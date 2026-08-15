@@ -63,8 +63,8 @@ export const DEFAULT_MOBILE_BACKGROUND_SETTINGS: MobileBackgroundSettings = {
 };
 
 export const DEFAULT_APPEARANCE_SETTINGS: AppearanceSettings = {
-  // 默认浅色（非暗色），亚克力默认开启（可在设置中关闭）
-  theme: 'light',
+  // 已移除浅色主题：固定深色；亚克力默认开启（可在设置中关闭）
+  theme: 'dark',
   acrylic: true,
 };
 

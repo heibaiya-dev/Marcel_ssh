@@ -1,6 +1,5 @@
 import { useRef, useEffect, useState, useMemo } from 'react';
 import { sshSendInput } from '@/lib/tauri';
-import { resolveAppearanceTheme } from '@/lib/appearance';
 import { resolveTerminalBackground, resolveTerminalThemeColors } from '@/lib/terminalBackground';
 import { BOTTOM_TABS, type BottomTab } from '@/lib/constants';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -74,12 +73,11 @@ export default function Terminal() {
   const fontFamily = preview?.fontFamily ?? storeSettings.fontFamily;
   const appearance = preview?.appearance ?? storeSettings.appearance;
   const acrylicOn = appearance?.acrylic ?? true;
-  const theme = resolveAppearanceTheme(appearance?.theme ?? 'light');
   const effectiveTerminalColors = useMemo(() => {
-    // 终端配色跟随应用主题（浅色 -> 亮色终端，深色 -> 暗色终端）
-    const themeColors = resolveTerminalThemeColors(theme);
+    // 已移除浅色主题：终端配色固定暗色
+    const themeColors = resolveTerminalThemeColors();
     return resolveTerminalBackground(themeColors, acrylicOn);
-  }, [theme, acrylicOn]);
+  }, [acrylicOn]);
 
   // Register callbacks for paste confirm and copy
   useEffect(() => {

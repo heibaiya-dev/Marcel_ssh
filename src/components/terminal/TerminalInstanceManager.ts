@@ -5,7 +5,6 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { readText } from '@tauri-apps/plugin-clipboard-manager';
 import { sshSendInput, sshResize } from '@/lib/tauri';
-import { resolveAppearanceTheme } from '@/lib/appearance';
 import { resolveTerminalBackground, resolveTerminalThemeColors } from '@/lib/terminalBackground';
 import { openExternalLink } from '@/lib/externalLinks';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -69,9 +68,7 @@ class TerminalInstanceManager {
     const initialFontSize = useSettingsStore.getState().settings.fontSize;
     const initialFontFamily = useSettingsStore.getState().settings.fontFamily;
     const settingsAtCreate = useSettingsStore.getState().settings;
-    const themeColors = resolveTerminalThemeColors(
-      resolveAppearanceTheme(settingsAtCreate.appearance?.theme ?? 'light'),
-    );
+    const themeColors = resolveTerminalThemeColors();
     const effectiveColors = resolveTerminalBackground(
       themeColors,
       settingsAtCreate.appearance?.acrylic ?? true,

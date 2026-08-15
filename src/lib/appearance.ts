@@ -38,11 +38,12 @@ function setHljsTheme(mode: 'light' | 'dark') {
 
 export function applyAppearance(appearance: AppearanceSettings) {
   const root = document.documentElement;
-  const theme = appearance?.theme ?? 'light';
+  // 已移除浅色主题：强制深色（旧设置里的 light/system 不再生效）
+  const theme: AppearanceTheme = 'dark';
   const acrylic = appearance?.acrylic ?? true;
   root.dataset.theme = theme;
-  root.style.colorScheme = theme === 'system' ? 'light dark' : theme;
-  setHljsTheme(resolveAppearanceTheme(theme));
+  root.style.colorScheme = 'dark';
+  setHljsTheme('dark');
   const isMobile = root.dataset.marcelPlatform === 'mobile';
   root.dataset.acrylic = !isMobile && acrylic ? 'true' : 'false';
 }

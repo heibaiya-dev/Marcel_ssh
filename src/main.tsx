@@ -13,13 +13,8 @@ async function bootstrap() {
 
   document.documentElement.dataset.marcelPlatform = platform;
 
-  // 桌面端：默认浅色 + 亚克力，先于首次渲染应用，避免暗色闪屏
-  // 手机端：保持原深色外观（不套桌面浅色主题/亚克力），仅保证代码高亮为深色
-  applyAppearance(
-    platform === 'mobile'
-      ? { theme: 'dark', acrylic: false }
-      : { theme: 'light', acrylic: true },
-  );
+  // 已移除浅色主题：统一深色。桌面端默认开亚克力，手机端不开。
+  applyAppearance({ theme: 'dark', acrylic: platform !== 'mobile' });
 
   // Window starts visible:false. Desktop App calls appReady; mobile must too.
   // Fire ASAP so a late React mount never leaves an invisible process.
