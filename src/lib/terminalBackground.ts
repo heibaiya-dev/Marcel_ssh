@@ -11,23 +11,15 @@ export function hexToRgba(hex: string, alpha: number): string {
 }
 
 /**
- * 终端配色跟随应用主题：
- * 当用户未自定义终端颜色（背景/前景仍等于默认暗色）时，浅色主题自动用“亮色”终端配色，
- * 深色主题用“暗色”；用户手动改过配色则尊重用户选择。
+ * 终端配色跟随应用主题（已移除独立终端颜色主题）：
+ * 浅色主题 -> “亮色”终端配色，深色主题 -> “暗色”终端配色。
  */
-export function resolveTerminalThemeColors(
-  colors: TerminalColors,
-  theme: 'light' | 'dark',
-): TerminalColors {
-  const d = DEFAULT_TERMINAL_COLORS;
-  const isDefaultDark =
-    colors?.background === d.background && colors?.foreground === d.foreground;
-  if (!isDefaultDark) return colors;
+export function resolveTerminalThemeColors(theme: 'light' | 'dark'): TerminalColors {
   const preset =
     theme === 'light'
       ? TERMINAL_COLOR_PRESETS.find((p) => p.name === '亮色')
       : TERMINAL_COLOR_PRESETS[0];
-  return preset?.colors ?? colors;
+  return preset?.colors ?? DEFAULT_TERMINAL_COLORS;
 }
 
 /**

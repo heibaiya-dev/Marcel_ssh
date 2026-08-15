@@ -1,28 +1,12 @@
 import { Card, SettingItem } from './helpers';
 import { useSettingsActions } from './SettingsActionsContext';
-import { ColorThemeSelector } from './ColorThemeSelector';
 import { FontSizeInput } from './FontSizeInput';
 
 export function TerminalAppearanceSection() {
   const { settings, update, setPreview } = useSettingsActions();
 
   return (
-    <Card id="settings-appearance" title="终端外观" description="调整终端的配色和字体表现">
-      <SettingItem
-        id="terminal-colors"
-        label="终端颜色"
-        description="选择终端配色方案"
-        sectionId="settings-appearance"
-        keywords={['theme', 'color', 'scheme', '配色', '界面', '终端外观']}
-      >
-        <ColorThemeSelector
-          value={settings.terminalColors}
-          onChange={(terminalColors) => {
-            setPreview({ terminalColors });
-            update({ terminalColors });
-          }}
-        />
-      </SettingItem>
+    <Card id="settings-appearance" title="终端外观" description="终端配色跟随界面主题（浅色/深色），此处调整字体表现">
       <SettingItem
         id="font-size"
         label="字号"
