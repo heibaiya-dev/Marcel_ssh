@@ -275,6 +275,8 @@ export interface QuickCommand {
   name: string;
   commands: string[];
   intervalMs: number;
+  /** 点击后仅插入内容（最后一行不回车），不自动执行，便于手动改参数 */
+  insertOnly: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -285,6 +287,7 @@ export interface QuickCommandInput {
   name: string;
   commands: string[];
   intervalMs: number;
+  insertOnly: boolean;
 }
 
 export interface QuickCommandPatch {
@@ -293,6 +296,7 @@ export interface QuickCommandPatch {
   name?: string;
   commands?: string[];
   intervalMs?: number;
+  insertOnly?: boolean;
 }
 
 // MCP types
@@ -410,6 +414,16 @@ export interface AgentMessage {
     decision?: 'approve' | 'route_to_human' | 'block';
     reasons?: string[];
   };
+  /** Context compaction indicator — a system message tracking compaction visibility. */
+  compaction?: {
+    status: 'running' | 'done';
+    trigger?: string;
+    /** 摘要文本：running 时是实时生成的进度片段，done 时是最终摘要。 */
+    summary?: string;
+    shadowedMessages?: number;
+    shadowedTokens?: number;
+    reason?: string;
+  };
 }
 
 export interface ToolCallInfo {
@@ -442,8 +456,8 @@ export interface AgentModeSettings {
   modelApprovalPrompt: string;
   systemPrompt: string;
   maxToolRounds: number;
-  /** Enable LLM context compression to stay within model window limits */
-  compactContext: boolean;
+  /** Model context window in tokens. 0 = unset (overflow-triggered compaction only). */
+  contextWindow: number;
   confirmEditFile: boolean;
 }
 
@@ -632,6 +646,15 @@ export type LlmStreamEvent =
   | { type: 'done' }
   | { type: 'error'; message: string }
   | { type: 'retrying'; attempt: number; maxAttempts: number; delaySecs: number; lastError: string }
+  // Context compaction visibility — LLM summarization of old history is in
+  // progress (can take tens of seconds), completed, or skipped.
+  | { type: 'compactionStart'; trigger: string }
+  // 压缩进行中的实时进度：summary 文本已生成的累计内容（随流增量推送）。
+  | { type: 'compactionProgress'; text: string }
+  | { type: 'compactionDone'; summary: string; shadowedMessages: number; shadowedTokens: number; shadowedStartNonSystem: number }
+  // attempted=false：未开始就跳过（无区间/结构异常），前端不留痕；
+  // attempted=true：摘要已跑但失败（截断/未遵循指令/校验不过），前端低调交代。
+  | { type: 'compactionSkipped'; reason: string; attempted: boolean }
   // Tool result — emitted as a separate event on the same channel
   | { type: 'toolResult' } & ToolResultPayload
   // Approval request — emitted when user confirmation is needed
