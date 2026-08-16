@@ -8,6 +8,7 @@ import { sshSendInput, sshResize } from '@/lib/tauri';
 import { resolveTerminalBackground, resolveTerminalThemeColors } from '@/lib/terminalBackground';
 import { openExternalLink } from '@/lib/externalLinks';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { attachClickLocate } from './terminalClickLocate';
 
 export interface TerminalInstance {
   id: string;
@@ -178,6 +179,21 @@ class TerminalInstanceManager {
     instance.domListeners.push(() =>
       container.removeEventListener('mousedown', handleClick),
     );
+
+    // Click-to-locate: same semantics as the mobile tap — move the remote
+    // shell cursor to the clicked cell when it is on the cursor's screen row.
+    // Skipped when the app enabled mouse tracking (vim/htop/tmux handle the
+    // click via xterm's mouse protocol) and for drags (text selection).
+    const clickLocate = attachClickLocate({
+      container,
+      getTerminal: () => terminal,
+      onLocate: (seq) => {
+        sshSendInput(sessionId, seq).catch((err) => {
+          console.error('Failed to send input:', err);
+        });
+      },
+    });
+    instance.domListeners.push(() => clickLocate.dispose());
 
     this.instances.set(sessionId, instance);
     return instance;
