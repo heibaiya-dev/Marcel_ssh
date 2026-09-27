@@ -575,8 +575,7 @@ impl ToolDispatcher {
                                     || effective_disposition.survives_auto()
                                 {
                                     final_needs_confirm = true;
-                                    model_reasons =
-                                        if rs.is_empty() { None } else { Some(rs) };
+                                    model_reasons = if rs.is_empty() { None } else { Some(rs) };
                                 }
                             }
                             ModelApprovalDecision::Approve => {
@@ -657,6 +656,10 @@ impl ToolDispatcher {
                 &self.task_id,
                 crate::agent::task::AgentStatus::WaitingApproval,
             );
+            let approval_reasons = merge_approval_reasons(
+                model_reasons,
+                command_decision.as_ref().map(|d| d.reason.clone()),
+            );
             let answer = self
                 .approval
                 .request_approval(
@@ -676,7 +679,7 @@ impl ToolDispatcher {
                     &tc.name,
                     tc.arguments.clone(),
                     effective_disposition,
-                    model_reasons.as_deref(),
+                    approval_reasons.as_deref(),
                     approval_metadata,
                 )
                 .await;
@@ -844,9 +847,13 @@ pub(crate) fn effective_approval_mode(mode: &AgentMode, settings: &AgentModeSett
 /// 份甚至完全不看风险评估）。改这里就是改两处。
 ///
 /// 四档的产生方式：
-///   - `Deny` —— 只有灾难模式判定能产出（见 `risk/checker.rs`），不征求意见
-///   - `ForceApproval` —— 系统级命令 / 受保护路径 / `sudo` …，Auto 也拦
-///   - `Approval` / `Allow` —— 由命令名单决定（白名单命中就放行、黑名单命中就要审批）
+///   - `Deny` —— 灾难模式判定 + 「该淘汰的写法」（按名字批量杀进程、管道进
+///     shell、`source`/藏变量执行）都能产出；不征求意见，理由里写明替代写法，
+///     模型会照着换
+///   - `ForceApproval` —— 系统级命令 / 受保护路径 …，Auto 也拦
+///   - `Approval` —— sudo 包装保底抬到这一档（`base_assessment`，Auto 跳过）；
+///     普通模式下也由命令名单产生
+///   - `Allow` —— 其余交命令名单定（白名单命中就放行）
 pub(crate) fn decide_command(
     cmd: &str,
     mode: &AgentMode,
@@ -873,10 +880,16 @@ pub(crate) fn decide_command(
             requires_confirmation: true,
         },
         _ => {
-            // 能在这里看到 `Plan`，只可能是「Plan 模式也需要审批」开着。
+            // 基础定档自己抬到「请求审批」的（sudo 包装保底，见 `base_assessment`）
+            // 与名单命中同样要确认；Auto 模式跳过这一档 —— 这正是它与强制审批的
+            // 唯一差别。名单看的是剥壳后的 base（`sudo -n tail` 在它眼里就是
+            // `sudo`），只有基础档知道"经 sudo 提权"这回事，所以理由优先用它的。
             let needs_confirm = match mode {
-                AgentMode::Plan | AgentMode::Agent => command_list_requires_confirm(cmd, settings),
                 AgentMode::Auto => false,
+                AgentMode::Plan | AgentMode::Agent => {
+                    assessment.disposition == Disposition::Approval
+                        || command_list_requires_confirm(cmd, settings)
+                }
             };
             CommandDecision {
                 disposition: if needs_confirm {
@@ -885,7 +898,9 @@ pub(crate) fn decide_command(
                     Disposition::Allow
                 },
                 reason: if needs_confirm {
-                    "命中命令名单的确认规则，需要用户确认".to_string()
+                    assessment
+                        .reason
+                        .unwrap_or_else(|| "命中命令名单的确认规则，需要用户确认".to_string())
                 } else {
                     "按当前命令名单判定为可直接执行".to_string()
                 },
@@ -963,6 +978,26 @@ pub(crate) fn needs_human_confirmation(
             None => effective_disposition.survives_auto() || requires_default_approval,
         },
     }
+}
+
+/// 审批弹窗上给用户看的理由列表：模型审批的理由 + 静态评估命中的理由。
+///
+/// 静态理由（"命令经 sudo 提权执行"、"`systemctl` 是系统级命令…"）以前只落库、
+/// 从不进弹窗 —— 用户只看到档位标签，不知道为什么被拦。模型理由与静态理由是
+/// 两类信息，模型说批准或转人审都不能把静态理由顶掉；去重只为同一句话不出现两次。
+/// 抽成纯函数是为了能单测：合并规则写在 `dispatch` 里就没人能验了。
+fn merge_approval_reasons(
+    model: Option<Vec<String>>,
+    static_reason: Option<String>,
+) -> Option<Vec<String>> {
+    let Some(static_reason) = static_reason.filter(|r| !r.trim().is_empty()) else {
+        return model;
+    };
+    let mut list = model.unwrap_or_default();
+    if !list.iter().any(|r| r == &static_reason) {
+        list.push(static_reason);
+    }
+    Some(list)
 }
 
 fn command_list_requires_confirm(cmd: &str, settings: &AgentModeSettings) -> bool {
@@ -1061,7 +1096,12 @@ mod tests {
         let s = default_settings();
         for mode in [AgentMode::Plan, AgentMode::Agent, AgentMode::Auto] {
             let d = decide_command("rm -rf /etc", &mode, &s, None);
-            assert_eq!(d.disposition, Disposition::Deny, "{:?} 模式下也应当拒绝", mode);
+            assert_eq!(
+                d.disposition,
+                Disposition::Deny,
+                "{:?} 模式下也应当拒绝",
+                mode
+            );
             assert!(!d.requires_confirmation, "拒绝不是「要不要确认」的问题");
             assert!(d.reason.contains("/etc"), "理由要能让模型知道踩了哪一步");
         }
@@ -1079,7 +1119,7 @@ mod tests {
         // 名单里没有 reboot，且关掉了「逐条确认」—— 按名单逻辑它本该静默放行。
         s.confirm_each_command = false;
 
-        for cmd in ["reboot", "systemctl restart nginx", "sudo apt update"] {
+        for cmd in ["reboot", "systemctl restart nginx", "useradd bob"] {
             let d = decide_command(cmd, &AgentMode::Auto, &s, None);
             assert_eq!(
                 d.disposition,
@@ -1088,11 +1128,92 @@ mod tests {
                 cmd
             );
             assert!(
-                needs_human_confirmation(&AgentMode::Auto, Some(&d), d.disposition, false, &s, false),
+                needs_human_confirmation(
+                    &AgentMode::Auto,
+                    Some(&d),
+                    d.disposition,
+                    false,
+                    &s,
+                    false
+                ),
                 "`{}` 在 Auto 下必须要求人确认",
                 cmd
             );
         }
+    }
+
+    /// sudo 包装只保底抬到「请求审批」：Agent 模式要确认、Auto 模式跳过 —— 与
+    /// 「请求审批」档同语义。里面的命令该强制还强制（见上一条）。
+    #[test]
+    fn sudo_wrapping_needs_approval_but_survives_auto_no_more() {
+        let s = default_settings();
+        // 默认黑名单（rm/mkfs/dd）里没有 sudo，普通模式靠基础定档的保底档要确认。
+        let d = decide_command(
+            "sudo -n tail -n 20 /var/log/nginx/access.log",
+            &AgentMode::Agent,
+            &s,
+            None,
+        );
+        assert_eq!(d.disposition, Disposition::Approval);
+        assert!(d.requires_confirmation);
+        assert!(
+            d.reason.contains("sudo"),
+            "理由要说清是 sudo 提权，实际 {:?}",
+            d.reason
+        );
+
+        // Auto 模式跳过这一档 —— 提权看日志不再弹窗。
+        let auto = decide_command(
+            "sudo -n tail -n 20 /var/log/nginx/access.log",
+            &AgentMode::Auto,
+            &s,
+            None,
+        );
+        assert_eq!(auto.disposition, Disposition::Allow);
+        assert!(!auto.requires_confirmation);
+
+        // 提权改系统状态的照样被里面的规则抬回强制审批，Auto 也拦。
+        let forced = decide_command("sudo systemctl restart nginx", &AgentMode::Auto, &s, None);
+        assert_eq!(forced.disposition, Disposition::ForceApproval);
+        assert!(needs_human_confirmation(
+            &AgentMode::Auto,
+            Some(&forced),
+            forced.disposition,
+            false,
+            &s,
+            false
+        ));
+    }
+
+    /// 静态理由要进弹窗：模型没给理由时它单独出现，模型给了就并排在后面，
+    /// 同一句话不重复，空理由不算数。
+    #[test]
+    fn static_reasons_reach_the_approval_dialog() {
+        assert_eq!(
+            merge_approval_reasons(None, Some("命令经 sudo 提权执行".into())),
+            Some(vec!["命令经 sudo 提权执行".to_string()])
+        );
+        assert_eq!(
+            merge_approval_reasons(
+                Some(vec!["模型判定有风险".to_string()]),
+                Some("命令经 sudo 提权执行".into())
+            ),
+            Some(vec![
+                "模型判定有风险".to_string(),
+                "命令经 sudo 提权执行".to_string()
+            ])
+        );
+        // 去重：decide_command 的理由与模型理由撞句时不出现两次。
+        assert_eq!(
+            merge_approval_reasons(
+                Some(vec!["命令经 sudo 提权执行".to_string()]),
+                Some("命令经 sudo 提权执行".into())
+            ),
+            Some(vec!["命令经 sudo 提权执行".to_string()])
+        );
+        // 空白理由与两头皆空都保持 None（前端按"没有理由"渲染）。
+        assert_eq!(merge_approval_reasons(None, Some("  ".into())), None);
+        assert_eq!(merge_approval_reasons(None, None), None);
     }
 
     /// 非命令类工具（声明了强制审批档的）在 Auto 下同样拦得住。
@@ -1219,7 +1340,12 @@ mod tests {
             ..Default::default()
         };
 
-        let d = decide_command("tee /srv/prod/app.conf", &AgentMode::Auto, &s, Some(&policy));
+        let d = decide_command(
+            "tee /srv/prod/app.conf",
+            &AgentMode::Auto,
+            &s,
+            Some(&policy),
+        );
         assert_eq!(d.disposition, Disposition::ForceApproval);
         assert!(d.requires_confirmation);
     }
@@ -1261,7 +1387,10 @@ mod tests {
             // 开关关着：Plan 与 Auto 逐项相等，且不弹窗。
             let plan = decide_command(cmd, &AgentMode::Plan, &silent, None);
             let auto = decide_command(cmd, &AgentMode::Auto, &silent, None);
-            assert_eq!(plan.disposition, auto.disposition, "`{cmd}` 的档位要与 Auto 一致");
+            assert_eq!(
+                plan.disposition, auto.disposition,
+                "`{cmd}` 的档位要与 Auto 一致"
+            );
             assert_eq!(plan.requires_confirmation, auto.requires_confirmation);
             assert_eq!(plan.disposition, Disposition::Allow);
             assert!(
@@ -1313,7 +1442,10 @@ mod tests {
             for mode in [AgentMode::Agent, AgentMode::Auto] {
                 let before = decide_command(cmd, &mode, &silent, None);
                 let after = decide_command(cmd, &mode, &gated, None);
-                assert_eq!(before.disposition, after.disposition, "{mode:?} 不受开关影响");
+                assert_eq!(
+                    before.disposition, after.disposition,
+                    "{mode:?} 不受开关影响"
+                );
                 assert_eq!(
                     needs_human_confirmation(
                         &mode,

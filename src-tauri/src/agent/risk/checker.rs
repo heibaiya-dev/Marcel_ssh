@@ -346,7 +346,6 @@ pub(super) fn is_read_only_system_query(base: &str, args: &[String]) -> bool {
             .iter()
             .any(|a| matches!(a.as_str(), "-L" | "--list" | "-S" | "--list-rules")),
         "nft" => first == "list",
-        "kill" => args.iter().any(|a| a == "-0"),
         _ => false,
     }
 }

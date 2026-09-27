@@ -62,6 +62,13 @@ impl Assessment {
         }
     }
 
+    pub fn approval(reason: impl Into<String>) -> Self {
+        Self {
+            disposition: Disposition::Approval,
+            reason: Some(reason.into()),
+        }
+    }
+
     pub fn forced(reason: impl Into<String>) -> Self {
         Self {
             disposition: Disposition::ForceApproval,

@@ -74,7 +74,6 @@ fn system_level_commands_force_approval() {
         "systemctl restart nginx",
         "useradd bob",
         "iptables -F",
-        "kill -9 1234",
     ] {
         assert_eq!(
             assess(cmd),
@@ -85,10 +84,22 @@ fn system_level_commands_force_approval() {
     }
 }
 
+/// sudo 包装只**保底**抬到「请求审批」（Auto 跳过、普通模式要确认）—— 判据是
+/// 里面跑了什么，不是"有没有 sudo"：纯读日志的提权查询不该在 Auto 模式也弹窗。
+/// 更严的规则照旧取最严：改服务状态 → 强制审批，递归删系统目录 → 直接拒绝。
 #[test]
-fn sudo_always_forces_approval() {
-    assert_eq!(assess("sudo apt update"), Disposition::ForceApproval);
+fn sudo_wrapping_defaults_to_approval_not_forced() {
+    assert_eq!(assess("sudo apt update"), Disposition::Approval);
     assert!(reason("sudo apt update").contains("sudo"));
+    assert_eq!(assess("sudo -n tail /var/log/nginx/access.log"), Disposition::Approval);
+    // 提权 + 只读查询形态：保底档不被查询豁免写成放行。
+    assert_eq!(assess("sudo systemctl status nginx"), Disposition::Approval);
+    // 里面的规则继续生效，取最严。
+    assert_eq!(
+        assess("sudo systemctl restart nginx"),
+        Disposition::ForceApproval
+    );
+    assert_eq!(assess("sudo -u root rm -rf /etc"), Disposition::Deny);
 }
 
 /// 磁盘工具作用在镜像文件上不拒绝（`mkfs.ext4 disk.img` 是常规操作），
@@ -127,15 +138,22 @@ fn recursive_rm_under_system_trees_needs_approval() {
     }
 }
 
-/// 管道进 shell = 执行下载来的代码。不是灾难（`curl … | sh` 是常见安装方式），
-/// 但必须有人看着。
+/// 管道进 shell = 执行命令文本之外的内容。不值得弹窗 —— 它有等价且可检查的
+/// 替代（先下载成文件再执行），直接拒绝并把替代写法回给模型。
 #[test]
-fn piping_into_a_shell_forces_approval() {
-    assert_eq!(assess("cat /etc/shadow | bash"), Disposition::ForceApproval);
-    assert_eq!(
-        assess("echo cm0gLXJmIC8= | base64 -d | sh"),
-        Disposition::ForceApproval
-    );
+fn piping_into_a_shell_is_denied_with_guidance() {
+    for cmd in [
+        "cat /etc/shadow | bash",
+        "echo cm0gLXJmIC8= | base64 -d | sh",
+    ] {
+        let a = RiskAssessor::default().assess_command(cmd);
+        assert_eq!(a.disposition, Disposition::Deny, "`{}` 应当直接拒绝", cmd);
+        assert!(
+            a.reason.unwrap_or_default().contains("下载"),
+            "`{}` 的理由要指路（先下载成文件再执行）",
+            cmd
+        );
+    }
 }
 
 /// **回归用例：用户实际撞到的这条命令曾是"强制审批"。**
@@ -191,9 +209,40 @@ fn read_only_system_queries_are_allowed() {
         "ufw status",
         "iptables -L",
         "nft list ruleset",
-        "kill -0 1234",
     ] {
         assert_eq!(assess(cmd), Disposition::Allow, "`{}` 是查询，不该抬档", cmd);
+    }
+}
+
+/// `kill <PID>` 是精确操作 —— agent 查到 PID 才会杀，不值得任何人看一眼。
+/// 按名字批量杀的 `pkill` / `killall` 走直接拒绝（见下）。
+#[test]
+fn killing_a_specific_pid_is_allowed() {
+    for cmd in ["kill -9 1234", "kill -0 1234", "kill 1234", "kill -TERM 1234"] {
+        assert_eq!(assess(cmd), Disposition::Allow, "`{}` 是精确操作，不该拦", cmd);
+    }
+}
+
+/// 按名字批量杀进程：命中面由名字匹配决定，误伤面不可控，且总有更精确的
+/// 替代写法 —— 直接拒绝并指路，不弹窗打扰人。
+#[test]
+fn name_based_kill_commands_are_denied_with_guidance() {
+    for cmd in [
+        "pkill nginx",
+        "killall nginx",
+        "pkill -f 'server.js'",
+        "sudo pkill nginx",
+        "ls; killall java",
+    ] {
+        let a = RiskAssessor::default().assess_command(cmd);
+        assert_eq!(a.disposition, Disposition::Deny, "`{}` 应当直接拒绝", cmd);
+        let reason = a.reason.unwrap_or_default();
+        assert!(
+            reason.contains("kill"),
+            "`{}` 的理由要指路（kill PID / systemctl），实际 {:?}",
+            cmd,
+            reason
+        );
     }
 }
 
@@ -209,7 +258,6 @@ fn mutating_system_commands_still_force_approval() {
         "crontab -r",
         "ufw enable",
         "iptables -F",
-        "kill -9 1234",
     ] {
         assert_eq!(
             assess(cmd),
@@ -220,9 +268,22 @@ fn mutating_system_commands_still_force_approval() {
     }
 }
 
+/// `source` 与「藏在变量里」都不值得弹窗 —— 替代写法零成本（`bash <脚本>` /
+/// 把命令原文写出来），直接拒绝并指路。
 #[test]
-fn source_forces_approval() {
-    assert_eq!(assess("source /tmp/evil.sh"), Disposition::ForceApproval);
+fn source_and_hidden_variable_execution_are_denied_with_guidance() {
+    let a = RiskAssessor::default().assess_command("source /tmp/evil.sh");
+    assert_eq!(a.disposition, Disposition::Deny);
+    assert!(a.reason.unwrap_or_default().contains("bash"));
+
+    let b = RiskAssessor::default().assess_command(r#"bash -c "$CMD""#);
+    assert_eq!(b.disposition, Disposition::Deny, "藏变量的执行应当拒绝");
+    let reason = b.reason.unwrap_or_default();
+    assert!(
+        reason.contains("原文"),
+        "理由要指路（把命令原文写出来），实际 {:?}",
+        reason
+    );
 }
 
 // ───────────────────────── 直接拒绝 ─────────────────────────

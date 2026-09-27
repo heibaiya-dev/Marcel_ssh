@@ -105,10 +105,11 @@ impl RiskAssessor {
     /// 给一条命令定档 —— **风险评估的唯一入口**。
     ///
     /// 三个来源按严取一：
-    ///   1. 灾难模式（[`catastrophic_reason`]）→ [`Disposition::Deny`]
-    ///   2. 系统级命令 / 磁盘工具 / `sudo` / 管道进 shell / 受保护路径
-    ///      → [`Disposition::ForceApproval`]
-    ///   3. 其余 → [`Disposition::Allow`]，由调用方按命令名单决定要不要审批
+    ///   1. 灾难模式 + 「该淘汰的写法」（递归删系统关键目录、写块设备、
+    ///      按名字批量杀进程、管道进 shell、`source`/藏变量执行）→ [`Disposition::Deny`]
+    ///   2. 系统级命令 / 磁盘工具 / 受保护路径 → [`Disposition::ForceApproval`]
+    ///   3. `sudo` 包装保底 → [`Disposition::Approval`]（Auto 跳过，普通模式要确认）
+    ///   4. 其余 → [`Disposition::Allow`]，由调用方按命令名单决定要不要审批
     ///
     /// 一条命令由多个 shell 段拼成（`a; b | c`），每段各判一次，取最严的那档。
     ///
@@ -158,10 +159,12 @@ impl RiskAssessor {
                 worst = worst.worst(verdict);
             }
 
-            // `curl … | sh` 这类"下什么就跑什么"：不是灾难，但必须有人看着。
+            // `curl … | sh` 这类"下什么就跑什么"：内容在命令文本之外，静态检查
+            // 无从看起。不弹窗 —— 这类写法有等价且可检查的替代（先下载成文件再
+            // 执行），直接拒绝并把替代写法回给模型，用户零打扰。
             if has_pipe && is_bare_shell(&parsed) {
-                worst = worst.worst(Assessment::forced(
-                    "命令把内容管道给了 shell 解释器，等于执行下载来的代码",
+                worst = worst.worst(Assessment::denied(
+                    "命令把内容直接管道给 shell 解释器执行，内容无法静态检查 —— 请先下载到文件（如 `curl -o`）确认后再执行",
                 ));
             }
 
@@ -201,13 +204,18 @@ impl RiskAssessor {
     /// 内嵌的 `bash -c "…"` / `eval …` / `source x`：里层当独立命令再判一次。
     fn assess_embedded(&self, kind: &str, inner: Option<&str>) -> Assessment {
         match (kind, inner) {
-            // `source` / `.` 的正文没法静态看，一律要人确认。
+            // `source` / `.` 的正文没法静态看，且等价替代零成本（`bash <脚本>`）
+            // —— 直接拒绝并指路，不弹窗。
             ("source", _) | (".", _) => {
-                Assessment::forced("source 会执行脚本内容，而内容无法静态检查")
+                Assessment::denied(
+                    "`source`/`.` 会在当前 shell 执行脚本内容，内容无法静态检查 —— 请改用 `bash <脚本>` 执行，或把要做的事写成明确命令",
+                )
             }
             (_, Some(s)) => self.assess_command(s),
             // 有包装却没有内层字符串（例如 `bash -c "$CMD"`）：同样看不懂。
-            _ => Assessment::forced("命令把要执行的内容藏在变量里，无法静态检查"),
+            _ => Assessment::denied(
+                "要执行的内容藏在变量里，无法静态检查 —— 请把要执行的命令原文写出来",
+            ),
         }
     }
 
