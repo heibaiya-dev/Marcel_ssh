@@ -4,14 +4,16 @@
 //! 传输实现与用户 SFTP 面板**共用同一流式核心**
 //! （commands::sftp::{stream_upload_single_file, stream_download_single_file}），
 //! 不在此重复字节拷贝逻辑；本文件只做参数解析 / 本地路径校验（绝对路径 +
-//! 系统/敏感路径黑名单；download 省略 local_path 时落系统 Downloads）/
-//! 传输中心接入（互斥 + 记账 + 事件）。桌面专属工具（移动端不注册）。
+//! 系统/敏感路径黑名单；download 省略 local_path 时落系统 Downloads，
+//! user_pick=true 时弹系统对话框让用户亲自选本机一侧）/ 传输中心接入
+//! （互斥 + 记账 + 事件）。桌面专属工具（移动端不注册）。
 
 use async_trait::async_trait;
 use russh_sftp::protocol::OpenFlags;
 use serde_json::json;
 use std::path::{Component, Path, PathBuf};
 use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
 use tokio::fs;
 
 use crate::agent::risk::Disposition;
@@ -355,6 +357,88 @@ async fn local_file_size(p: &Path) -> Result<u64, AppError> {
     Ok(meta.len())
 }
 
+// ─────────────── 本地一侧的取值方式：local_path vs user_pick ───────────────
+
+/// `user_pick=true` 与 `local_path` 同时给出的拒绝文案（两个工具共用一条语义：
+/// 本机一侧要么 agent 给路径、要么弹窗让用户选，不能混用）。
+const LOCAL_SIDE_CONFLICT: &str =
+    "local_path 与 user_pick=true 只能二选一：要么自己指定本机绝对路径，要么弹窗让用户选，不要同时传。";
+
+/// `user_pick=true` 且用户取消时的失败文案（附下一步指引）。
+fn user_pick_cancelled() -> String {
+    "用户在系统文件对话框中取消了选择，未执行任何传输。可改传显式 local_path 重试，\
+     或先调用 ask_user 工具与用户确认本机路径。"
+        .to_string()
+}
+
+/// 本地一侧（上传的源文件 / 下载的落点）由谁决定。
+#[derive(Debug, PartialEq, Eq)]
+enum LocalSide {
+    /// 参数显式给了本机绝对路径。
+    Given(PathBuf),
+    /// `user_pick=true`：弹系统对话框让用户亲自选。
+    UserPick,
+    /// `user_pick=true` 与 `local_path` 同时出现——互斥，必须拒绝。
+    Conflict,
+    /// 两者都没有。
+    Missing,
+}
+
+/// 从工具参数解析本地一侧的取值方式（纯函数，单测覆盖互斥矩阵）。
+/// 参数名不可叫 `ask_user`——那已是问询工具的名字。
+fn resolve_local_side(params: &serde_json::Value) -> LocalSide {
+    let given = params
+        .get("local_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let pick = params
+        .get("user_pick")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    match (pick, given) {
+        (true, Some(_)) => LocalSide::Conflict,
+        (true, None) => LocalSide::UserPick,
+        (false, Some(p)) => LocalSide::Given(PathBuf::from(p)),
+        (false, None) => LocalSide::Missing,
+    }
+}
+
+/// `user_pick` 上传：弹系统文件选择框让用户挑本机源文件（单选、不过滤类型）。
+/// 返回 None = 用户取消。阻塞式对话框会卡住调用线程，必须用 spawn_blocking
+/// 离开 tokio 工作线程。
+async fn ask_user_pick_upload_source(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择要上传到服务器的文件")
+            .blocking_pick_file()
+            .and_then(|fp| fp.into_path().ok())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// `user_pick` 下载：弹系统保存对话框让用户选落点，预填远端文件名。
+async fn ask_user_pick_download_target(
+    app: &tauri::AppHandle,
+    suggested_name: String,
+) -> Option<PathBuf> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择保存位置")
+            .set_file_name(suggested_name)
+            .blocking_save_file()
+            .and_then(|fp| fp.into_path().ok())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 // ────────────────────────────── UploadFileTool ──────────────────────────────
 
 pub struct UploadFileTool;
@@ -445,11 +529,17 @@ impl AgentTool for UploadFileTool {
         "Upload a file from THIS computer (where Marcel SSH runs) to the remote server \
          (binary-safe). local_path is the absolute path of an existing file ON THIS \
          COMPUTER — not a server path (system/secret paths like ~/.ssh, /etc are \
-         blocked). remote_path is a path ON THE SERVER: give an existing directory, a \
-         directory ending with '/', or a full target file path (the tool probes the \
-         server: existing directories get the local file name appended, anything else \
-         is treated as the exact target file path). To rename on the server pass \
-         file_name.\n\
+         blocked). Alternatively pass user_pick=true (and omit local_path) to open a \
+         native file picker and let the user choose the source file on this computer; \
+         the call fails if the user cancels. user_pick is for single, user-in-the-loop \
+         uploads only: do NOT use it for server-to-server transfers (relaying files \
+         between servers through this computer) — a dialog would block the task on \
+         the user mid-automation; stage with an explicit local_path or transfer with \
+         scp/rsync via bash instead. remote_path is a path ON THE SERVER: give an \
+         existing directory, a directory ending with '/', or a full target file path \
+         (the tool probes the server: existing directories get the local file name \
+         appended, anything else is treated as the exact target file path). To rename \
+         on the server pass file_name.\n\
          Multi-host: you may pass an optional `host` (the current machine or a \
          machine from the selected set, by its readable name) to upload to that \
          machine instead of the current one. Desktop only."
@@ -459,12 +549,13 @@ impl AgentTool for UploadFileTool {
         json!({
             "type": "object",
             "properties": {
-                "local_path": { "type": "string", "description": "Required. Absolute path of the file to upload ON THIS COMPUTER (not the server). System/secret paths are rejected." },
+                "local_path": { "type": "string", "description": "Optional if user_pick=true. Absolute path of the file to upload ON THIS COMPUTER (not the server). System/secret paths are rejected." },
+                "user_pick": { "type": "boolean", "description": "Optional. Open a native file picker and let the user choose the source file on this computer instead of passing local_path. Mutually exclusive with local_path; the call fails if the user cancels. Single user-in-the-loop uploads only — never for server-to-server transfers (relaying files between servers through this computer): stage with an explicit local_path or use bash scp/rsync there.", "default": false },
                 "remote_path": { "type": "string", "description": "Required. Destination ON THE SERVER: an existing directory, a directory ending with '/', or the full target file path. Existing directories get the local file name appended; otherwise the path is used as-is as the target file." },
                 "file_name": { "type": "string", "description": "Optional. Rename the uploaded file on the server. When given, remote_path is treated as a directory and file_name is appended." },
                 "host": { "type": "string", "description": format!("Optional. Target machine's readable name: the current machine or one from the multi-host selected set. When omitted, uploads to the current session's machine. Desktop only. {}", super::HOST_MATCH_RULE) }
             },
-            "required": ["local_path", "remote_path"]
+            "required": ["remote_path"]
         })
     }
 
@@ -513,10 +604,6 @@ async fn upload_execute(
     ctx: &ToolContext,
     params: serde_json::Value,
 ) -> Result<ToolOutput, AppError> {
-    let local_path = params
-        .get("local_path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Agent("Missing 'local_path' parameter".into()))?;
     let remote_path = params
         .get("remote_path")
         .and_then(|v| v.as_str())
@@ -525,7 +612,18 @@ async fn upload_execute(
         return Ok(ToolOutput::fail("upload_file", "empty remote_path"));
     }
 
-    let local_path_buf = PathBuf::from(local_path);
+    // 本机源：显式 local_path 或 user_pick 弹窗（互斥，见 resolve_local_side）。
+    let local_path_buf = match resolve_local_side(&params) {
+        LocalSide::Given(p) => p,
+        LocalSide::UserPick => match ask_user_pick_upload_source(&ctx.app_handle).await {
+            Some(p) => p,
+            None => return Ok(ToolOutput::fail("upload_file", user_pick_cancelled())),
+        },
+        LocalSide::Conflict => return Ok(ToolOutput::fail("upload_file", LOCAL_SIDE_CONFLICT)),
+        LocalSide::Missing => {
+            return Err(AppError::Agent("Missing 'local_path' parameter".into()));
+        }
+    };
     if let Err(e) = validate_local_upload_path(&local_path_buf).await {
         return Ok(ToolOutput::fail("upload_file", e.to_string()));
     }
@@ -789,9 +887,17 @@ impl AgentTool for DownloadFileTool {
          runs, binary-safe). local_path is the absolute save path ON THIS COMPUTER — \
          not a server path. It is OPTIONAL: when omitted the file is saved to the \
          system Downloads folder with the remote file name (the actual local path is \
-         reported back in the result). System/secret local paths (/, ~/.ssh, System32) \
-         are blocked. Existing files are not overwritten unless overwrite=true. \
-         Limit: 32 MB.\n\
+         reported back in the result). Alternatively pass user_pick=true (and omit \
+         local_path) to open a native save dialog and let the user choose where to \
+         save (prefilled with the remote file name; the call fails if the user \
+         cancels). user_pick is for single, user-in-the-loop downloads only: do NOT \
+         use it for server-to-server transfers (relaying files between servers \
+         through this computer) — a dialog would block the task on the user \
+         mid-automation; stage with an explicit local_path or transfer with \
+         scp/rsync via bash instead. System/secret local paths (/, ~/.ssh, System32) \
+         are blocked. Existing files are not overwritten unless overwrite=true (when \
+         user_pick is on, replacing an existing file confirmed by the user in the \
+         save dialog counts as overwrite). Limit: 32 MB.\n\
          Multi-host: you may pass an optional `host` (the current machine or a \
          machine from the selected set, by its readable name) to download from \
          that machine instead of the current one. Desktop only."
@@ -802,7 +908,8 @@ impl AgentTool for DownloadFileTool {
             "type": "object",
             "properties": {
                 "remote_path": { "type": "string", "description": "Required. Absolute path of the remote file on the server to download" },
-                "local_path":  { "type": "string", "description": "Optional. Absolute save path ON THIS COMPUTER (not the server). Omit to save to the system Downloads folder with the remote file name. System/secret paths are rejected." },
+                "local_path":  { "type": "string", "description": "Optional. Absolute save path ON THIS COMPUTER (not the server). Omit to save to the system Downloads folder with the remote file name. Mutually exclusive with user_pick. System/secret paths are rejected." },
+                "user_pick": { "type": "boolean", "description": "Optional. Open a native save dialog and let the user choose where to save (prefilled with the remote file name) instead of passing local_path. Mutually exclusive with local_path; the call fails if the user cancels. Single user-in-the-loop downloads only — never for server-to-server transfers (relaying files between servers through this computer): stage with an explicit local_path or use bash scp/rsync there.", "default": false },
                 "overwrite": { "type": "boolean", "description": "If true, overwrite an existing regular file. Symlinks and directories are never overwritten. Default: false.", "default": false },
                 "host": { "type": "string", "description": format!("Optional. Target machine's readable name: the current machine or one from the multi-host selected set. When omitted, downloads from the current session's machine. Desktop only. {}", super::HOST_MATCH_RULE) }
             },
@@ -864,35 +971,41 @@ async fn download_execute(
         .unwrap_or(false);
 
     let policy = LocalPathPolicy::default_policy();
+    let suggested_name = remote_file_name(remote_path).unwrap_or_else(|| "download".to_string());
 
-    // local_path 可选：省略时落到系统 Downloads 目录（解析失败退回 home），
-    // 文件名取远端 basename。用户指定时必须是绝对路径（黑名单外）。
-    let resolved = match params
-        .get("local_path")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        Some(local_path) => {
-            match validate_local_download_path(Path::new(local_path), overwrite, &policy).await {
-                Ok(r) => r,
-                Err(e) => return Ok(ToolOutput::fail("download_file", e.to_string())),
+    // 落点三选一：显式 local_path / user_pick 弹窗 / 省略落系统 Downloads。
+    // user_pick 时用户已在系统保存对话框里亲自确认「替换已有文件」，validation
+    // 直接放行 overwrite（黑名单、symlink/目录拒绝照常生效）。
+    let picked_by_user;
+    let raw_target = match resolve_local_side(&params) {
+        LocalSide::Given(p) => {
+            picked_by_user = false;
+            p
+        }
+        LocalSide::UserPick => {
+            picked_by_user = true;
+            match ask_user_pick_download_target(&ctx.app_handle, suggested_name).await {
+                Some(p) => p,
+                None => return Ok(ToolOutput::fail("download_file", user_pick_cancelled())),
             }
         }
-        None => {
-            let remote_name =
-                remote_file_name(remote_path).unwrap_or_else(|| "download".to_string());
+        LocalSide::Conflict => return Ok(ToolOutput::fail("download_file", LOCAL_SIDE_CONFLICT)),
+        LocalSide::Missing => {
+            // 省略 local_path：落到系统 Downloads 目录（解析失败退回 home）。
+            picked_by_user = false;
             let Some(download_dir) = LocalPathPolicy::default_download_dir() else {
                 return Ok(ToolOutput::fail(
                     "download_file",
                     "无法确定系统下载目录（Downloads 与 home 均不可用），请显式传 local_path",
                 ));
             };
-            let target = download_dir.join(&remote_name);
-            match validate_local_download_path(&target, overwrite, &policy).await {
-                Ok(r) => r,
-                Err(e) => return Ok(ToolOutput::fail("download_file", e.to_string())),
-            }
+            download_dir.join(&suggested_name)
         }
+    };
+    let overwrite = overwrite || picked_by_user;
+    let resolved = match validate_local_download_path(&raw_target, overwrite, &policy).await {
+        Ok(r) => r,
+        Err(e) => return Ok(ToolOutput::fail("download_file", e.to_string())),
     };
 
     if let Err(e) = ensure_parent_creatable(&resolved, &policy).await {
@@ -1279,6 +1392,89 @@ mod tests {
     fn download_unrelated_error_is_not_cancel() {
         assert!(!is_download_cancel("打开远程文件失败: No such file"));
         assert!(!is_download_cancel("connection refused"));
+    }
+
+    // ── resolve_local_side（local_path / user_pick 互斥矩阵） ──
+
+    #[test]
+    fn local_side_given_when_path_only() {
+        assert_eq!(
+            resolve_local_side(&json!({ "local_path": "/tmp/a.bin" })),
+            LocalSide::Given(PathBuf::from("/tmp/a.bin"))
+        );
+    }
+
+    #[test]
+    fn local_side_user_pick_when_flag_only() {
+        assert_eq!(
+            resolve_local_side(&json!({ "user_pick": true })),
+            LocalSide::UserPick
+        );
+    }
+
+    #[test]
+    fn local_side_conflict_when_both_given() {
+        assert_eq!(
+            resolve_local_side(&json!({ "user_pick": true, "local_path": "/tmp/a.bin" })),
+            LocalSide::Conflict
+        );
+    }
+
+    #[test]
+    fn local_side_missing_when_neither() {
+        assert_eq!(resolve_local_side(&json!({})), LocalSide::Missing);
+    }
+
+    #[test]
+    fn local_side_empty_path_counts_as_missing() {
+        assert_eq!(
+            resolve_local_side(&json!({ "local_path": "" })),
+            LocalSide::Missing
+        );
+    }
+
+    #[test]
+    fn local_side_non_boolean_flag_is_not_user_pick() {
+        // 非布尔值（如字符串 "true"）不按启用处理，不猜参数。
+        assert_eq!(
+            resolve_local_side(&json!({ "user_pick": "true" })),
+            LocalSide::Missing
+        );
+        assert_eq!(
+            resolve_local_side(&json!({ "user_pick": "true", "local_path": "/tmp/a" })),
+            LocalSide::Given(PathBuf::from("/tmp/a"))
+        );
+    }
+
+    // ── user_pick 提醒护栏：描述与 schema 必须带上「跨机中转别用」的警告，
+    //    防止后续改文案时把这条提醒删丢（多机.hbs 的中转流程依赖显式 local_path）。 ──
+
+    #[test]
+    fn transfer_tools_warn_not_to_user_pick_across_servers() {
+        let upload = UploadFileTool::new();
+        let download = DownloadFileTool::new();
+        for (name, desc, schema) in [
+            (
+                "upload_file",
+                upload.description(),
+                upload.parameters_schema().to_string(),
+            ),
+            (
+                "download_file",
+                download.description(),
+                download.parameters_schema().to_string(),
+            ),
+        ] {
+            assert!(
+                desc.contains("server-to-server"),
+                "{name} 描述缺少跨机中转警告"
+            );
+            assert!(
+                schema.contains("server-to-server"),
+                "{name} schema 缺少跨机中转警告"
+            );
+            assert!(desc.contains("user_pick"), "{name} 描述未提及 user_pick");
+        }
     }
 
     // ── upload_error_hint（上传失败的可操作指引） ──
