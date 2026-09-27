@@ -226,7 +226,7 @@ export function MobileAgentPolicySection() {
                     placeholder={
                       hasJevApiKey
                         ? '已保存，输入新 Key 可覆盖'
-                        : '输入 TypeSafe API Key'
+                        : '输入 Jev 的 API Key（官方或你的网关）'
                     }
                     autoComplete="off"
                     className={inputClass}
@@ -255,7 +255,7 @@ export function MobileAgentPolicySection() {
                   className={inputClass}
                 />
                 <p className="text-xs text-zinc-500">
-                  建议填具体版本号（如 jev-1.13.0）而不是 jev-latest 别名——别名会随官方发布前移。
+                  内置默认已经钉住版本号，不建议改用 jev-latest 别名——别名会随官方发布前移。走中转或网关时，模型名往往是它自己的一套（例如 Command Code 的 typesafe/jev），照对方文档填。
                 </p>
                 <span className="text-xs text-zinc-400">API 地址</span>
                 <input
@@ -266,7 +266,7 @@ export function MobileAgentPolicySection() {
                   className={inputClass}
                 />
                 <p className="text-xs text-zinc-500">
-                  只在走代理、私有网关或本地 mock 时填（路径 /v1/systemone 不变）。留空 = 保持官方地址。
+                  只在走代理、私有网关或本地 mock 时填。路径 /v1/systemone 是固定拼上去的——对方文档给的基址若末尾带 /v1（如 https://api.commandcode.ai/provider/v1），要把那段去掉，否则会拼成 …/v1/v1/systemone 而 404。留空 = 保持官方地址。
                 </p>
                 {needsUrlScheme(agent.jevBaseUrl) && (
                   <p className="text-xs text-amber-400/90">

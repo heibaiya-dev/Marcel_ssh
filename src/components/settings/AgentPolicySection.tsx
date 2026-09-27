@@ -641,7 +641,7 @@ export function AgentPolicySection() {
                               placeholder={
                                 hasJevApiKey
                                   ? '已保存，输入新 Key 可覆盖'
-                                  : '输入 TypeSafe API Key'
+                                  : '输入 Jev 的 API Key（官方或你的网关）'
                               }
                               autoComplete="off"
                               className="flex-1 rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-1.5 text-sm font-mono text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-indigo-500"
@@ -677,9 +677,11 @@ export function AgentPolicySection() {
                             />
                           </div>
                           <p className="text-xs text-zinc-500">
-                            建议填具体版本号（如 <code>jev-1.13.0</code>）而不是
+                            内置默认已经钉住版本号，不建议改用{' '}
                             <code>jev-latest</code> 别名——别名会随官方发布前移，
-                            审批行为不该在你不知情时改变。
+                            审批行为不该在你不知情时改变。走中转或网关时，模型名
+                            往往是它自己的一套（例如 Command Code 的{' '}
+                            <code>typesafe/jev</code>），照对方文档填。
                           </p>
                           <div className="flex items-center gap-2">
                             <span className="text-xs text-zinc-400 flex-shrink-0 w-24">
@@ -696,9 +698,12 @@ export function AgentPolicySection() {
                             />
                           </div>
                           <p className="text-xs text-zinc-500">
-                            只在需要走代理、私有网关或本地 mock 时填；填了之后请求
-                            打到的就是你这里的地址（路径 <code>/v1/systemone</code>
-                            不变）。留空 = 保持官方地址。
+                            只在需要走代理、私有网关或本地 mock 时填。路径{' '}
+                            <code>/v1/systemone</code> 是固定拼上去的——如果对方
+                            文档给的基址末尾带 <code>/v1</code>
+                            （如 <code>https://api.commandcode.ai/provider/v1</code>
+                            ），要把那段去掉，否则会拼成{' '}
+                            <code>…/v1/v1/systemone</code> 而 404。留空 = 保持官方地址。
                           </p>
                           {needsUrlScheme(agent.jevBaseUrl) && (
                             <p className="text-xs text-amber-400/90">
