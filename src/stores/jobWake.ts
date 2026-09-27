@@ -30,7 +30,7 @@ import * as tauri from '@/lib/tauri';
 import { subscribeTauriEvent, type Unsubscribe } from '@/lib/tauriEvent';
 import type { JobInfo } from '@/lib/types';
 import {
-  conversationHasRunningTask,
+  conversationIsBusy,
   useConversationStore,
 } from './conversationStore';
 import { mapJob, useJobStore } from './jobStore';
@@ -74,8 +74,10 @@ export async function maybeContinueForConversation(
 ): Promise<void> {
   if (!conversationId || !sessionId || waking.has(conversationId)) return;
   // 会话里已经有任务在跑（用户刚发过消息、或上一轮还没收尾）→ 那一边会把
-  // 结局注入进去，这里不抢。
-  if (conversationHasRunningTask(conversationId)) return;
+  // 结局注入进去，这里不抢。**正在压缩上下文时同样不抢**：压缩卡按「提交那一刻
+  // 的队尾」落位，这一轮写进去的消息会被卡片盖到后面、被归档边界从后续请求里
+  // 抹掉 —— 而且这条路径不需要用户做任何操作，一旦漏掉就是静默丢上下文。
+  if (conversationIsBusy(conversationId)) return;
   // 额度用尽 → 不再自动开轮（结局仍待播报）。
   if (!canAutoContinue(conversationId)) return;
 

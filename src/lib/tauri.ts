@@ -307,6 +307,15 @@ export async function agentCompactConversation(
   });
 }
 
+/** 取消该会话正在跑的手动压缩（压缩中的「取消压缩」按钮）。
+ *
+ *  返回「确实取消了一次在册压缩」：false 只说明这次点晚了（事件已到、命令已
+ *  返回），不是错误。取消后后端会发 `Skipped{attempted:true}`，进行中的卡片转成
+ *  「上下文压缩未完成：已取消」，原文与库都不动。 */
+export async function agentCancelCompaction(conversationId: string): Promise<boolean> {
+  return invoke<boolean>("agent_cancel_compaction", { conversationId });
+}
+
 export async function agentApproveOperation(
   taskId: string,
   operationId: string,

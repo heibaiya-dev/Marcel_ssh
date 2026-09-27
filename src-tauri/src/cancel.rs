@@ -76,6 +76,40 @@ impl CancellationRegistry {
         }
     }
 
+    /// 注册一个取消通道，但**同一个 id 只允许一个在册目标**：已有在册者时返回
+    /// `None`，调用方据此拒绝这次开始。
+    ///
+    /// 与 `register` 的分工是刻意的：`register` 是「重新开始」语义（同一 id 可以
+    /// 有多份注册，各自的 guard 只管自己那一次）；`try_register` 是「**互斥**」
+    /// 语义 —— 同一时刻只允许一个执行体。手动压缩（`commands/agent_compact.rs`）
+    /// 属于后者：同一会话并发两次压缩会各写一张卡，破坏「恒单卡」，而归档边界
+    /// 正是按「最新一张卡」定义的。
+    ///
+    /// 在册 = 进行中：`is_registered` 即「这个会话正在压缩」（`agent_start_task`
+    /// 拿它做兜底守卫），`cancel` 一 remove 即「已请求取消」。注意 `cancel` 会把
+    /// 表项摘掉，所以被取消之后到执行体真正返回之间，`is_registered` 已经是 false
+    /// —— 那段时间的写入拦截靠调用方自己的生命周期（前端持有会话写锁直到命令返回）。
+    #[must_use = "Registration 一旦被丢弃就会立刻注销，占位与取消信号随之失效"]
+    pub fn try_register(&self, id: &str) -> Option<Registration> {
+        let (tx, rx) = watch::channel(false);
+        let seq = {
+            let mut inner = self.inner.write();
+            if inner.senders.contains_key(id) {
+                return None;
+            }
+            let seq = inner.next_seq;
+            inner.next_seq = inner.next_seq.wrapping_add(1);
+            inner.senders.insert(id.to_string(), (seq, tx));
+            seq
+        };
+        Some(Registration {
+            id: id.to_string(),
+            seq,
+            registry: self.clone(),
+            rx,
+        })
+    }
+
     /// 取消并注销。返回「确实取消了一个在册目标」。
     ///
     /// 不在册时返回 `false`（任务已结束、或已被取消过）—— 与旧写法
@@ -136,15 +170,16 @@ impl Drop for Registration {
 }
 
 impl CancellationRegistry {
-    /// 表里此刻是否登记着这个 id（测试钩子）。
+    /// 表里此刻是否登记着这个 id —— 对 `try_register` 的使用者来说这就是
+    /// 「**这个执行体现在处于进行中**」（手动压缩：该会话正在压缩）。
     ///
-    /// 存在的唯一理由是让「Drop 有没有把表项摘掉」**可观测**：不经过 `cancel` 的
+    /// 另一半用途是让「Drop 有没有把表项摘掉」**可观测**：不经过 `cancel` 的
     /// 纯 Drop 路径此前只被一条「Drop 后接收端看到通道关闭」间接守着，而那条在实现
     /// 变坏时是**挂死**（`changed()` 永不等不到结果）而不是干净变红 —— 没有超时的
     /// `cargo test` 会一直挂着。而「Drop 必须注销」是生产不变量：漏了它取消表会随
-    /// 任务数永久泄漏，且已结束的任务仍会被 `cancel` 命中。
-    #[cfg(test)]
-    pub(crate) fn is_registered(&self, id: &str) -> bool {
+    /// 任务数永久泄漏，且已结束的任务仍会被 `cancel` 命中，正在压缩的会话也会
+    /// 永远被 `agent_start_task` 拒掉。
+    pub fn is_registered(&self, id: &str) -> bool {
         self.inner.read().senders.contains_key(id)
     }
 }
@@ -171,6 +206,47 @@ mod tests {
     async fn cancel_on_unknown_id_is_false_not_panic() {
         let reg = CancellationRegistry::new();
         assert!(!reg.cancel("never-registered"));
+    }
+
+    /// `try_register` 的互斥语义：同一 id 第二次必须被拒。
+    #[tokio::test]
+    async fn try_register_rejects_a_second_target_for_the_same_id() {
+        let reg = CancellationRegistry::new();
+        let first = reg.try_register("c1").expect("首次注册应成功");
+        assert!(reg.is_registered("c1"), "在册 = 这个会话正在压缩");
+
+        assert!(
+            reg.try_register("c1").is_none(),
+            "同一 id 已有在册目标时必须返回 None：并发两次压缩会各写一张卡，破坏恒单卡"
+        );
+        let other = reg.try_register("c2").expect("不同 id 互不影响");
+        drop((first, other));
+
+        assert!(!reg.is_registered("c1"), "guard Drop 后应注销");
+        assert!(
+            reg.try_register("c1").is_some(),
+            "上一个结束后应能重新开始"
+        );
+    }
+
+    /// 取消路径：guard 还活着（命令尚未返回）时，接收端必须立刻收到信号 ——
+    /// 压缩管道正是靠它在 `select!` 里中断摘要调用。
+    #[tokio::test]
+    async fn try_register_cancel_signals_while_the_guard_is_still_alive() {
+        let reg = CancellationRegistry::new();
+        let guard = reg.try_register("c1").expect("应可注册");
+        let mut rx = guard.receiver();
+
+        assert!(reg.cancel("c1"), "在册目标应被取消");
+        rx.changed().await.expect("应收到取消信号");
+        assert!(*rx.borrow());
+        assert!(!reg.is_registered("c1"), "cancel 会摘掉表项");
+
+        drop(guard); // 对已摘掉的表项是幂等的
+        assert!(
+            reg.try_register("c1").is_some(),
+            "取消后应能重新开始（前端在命令返回前仍持有会话写锁，不会真并发）"
+        );
     }
 
     /// **不经过 `cancel`** 的纯 Drop 路径必须注销。

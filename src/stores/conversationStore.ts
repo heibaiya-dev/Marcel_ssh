@@ -88,6 +88,15 @@ export interface ConversationState {
    */
   compactConversation: (conversationId: string) => Promise<AgentCompactResult>;
   /**
+   * 取消该会话正在跑的手动压缩（压缩中的「取消压缩」按钮）。返回「确实取消了一次
+   * 在册压缩」——`false` 只说明这次点晚了（事件已到、命令已返回），不是错误。
+   *
+   * **不在这里解锁**：占位要等 `compactConversation` 的 `finally` 才释放。摘要调用
+   * 可能刚好在取消到达之前跑完，那种情况下它仍会落库（`select!` 只包住进行中的
+   * 请求），这时放进一条新消息就又踩回原来的坑。
+   */
+  cancelCompaction: (conversationId: string) => Promise<boolean>;
+  /**
    * 注册 subagent 工具派发的子agent对话：插入 conversation 条目 + 骨架消息
    * （user=prompt、assistant=loading 占位）。子agent流式 listener 挂上后
    * 会实时更新该对话；不改变当前 active 对话。
@@ -290,6 +299,32 @@ export function conversationHasRunningTask(conversationId: string): boolean {
 }
 
 /**
+ * 该对话是否正在手动压缩上下文（见 `taskStore.compacting`）。
+ *
+ * 与 `conversationHasRunningTask` 并列存在，只为「提示文案要说清是哪一种忙」；
+ * 判断「能不能往这个对话写东西」一律用下面的 `conversationIsBusy`。
+ */
+export function conversationIsCompacting(conversationId: string): boolean {
+  return !!useTaskStore.getState().compacting[conversationId];
+}
+
+/**
+ * 该对话此刻**能不能被写入** —— 「有运行中的任务」或「正在压缩上下文」。
+ *
+ * 这是唯一入口：任何「往这个对话写消息 / 改写它的历史」的动作（发送、`/` 命令
+ * 菜单、撤回回滚、后台作业自动继续、再压一次）都必须问它，而不是自己挑一个
+ * 子条件。手动压缩此前正是漏在这张表之外 —— 它不是任务，于是前端所有 busy
+ * 判定都看不见它，压缩期间发出去的消息会被随后落下的压缩卡盖到后面、被归档
+ * 边界（最新一张卡之前的行）从后续请求里抹掉。
+ *
+ * 后端 `agent_start_task` 还有一道同样的兜底守卫（`AppState.compactions`），
+ * 但那是防御，不是理由 —— 这里漏了，用户会看到自己的消息被静默吞掉。
+ */
+export function conversationIsBusy(conversationId: string): boolean {
+  return conversationIsCompacting(conversationId) || conversationHasRunningTask(conversationId);
+}
+
+/**
  * 切换对话后恢复"当前活动任务"：
  * 该对话有 running task（主 agent / 子 agent）→ 设为 activeTaskId（停止按钮、
  * isRunning 随之恢复）；否则清空。
@@ -408,7 +443,9 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     const known = get().conversations[conversationId];
     // 运行中的对话（主 agent / 子 agent 在跑）：跳过 DB 重载，保留内存消息
     // （运行中的 tool 卡片等流式状态尚未落库，重载会导致卡片消失）。
-    const running = conversationHasRunningTask(conversationId);
+    // 压缩中的对话同理：进行中的压缩卡还没落库，重载会把它从 live store 里冲掉,
+    // 用户切走再切回来就看不出这个会话正在压缩了。
+    const running = conversationIsBusy(conversationId);
     const [activeRes, storedPlans, meta] = await Promise.all([
       running ? Promise.resolve(null) : tauri.agentLoadActiveMessages(conversationId),
       running ? Promise.resolve(null) : tauri.agentLoadPlansByConversation(conversationId),
@@ -458,7 +495,8 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     // 改 active，竞态下会盖掉更新的 tab」说的就是它）。
     const myGeneration = activeSelectionGeneration;
     const known = get().conversations[conversationId];
-    const running = conversationHasRunningTask(conversationId);
+    // 同 switchConversation：任务在跑或正在压缩都不重载（后者的进行中卡片没落库）
+    const running = conversationIsBusy(conversationId);
     const [activeRes, storedPlans, meta] = await Promise.all([
       running ? Promise.resolve(null) : tauri.agentLoadActiveMessages(conversationId),
       running ? Promise.resolve(null) : tauri.agentLoadPlansByConversation(conversationId),
@@ -1174,10 +1212,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   },
 
   compactConversation: async (conversationId: string) => {
-    // busy 守卫（与后端一致）：运行中不允许手动压缩（'/' 菜单运行中也不唤出）。
-    // 守卫在 listener 建立之前，事件路径不可达 → 直接给可见提示再拒绝。
-    if (conversationHasRunningTask(conversationId)) {
-      const err = new Error('会话正在运行任务，请等待任务结束或停止后再压缩');
+    // busy 守卫（与后端一致）：有任务在跑、或已经在压缩 → 拒绝（'/' 菜单同样
+    // 不唤出）。守卫在 listener 建立之前，事件路径不可达 → 直接给可见提示再拒绝。
+    // 分两种文案：用户要能分清「等任务」还是「等这次压缩」。
+    if (conversationIsBusy(conversationId)) {
+      const err = new Error(
+        conversationIsCompacting(conversationId)
+          ? '该会话正在压缩上下文，请等待完成或取消后再试'
+          : '会话正在运行任务，请等待任务结束或停止后再压缩',
+      );
       get().updateConversationMessages(conversationId, (msgs) => [
         ...msgs,
         {
@@ -1189,10 +1232,20 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       ]);
       throw err;
     }
+    // 占位：从这里开始到 `finally` 解锁为止，本会话对外表现为「忙」——
+    // 发送、`/` 菜单、撤回、后台作业自动继续全部让路。
+    //
+    // 快照必须先于上锁，且两者之间**没有任何 await**（都是同步代码，别的写入
+    // 插不进来）：先上锁再算快照的话，`buildLlmHistory` 万一抛错锁就泄留了。
+    // 压缩的卡片按「提交那一刻的队尾」落位（后端 `persist_compaction`、前端
+    // `applyCompactionSplice` 的 manual 分支），从这份快照到提交之间隔着一次完整
+    // 的摘要调用——这期间写进来的消息会被卡片盖到后面，再被归档边界（最新一张卡
+    // 之前的行）从后续请求里抹掉，占位就是为了让这个窗口一次都不出现。
     const taskId = crypto.randomUUID();
     // 压缩对象 = buildLlmHistory 产物（与 agent_start_task 同源，tool 协议
     // 已闭合修正，避免中断遗留的未闭合 tool 调用组导致无法压缩）
     const history = get().buildLlmHistory(conversationId);
+    useTaskStore.getState().beginCompaction(conversationId);
     try {
       // 完整复用现有 stream 监听：后端把压缩事件实时转发到
       // `agent://stream/{taskId}`，经 attachStreamListener 分发到
@@ -1269,7 +1322,14 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       throw err;
     } finally {
       cleanupTaskListeners(taskId);
+      // 解锁（成功 / 跳过 / 失败 / 被取消都要走到）。漏掉它 = 该会话输入框
+      // 永久禁用：发送、`/` 菜单、撤回全被 `conversationIsBusy` 拦住。
+      useTaskStore.getState().endCompaction(conversationId);
     }
+  },
+
+  cancelCompaction: async (conversationId: string) => {
+    return tauri.agentCancelCompaction(conversationId);
   },
 
   registerSubConversation: (conversationId, connectionId, title, subTaskId, prompt, parentConversationId) => {

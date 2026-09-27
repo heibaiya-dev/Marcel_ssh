@@ -101,6 +101,21 @@ pub struct AppState {
     pub download_cancel: crate::cancel::CancellationRegistry,
     /// 插件安装的取消信号（install_id → 取消通道）。
     pub plugin_install_cancel: crate::cancel::CancellationRegistry,
+    /// **手动**上下文压缩的占位与取消信号（conversation_id → 取消通道）。
+    ///
+    /// 与上面四张表的区别：这里用 `try_register`（同一 id 只允许一个在册目标），
+    /// 所以「在册」本身就是**互斥锁**——同一会话不允许并发两次压缩（会各写一张卡、
+    /// 破坏归档边界的「恒单卡」前提）。同时它是那次摘要调用的取消通道，用户点
+    /// 「取消压缩」即在这里置位，`context/mod.rs` 的 `select!` 立刻中断摘要。
+    ///
+    /// 为什么需要这张表：压缩不是任务（不进 `agent_tasks`），此前它**完全不可见**
+    /// ——运行中发的消息会被随后落下的压缩卡盖到后面，归档边界于是把那条消息从
+    /// 后续请求里抹掉。现在 `agent_compact_conversation` 在入口占位、
+    /// `agent_start_task` 在入口查位，两侧都不再当会话空闲。
+    ///
+    /// 键是会话 id 而不是任务 id：压缩的守卫与取消都按「会话」问（一次压缩就是
+    /// 该会话的一次独占操作），与 `task_cancel` 按 task_id 键控是两回事。
+    pub compactions: crate::cancel::CancellationRegistry,
     /// 命令执行统一管理器：所有 SSH 命令执行（用户直发 / 系统长任务 /
     /// Agent 工具 / 插件）的唯一入口，集中管理执行记录、取消注册表
     /// （取代旧的 long_exec_cancel_senders）、断连级联取消与后台作业
@@ -522,6 +537,7 @@ impl AppState {
             upload_cancel: crate::cancel::CancellationRegistry::new(),
             download_cancel: crate::cancel::CancellationRegistry::new(),
             plugin_install_cancel: crate::cancel::CancellationRegistry::new(),
+            compactions: crate::cancel::CancellationRegistry::new(),
             command_exec,
             sysopen_watchers: std::sync::Arc::new(PlRwLock::new(HashMap::new())),
             sysopen_active_paths: std::sync::Arc::new(PlRwLock::new(HashMap::new())),
@@ -840,6 +856,7 @@ pub fn run() {
             commands::agent_lifecycle::agent_reject_operation,
             commands::agent_lifecycle::agent_answer_question,
             commands::agent_compact::agent_compact_conversation,
+            commands::agent_compact::agent_cancel_compaction,
             commands::agent_policy::agent_check_command,
             commands::agent_policy::agent_default_approval_prompt,
             commands::agent_conversation::agent_create_conversation,

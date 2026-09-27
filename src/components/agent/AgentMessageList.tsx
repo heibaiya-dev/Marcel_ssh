@@ -28,8 +28,9 @@ import { TurnFoldGroup } from "./TurnFoldGroup";
 
 interface Props {
   messages: AgentMessage[];
-  isThinking?: boolean;
-  isRunning?: boolean;
+  /** 禁用「撤回」入口（有任务在跑、或该会话正在压缩上下文 —— 见
+   *  `conversationStore.conversationIsBusy`）。只读历史视图不传。 */
+  rollbackDisabled?: boolean;
   onRollback?: (message: AgentMessage) => void;
   onCopy?: (message: AgentMessage) => void;
   messagesEndRef?: RefObject<HTMLDivElement>;
@@ -154,8 +155,7 @@ function buildTurnItems(
 
 function AgentMessageList({
   messages,
-  isThinking,
-  isRunning = false,
+  rollbackDisabled = false,
   onRollback,
   onCopy,
   messagesEndRef,
@@ -563,7 +563,7 @@ function AgentMessageList({
         <AgentMessageItem
           message={msg}
           autoExpand={!!msg.isThinking}
-          rollbackDisabled={isRunning}
+          rollbackDisabled={rollbackDisabled}
           onRollback={onRollback}
           onCopy={onCopy}
           searchKeyword={searchKeyword}
@@ -574,9 +574,9 @@ function AgentMessageList({
     // wrapMessage 引用的 flashId/matchedSet 属父级状态；折叠区命中时由
     // forceExpand 展开，故这里不需要它们进依赖（普通路径在父级每次渲染时
     // 重建也无妨——它只影响可见行，不触发折叠区）。依赖保持最小：
-    // expandedIds/isThinking/isRunning 变化才重建。
+    // expandedIds 变化才重建。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [expandedIds, isThinking, isRunning, onRollback, onCopy, searchKeyword, alwaysShowActions],
+    [expandedIds, rollbackDisabled, onRollback, onCopy, searchKeyword, alwaysShowActions],
   );
 
   const conversationId = activeConversationId ?? "";

@@ -22,7 +22,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import {
   useConversationStore,
-  conversationHasRunningTask,
+  conversationIsBusy,
 } from "@/stores/conversationStore";
 import { sessionConversationBindingManager } from "@/stores/sessionConversationBindingManager";
 import { AGENT_MODES } from "@/lib/constants";
@@ -150,6 +150,11 @@ export default function AgentPanel() {
   const tasks = useTaskStore((s) => s.tasks);
   const unreadCompletedConversations = useTaskStore(
     (s) => s.unreadCompletedConversations,
+  );
+  // 本会话是否正在手动压缩上下文（订阅而非直接读 store：压缩一开始就要立刻
+  // 禁用发送键并显示原因，不能等第一条压缩事件把它带出来）。
+  const isCompacting = useTaskStore((s) =>
+    activeConversationId ? !!s.compacting[activeConversationId] : false,
   );
 
   // 子agent对话不在会话列表展示：只通过主对话的 task 卡片进入/返回
@@ -342,6 +347,13 @@ export default function AgentPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only react to vision toggle
   }, [visionEnabled]);
 
+  const resizeInput = useCallback(() => {
+    const textarea = inputRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 96)}px`;
+  }, []);
+
   /** 追加文本附件到输入框草稿（带文件名标记），并保持输入框自动增高。 */
   const appendTextAttachment = useCallback(
     (text: string) => {
@@ -351,7 +363,7 @@ export default function AgentPanel() {
         notifyInputTyping();
       });
     },
-    [setInput],
+    [setInput, resizeInput],
   );
 
   /** 统一处理一组本地 File（拖拽 / 粘贴）：图片 → 预览区，文本 → 插入输入框。 */
@@ -586,7 +598,10 @@ export default function AgentPanel() {
   };
 
   const handleSend = async () => {
-    if (isRunning || sendingRef.current) return;
+    // 压缩中把消息发出去 = 消息会被随后落下的压缩卡盖到后面、再被归档边界
+    // 从后续请求里抹掉（见 taskStore.compacting 的注释）。返回键与发送键同一
+    // 判定；屏幕上常驻的原因说明负责让用户知道为什么没反应。
+    if (isRunning || isCompacting || sendingRef.current) return;
     const prompt = input.trim();
     const images = visionEnabled ? pendingImages : [];
     if ((!prompt && images.length === 0) || !canInteract) return;
@@ -643,12 +658,13 @@ export default function AgentPanel() {
   // 输入以 "/" 开头且不含空格时激活（含空格视为普通文本，避免路径输入误弹）。
   // 任务运行中不唤出：手动压缩与运行中任务并发会造成替换竞态（对齐 DSH
   // compactNow 的 busy 语义），其它命令（模式切换）在运行中也没有意义。
-  // 键盘事件在打开时交给面板组件消费（↑↓/Enter/Esc/子菜单 Backspace）。
+  // 压缩中同样不唤出 —— 会话忙的两种情况走同一个 `conversationIsBusy`，
+  // 顺带堵住「压缩中再点一次压缩」（两次摘要各写一张卡会破坏恒单卡）。
+  // 键盘事件在打开时交给面板组件处理（↑↓/Enter/Esc/子菜单 Backspace）。
   const commandMenuOpen =
     input.startsWith("/") &&
     !/\s/.test(input) &&
-    (!activeConversationId ||
-      !conversationHasRunningTask(activeConversationId));
+    (!activeConversationId || !conversationIsBusy(activeConversationId));
   const commandMenuQuery = commandMenuOpen ? input.slice(1) : "";
 
   const handleCompact = () => {
@@ -659,6 +675,20 @@ export default function AgentPanel() {
       .compactConversation(activeConversationId)
       .catch((err) => {
         console.error("Failed to compact conversation:", err);
+      });
+  };
+
+  // 「取消压缩」：中断正在跑的摘要调用（后端置位取消通道），随后走既有的
+  // Skipped 分支把进行中的卡片转成「未完成：已取消」，会话占位随之释放。
+  // 解锁交给 compactConversation 的 finally —— 这里提前放行会让「取消晚于摘要
+  // 完成」的那次落库和新消息撞在一起。
+  const handleCancelCompaction = () => {
+    if (!activeConversationId) return;
+    void useConversationStore
+      .getState()
+      .cancelCompaction(activeConversationId)
+      .catch((err) => {
+        console.error("Failed to cancel compaction:", err);
       });
   };
 
@@ -687,13 +717,6 @@ export default function AgentPanel() {
     notifyInputTyping();
   };
 
-  const resizeInput = () => {
-    const textarea = inputRef.current;
-    if (!textarea) return;
-    textarea.style.height = "auto";
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 96)}px`;
-  };
-
   useLayoutEffect(() => {
     const textarea = inputRef.current;
     if (!textarea || !input) return;
@@ -701,7 +724,7 @@ export default function AgentPanel() {
     textarea.style.height = `${Math.min(textarea.scrollHeight, 96)}px`;
   }, [input]);
 
-  const showRollbackNotice = (removedCount: number) => {
+  const showRollbackNotice = useCallback((removedCount: number) => {
     setRollbackNotice(`已撤回 ${removedCount} 条消息，原消息已放回输入框`);
     if (rollbackNoticeTimerRef.current !== null) {
       window.clearTimeout(rollbackNoticeTimerRef.current);
@@ -710,10 +733,12 @@ export default function AgentPanel() {
       setRollbackNotice(null);
       rollbackNoticeTimerRef.current = null;
     }, 4200);
-  };
+  }, []);
 
-  const handleRollbackMessage = async (message: AgentMessage) => {
-    if (!activeConversationId || isRunning) return;
+  const handleRollbackMessage = useCallback(async (message: AgentMessage) => {
+    // 压缩中同样不许撤回：撤回会删掉压缩区间里的 DB 行，而这次压缩的卡片正按
+    // 「提交那一刻的队尾」落位 —— 锚点被抽掉，落库要么失败要么落到错的位置。
+    if (!activeConversationId || isRunning || isCompacting) return;
     try {
       const result = await rollbackToMessage(activeConversationId, message.id);
       setInput(result.prompt);
@@ -761,15 +786,19 @@ export default function AgentPanel() {
     } catch (err) {
       console.error("Failed to rollback message:", err);
     }
-  };
+  }, [
+    activeConversationId, isRunning, isCompacting, rollbackToMessage, setInput,
+    clearPendingImages, visionEnabled, deletePersistedPaths, showAttachHint,
+    showRollbackNotice, resizeInput,
+  ]);
 
-  const handleCopyMessage = async (message: AgentMessage) => {
+  const handleCopyMessage = useCallback(async (message: AgentMessage) => {
     try {
       await writeText(message.content);
     } catch (err) {
       console.error("Failed to copy message:", err);
     }
-  };
+  }, []);
 
   const handleStop = () => {
     stopActiveTask();
@@ -1069,7 +1098,7 @@ export default function AgentPanel() {
           {canInteract && (
             <AgentMessageList
               messages={messages}
-              isRunning={isRunning}
+              rollbackDisabled={isRunning || isCompacting}
               onRollback={handleRollbackMessage}
               onCopy={handleCopyMessage}
               messagesEndRef={messagesEndRef}
@@ -1196,6 +1225,14 @@ export default function AgentPanel() {
           {attachHint && (
             <div className="mb-2 px-2 py-1.5 rounded-md bg-amber-950/60 border border-amber-800/50 text-xs text-amber-200">
               {attachHint}
+            </div>
+          )}
+          {/* 压缩中常驻的原因说明：发送键这时是「取消压缩」，回车也发不出去，
+              没有这一行用户只会觉得输入框坏了。配色跟随会话里那张进行中卡。 */}
+          {isCompacting && (
+            <div className="mb-2 flex items-center gap-2 px-2 py-1.5 rounded-md bg-violet-950/50 border border-violet-800/50 text-xs text-violet-200">
+              <span className="h-2 w-2 shrink-0 rounded-full bg-violet-400/90" />
+              正在压缩上下文，完成后即可发送（可点右下角取消）
             </div>
           )}
           {pendingImages.length > 0 && (
@@ -1402,12 +1439,22 @@ export default function AgentPanel() {
 
             <div className="flex-1" />
 
-            {/* Send / Stop button — 右下角 */}
+            {/* Send / Stop / Cancel-compaction button — 右下角
+                三态：任务运行中 = 停止（红）；正在压缩上下文 = 取消压缩（紫，
+                压缩不能暂停，这是它唯一的出路）；否则 = 发送。
+                压缩时发送键不能只是「禁用」：那会让用户干等几十秒。 */}
             <button
               type="button"
-              onClick={isRunning ? handleStop : handleSend}
+              onClick={
+                isRunning
+                  ? handleStop
+                  : isCompacting
+                    ? handleCancelCompaction
+                    : handleSend
+              }
               disabled={
                 !isRunning &&
+                !isCompacting &&
                 ((!input.trim() && pendingImages.length === 0) || !canInteract)
               }
               className={`
@@ -1415,11 +1462,13 @@ export default function AgentPanel() {
               ${
                 isRunning
                   ? "bg-red-600 hover:bg-red-500 text-white"
-                  : "bg-indigo-600 hover:bg-indigo-500 text-white disabled:bg-zinc-700 disabled:text-zinc-500 disabled:cursor-not-allowed"
+                  : isCompacting
+                    ? "bg-violet-600 hover:bg-violet-500 text-white"
+                    : "bg-indigo-600 hover:bg-indigo-500 text-white disabled:bg-zinc-700 disabled:text-zinc-500 disabled:cursor-not-allowed"
               }
             `}
-              title={isRunning ? "停止" : "发送"}
-              aria-label={isRunning ? "停止" : "发送"}
+              title={isRunning ? "停止" : isCompacting ? "取消压缩" : "发送"}
+              aria-label={isRunning ? "停止" : isCompacting ? "取消压缩" : "发送"}
             >
               {isRunning ? (
                 <svg
@@ -1435,6 +1484,20 @@ export default function AgentPanel() {
                     height="12"
                     rx="1"
                     fill="currentColor"
+                  />
+                </svg>
+              ) : isCompacting ? (
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M6 6l12 12M18 6L6 18"
                   />
                 </svg>
               ) : (

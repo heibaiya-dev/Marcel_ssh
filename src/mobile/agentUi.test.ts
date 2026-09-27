@@ -70,6 +70,22 @@ describe('canSendAgentPrompt', () => {
       ),
     ).toBe(false);
   });
+
+  it('blocks send while the conversation is being compacted', () => {
+    // busy 的第二种来源：手动压缩上下文。调用方算的是
+    // `isRunning || isCompacting`（或 conversationIsBusy）—— 压缩不是任务，
+    // 只看 isRunning 时它完全隐形，而这期间发出去的消息会被随后落下的压缩卡
+    // 盖到后面、被归档边界从后续请求里抹掉。
+    const running = false;
+    const compacting = true;
+    expect(
+      canSendAgentPrompt(
+        session({ id: 's1', status: 'connected', configId: 'cfg-1' }),
+        running || compacting,
+        'hi',
+      ),
+    ).toBe(false);
+  });
 });
 
 describe('agentEmptyStateReason', () => {

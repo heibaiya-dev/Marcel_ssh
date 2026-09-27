@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowUp, ChevronDown, Plus, Square } from "lucide-react";
+import { ArrowUp, ChevronDown, Plus, Square, X } from "lucide-react";
 import { Pencil, Pin, Trash2 } from "lucide-react";
 import { useAgent } from "@/hooks/useAgent";
 import { useTaskStore } from "@/stores/taskStore";
@@ -14,7 +14,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import {
   useConversationStore,
-  conversationHasRunningTask,
+  conversationIsBusy,
 } from "@/stores/conversationStore";
 import { sessionConversationBindingManager } from "@/stores/sessionConversationBindingManager";
 import { groupConversationsWithPinned } from "@/lib/dateGrouping";
@@ -144,6 +144,14 @@ export default function MobileAgentHost({
   // 图片支持按「当前会话实际生效模型」判定（会话记忆 → 全局最近使用）
   const registry = useSettingsStore((s) => s.settings.llmRegistry);
   const visionEnabled = currentVision(registry, activeConversation?.modelId ?? null);
+  // 本会话是否正在手动压缩上下文（订阅而非直接读：压缩一开始就要禁用发送并
+  // 显示原因，不能等第一条压缩事件把它带出来）
+  const isCompacting = useTaskStore((s) =>
+    activeConversationId ? !!s.compacting[activeConversationId] : false,
+  );
+  // 「会话忙」= 任务在跑或正在压缩 —— 发送、`/` 菜单、撤回共用这一个判定
+  // （与桌面同源，见 conversationStore.conversationIsBusy）。
+  const conversationBusy = isRunning || isCompacting;
 
   // 占用环读数（百分比、未配置窗口的降级都由 `lib/tokenUsage.ts` 定，与桌面端同一份）
   const meter = contextMeterView(activeUsageView?.usage, activeUsageView?.windowTokens);
@@ -579,8 +587,8 @@ export default function MobileAgentHost({
   }, [canInteract, ids, handleAttachmentPaths, showAttachHint]);
 
   const handleSend = useCallback(async () => {
-    if (isRunning || sendingRef.current) return;
-    if (!canSendAgentPrompt(activeSession, isRunning, inputDraft)) return;
+    if (conversationBusy || sendingRef.current) return;
+    if (!canSendAgentPrompt(activeSession, conversationBusy, inputDraft)) return;
     if (!ids) return;
     const prompt = inputDraft.trim();
     const images = visionEnabled ? pendingImages : [];
@@ -613,7 +621,7 @@ export default function MobileAgentHost({
     activeSession,
     ids,
     inputDraft,
-    isRunning,
+    conversationBusy,
     canInteract,
     sendPrompt,
     setInputDraft,
@@ -625,7 +633,9 @@ export default function MobileAgentHost({
 
   const handleRollbackMessage = useCallback(
     async (message: AgentMessage) => {
-      if (!activeConversationId || isRunning) return;
+      // 压缩中同样不许撤回：撤回会删掉压缩区间里的 DB 行，而这次压缩的卡片正按
+      // 「提交那一刻的队尾」落位 —— 锚点被抽掉，落库要么失败要么落到错的位置。
+      if (!activeConversationId || conversationBusy) return;
       try {
         const result = await rollbackToMessage(
           activeConversationId,
@@ -647,7 +657,7 @@ export default function MobileAgentHost({
     },
     [
       activeConversationId,
-      isRunning,
+      conversationBusy,
       rollbackToMessage,
       setInputDraft,
       showRollbackHint,
@@ -672,11 +682,12 @@ export default function MobileAgentHost({
   // ── `/` 命令面板（与桌面同款组件）：输入以 "/" 开头时在输入框上方弹出，
   // 手机端以触摸点选为主；软键盘回车/发送语义不变。
   // 任务运行中不唤出（与桌面一致）：手动压缩与运行中任务并发会造成替换竞态。
+  // 压缩中同样不唤出 —— 会话忙的两种情况走同一个 `conversationIsBusy`，顺带
+  // 堵住「压缩中再点一次压缩」（两次摘要各写一张卡会破坏恒单卡）。
   const commandMenuOpen =
     inputDraft.startsWith("/") &&
     !/\s/.test(inputDraft) &&
-    (!activeConversationId ||
-      !conversationHasRunningTask(activeConversationId));
+    (!activeConversationId || !conversationIsBusy(activeConversationId));
   const commandMenuQuery = commandMenuOpen ? inputDraft.slice(1) : "";
 
   const handleCompact = useCallback(() => {
@@ -687,6 +698,20 @@ export default function MobileAgentHost({
       .compactConversation(activeConversationId)
       .catch((err) => {
         console.error("Failed to compact conversation:", err);
+      });
+  }, [activeConversationId]);
+
+  // 「取消压缩」：中断正在跑的摘要调用（后端置位取消通道），随后走既有的
+  // Skipped 分支把进行中的卡片转成「未完成：已取消」，会话占位随之释放。
+  // 解锁交给 compactConversation 的 finally —— 这里提前放行会让「取消晚于摘要
+  // 完成」的那次落库和新消息撞在一起。
+  const handleCancelCompaction = useCallback(() => {
+    if (!activeConversationId) return;
+    void useConversationStore
+      .getState()
+      .cancelCompaction(activeConversationId)
+      .catch((err) => {
+        console.error("Failed to cancel compaction:", err);
       });
   }, [activeConversationId]);
 
@@ -712,7 +737,12 @@ export default function MobileAgentHost({
 
   const sendEnabled =
     !!ids &&
-    canSendAgentPrompt(activeSession, isRunning, inputDraft, pendingImages.length > 0);
+    canSendAgentPrompt(
+      activeSession,
+      conversationBusy,
+      inputDraft,
+      pendingImages.length > 0,
+    );
   const hostLabel =
     resolveSessionDisplayName(activeSession, connections) || "智能助手";
   const statusText = activeSession
@@ -853,10 +883,10 @@ export default function MobileAgentHost({
           {canInteract && (
             <AgentMessageList
               messages={messages}
-              isRunning={isRunning}
+              rollbackDisabled={conversationBusy}
               messagesEndRef={messagesEndRef}
-              onRollback={(m) => void handleRollbackMessage(m)}
-              onCopy={(m) => void handleCopyMessage(m)}
+              onRollback={handleRollbackMessage}
+              onCopy={handleCopyMessage}
               alwaysShowActions
               // 宿主层已管贴底跟随；列表层不再二次写 scrollTop
               enableStickyFollow={false}
@@ -1138,6 +1168,14 @@ export default function MobileAgentHost({
               {attachHint}
             </div>
           )}
+          {/* 压缩中常驻的原因说明（与桌面同文案）：发送键这时是「取消压缩」，
+              回车也发不出去，没有这一行用户只会觉得输入框坏了。 */}
+          {isCompacting && (
+            <div className="mb-2 flex items-center gap-2 rounded-lg border border-violet-800/50 bg-violet-950/50 px-2.5 py-1.5 text-xs text-violet-200">
+              <span className="h-2 w-2 shrink-0 rounded-full bg-violet-400/90" />
+              正在压缩上下文，完成后即可发送（可点右下角取消）
+            </div>
+          )}
           {pendingImages.length > 0 && (
             <div className="mb-2 flex flex-wrap gap-2">
               {pendingImages.map((img) => (
@@ -1292,20 +1330,32 @@ export default function MobileAgentHost({
             >
               <ContextMeterRing percent={meter.percent} size={18} />
             </button>
+            {/* 三态（与桌面同款）：任务运行中 = 停止（红）；正在压缩上下文 =
+                取消压缩（紫，压缩不能暂停，这是它唯一的出路）；否则 = 发送。 */}
             <button
               type="button"
-              onClick={() => (isRunning ? handleStop() : void handleSend())}
-              disabled={!isRunning && !sendEnabled}
+              onClick={() =>
+                isRunning
+                  ? handleStop()
+                  : isCompacting
+                    ? handleCancelCompaction()
+                    : void handleSend()
+              }
+              disabled={!isRunning && !isCompacting && !sendEnabled}
               className={`mr-0.5 flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg text-white transition-transform duration-150 active:scale-95 disabled:opacity-40 ${
                 isRunning
                   ? "bg-red-600 active:bg-red-500"
-                  : "bg-indigo-600 active:bg-indigo-500"
+                  : isCompacting
+                    ? "bg-violet-600 active:bg-violet-500"
+                    : "bg-indigo-600 active:bg-indigo-500"
               }`}
-              title={isRunning ? "停止" : "发送"}
-              aria-label={isRunning ? "停止" : "发送"}
+              title={isRunning ? "停止" : isCompacting ? "取消压缩" : "发送"}
+              aria-label={isRunning ? "停止" : isCompacting ? "取消压缩" : "发送"}
             >
               {isRunning ? (
                 <Square className="h-4 w-4 fill-current" />
+              ) : isCompacting ? (
+                <X className="h-4 w-4" />
               ) : (
                 <ArrowUp className="h-[18px] w-[18px]" />
               )}

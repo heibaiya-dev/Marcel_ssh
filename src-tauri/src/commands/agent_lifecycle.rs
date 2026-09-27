@@ -25,6 +25,18 @@ pub async fn agent_start_task(
     // 认不出来一律当用户输入，见 `PromptOrigin::from_ipc`。
     origin: Option<String>,
 ) -> Result<String, AppError> {
+    // 兜底守卫：该会话正在手动压缩上下文 → 拒绝开这一轮。
+    //
+    // 正常时序下前端根本不会走到这里（压缩期间发送键禁用、`/` 菜单不唤出、后台
+    // 作业的自动继续让路，见 `conversationIsBusy`）。留这道守卫是因为**压缩卡按
+    // 「提交那一刻的队尾」落位**：从快照到提交之间写进来的任何一条消息，都会被
+    // 随后落下的卡盖到后面，然后被归档边界（最新一张卡之前的行）从后续请求里抹掉
+    // —— 那是静默丢上下文，不能只靠前端记得拦。
+    if state.compactions.is_registered(&conversation_id) {
+        return Err(AppError::Agent(
+            "会话正在压缩上下文，请等待完成或取消后再发送".into(),
+        ));
+    }
     // 前端可预生成 task_id 并先挂好事件 listener；旧调用方不传时仍由后端生成。
     let task_id = task_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     // 会话级模型选择（llmRegistry 模型条目 id）；None = 跟随全局默认模型。

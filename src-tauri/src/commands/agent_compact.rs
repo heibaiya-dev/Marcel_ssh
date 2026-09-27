@@ -63,6 +63,20 @@ pub async fn agent_compact_conversation(
         ));
     }
 
+    // 占位（互斥）：同一会话同一时刻只允许一次手动压缩；这张表同时是本次摘要
+    // 调用的取消通道（用户点「取消压缩」就在表里置位，摘要调用立即中断）。
+    //
+    // 为什么非要占位：压缩不是任务（不进 `agent_tasks`），此前它对整个系统**完全
+    // 不可见** —— 卡片按「**提交那一刻**的队尾」落位（见 `persist_compaction`），
+    // 而从快照到提交之间隔着一次完整的摘要调用（几十秒）。这期间写进来的消息会被
+    // 随后落下的卡盖到后面，归档边界（最新一张卡之前的行）于是把它从后续请求里
+    // 抹掉。占位之后 `agent_start_task` 也在入口查它，两侧都不再当会话空闲。
+    let Some(compaction_guard) = state.compactions.try_register(&conversation_id) else {
+        return Err(AppError::Agent(
+            "该会话正在压缩上下文，请等待完成或取消后再试".into(),
+        ));
+    };
+
     // LLM 配置（摘要模型解析优先级）：
     //   1. 显式「上下文压缩模型」槽位（用户明确选了就固定用它，与会话无关）；
     //   2. 否则会话级模型记忆（本会话 agent 正在用的模型）；
@@ -89,7 +103,8 @@ pub async fn agent_compact_conversation(
     // 摘要调用的工具 schema =「该会话下一次常规请求」会下发的那一份（走 `spawn`
     // 同一个 `build_registry`，工具集将来怎么变都自动跟上）：摘要调用与常规请求的
     // tools 段因而一致，模型也能据此理解历史里的工具调用（减少信息丢失）。
-    // 手动压缩跑在会话空闲时，凭设置里持久化的当前模式取清单。
+    // 手动压缩跑在会话空闲时（且全程占位，见上方 `try_register`），凭设置里
+    // 持久化的当前模式取清单。
     // 状态门控（read_history 该不该出现）按**压缩前**那一刻的会话状态判：摘要要
     // 解释的是压缩之前那段历史，而那段历史是在压缩前的工具集下产生的。
     let tools = AgentManager::new(state.inner().clone())
@@ -124,7 +139,9 @@ pub async fn agent_compact_conversation(
     let on_event = |ev: crate::agent::context::CompactionEvent| {
         forward_compaction_event(&app, &event_name, ev);
     };
-    let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    // 取消接收端取自占位凭据：`compaction_guard` 必须活到本次压缩结束（Drop 即
+    // 注销占位），所以它是命名绑定而不是 `_`。
+    let mut cancel_rx = compaction_guard.receiver();
     let run = crate::agent::context::compact_if_needed(
         &mut messages,
         &llm_manager,
@@ -199,4 +216,22 @@ pub async fn agent_compact_conversation(
         reason: None,
         attempted: true,
     })
+}
+
+/// 取消指定会话正在跑的手动压缩（前端「取消压缩」）。
+///
+/// 返回「确实取消了一次在册压缩」。取消**立刻**生效：摘要调用在
+/// `context/mod.rs` 的 `select!` 里被中断，原文与库都不动，前端拿到的是一次
+/// `Skipped { attempted: true, reason: "已取消" }`（进行中的卡片转成
+/// 「上下文压缩未完成：已取消」），随后 `agent_compact_conversation` 返回、
+/// 占位随之释放、输入恢复可用。
+///
+/// 没有在跑的压缩时返回 `false`：前端在事件已到、命令已返回之后再点一次属于
+/// 正常时序（锁这时候也早释放了），不是错误。
+#[tauri::command]
+pub async fn agent_cancel_compaction(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<bool, AppError> {
+    Ok(state.compactions.cancel(&conversation_id))
 }

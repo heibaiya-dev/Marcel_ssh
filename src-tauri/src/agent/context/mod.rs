@@ -428,6 +428,13 @@ pub async fn compact_if_needed(
             // 运行中消息也可压（超长任务恢复）；无锚点则跳过。
             // 手动不做事前预算收缩：卡片定位靠"区间一直压到最后一条"，收短会让
             // 前端把未被摘要的中间段屏蔽掉（静默丢上下文）。
+            //
+            // 队尾语义成立的前提是**快照到提交之间没有新写入**（否则卡片落到新
+            // 消息之后、归档边界会把它们从后续请求里抹掉）。这个前提由
+            // `agent_compact_conversation` 的占位保证（`AppState.compactions`：
+            // 同一会话压缩期间禁止再压缩、`agent_start_task` 拒绝开新回合），
+            // 前端 `taskStore.compacting` / `conversationIsBusy` 是同一件事的
+            // UI 侧。改压缩的触发路径时别绕开那张表。
             let (range, budget_bound) = if trigger == CompactionTrigger::Manual {
                 (range, false)
             } else {
@@ -822,6 +829,8 @@ async fn compact_region(
     // 前端按 dbId 定位插卡、后端按 id 查行取 created_at）。
     // **手动 = 队尾语义**：恒 `None`（本会话消息可能没有 db_id），后端按
     // 最后一行定位队尾、前端队尾追加——前后端位置严格一致，不依赖 id。
+    // 「最后一行 = 快照里的最后一行」由命令入口的占位保证（见上方
+    // Manual 分支的注释），不是碰运气。
     let tail_db_id = if matches!(trigger, "manual") {
         None
     } else {

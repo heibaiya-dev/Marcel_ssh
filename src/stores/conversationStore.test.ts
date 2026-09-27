@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { useConversationStore } from '@/stores/conversationStore';
+import {
+  useConversationStore,
+  conversationHasRunningTask,
+  conversationIsBusy,
+  conversationIsCompacting,
+} from '@/stores/conversationStore';
 import { useTaskStore } from '@/stores/taskStore';
 import { getStreamState, setStreamState } from './agentStreamHandlers';
 import type { AgentMessage, AgentTask, AgentConversation, StoredMessage } from '@/lib/types';
@@ -15,6 +20,7 @@ const {
   agentDeleteConversation,
   agentGetConversation,
   agentCompactConversation,
+  agentCancelCompaction,
   agentSetConversationPinned,
   listen,
 } = vi.hoisted(() => ({
@@ -28,6 +34,7 @@ const {
   agentDeleteConversation: vi.fn(),
   agentGetConversation: vi.fn(),
   agentCompactConversation: vi.fn(),
+  agentCancelCompaction: vi.fn(),
   agentSetConversationPinned: vi.fn(),
   listen: vi.fn(),
 }));
@@ -43,6 +50,7 @@ vi.mock('@/lib/tauri', () => ({
   agentDeleteConversation,
   agentGetConversation,
   agentCompactConversation,
+  agentCancelCompaction,
   agentSetConversationPinned,
 }));
 
@@ -69,6 +77,9 @@ describe('conversationStore', () => {
       activeConversationId: null,
       activeConversationByConnection: {},
     });
+    // 压缩占位不跨用例残留（漏解锁的用例会在这里被清掉，而不是把下一个用例
+    // 拖成"会话永远忙"的假失败）
+    useTaskStore.setState({ compacting: {} });
   });
 
   function makeMessage(overrides: Partial<AgentMessage> = {}): AgentMessage {
@@ -2008,6 +2019,109 @@ describe('conversationStore', () => {
       // 原文一条不少（无隐藏）。
       const msgs = useConversationStore.getState().messages['conv-1'];
       expect(msgs.map((m) => m.id)).toEqual(['u1', 'a1', 'u2']);
+    });
+
+    // ── 压缩占位（会话写锁）─────────────────────────────────────────────
+    // 背景：压缩的卡片按「提交那一刻的队尾」落位，从快照到提交之间隔着一次完整
+    // 的摘要调用。这期间写进来的消息会被卡片盖到后面、再被归档边界从后续请求里
+    // 抹掉。占位就是让这个窗口一次都不出现。
+
+    /** 让后端命令悬挂，模拟「摘要调用正在跑」的那几十秒。 */
+    function holdCompaction() {
+      let release!: () => void;
+      agentCompactConversation.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = () =>
+              resolve({
+                compacted: true,
+                summary: 's',
+                shadowedMessages: 1,
+                shadowedTokens: 10,
+                tailDbId: null,
+                reason: null,
+                attempted: true,
+              });
+          }),
+      );
+      return () => release();
+    }
+
+    it('压缩期间同步占位：第二次压缩被拒且不打后端，命令返回后解锁', async () => {
+      const release = holdCompaction();
+      seedConversation('conv-1', [makeMessage({ id: 'u1', content: 'go' })]);
+      seedTask('task-1', 'conv-1', 'completed'); // 已完成的任务不算忙
+
+      const pending = useConversationStore.getState().compactConversation('conv-1');
+
+      // 同步上锁：不能等微任务 —— 前面任何一个 await 之后才上锁，窗口就已经开了
+      expect(conversationIsCompacting('conv-1')).toBe(true);
+      expect(conversationIsBusy('conv-1')).toBe(true);
+      expect(conversationHasRunningTask('conv-1')).toBe(false); // 忙不是因为有任务
+
+      const before = useConversationStore.getState().messages['conv-1'].length;
+      await expect(
+        useConversationStore.getState().compactConversation('conv-1'),
+      ).rejects.toThrow('正在压缩上下文');
+      expect(agentCompactConversation).toHaveBeenCalledTimes(1); // 第二次没打后端
+      const after = useConversationStore.getState().messages['conv-1'];
+      expect(after).toHaveLength(before + 1); // 但给了可见提示
+      expect(after[after.length - 1].content).toContain('正在压缩上下文');
+
+      release();
+      await pending;
+      expect(conversationIsCompacting('conv-1')).toBe(false);
+      expect(conversationIsBusy('conv-1')).toBe(false);
+    });
+
+    it.each([
+      ['命令抛错', () => agentCompactConversation.mockRejectedValue(new Error('boom'))],
+      [
+        '被跳过（attempted=false）',
+        () =>
+          agentCompactConversation.mockResolvedValue({
+            compacted: false,
+            summary: null,
+            shadowedMessages: 0,
+            shadowedTokens: 0,
+            tailDbId: null,
+            reason: '没有可压缩的早期历史区间',
+            attempted: false,
+          }),
+      ],
+    ])('%s 之后占位必须释放（否则该会话输入永久禁用）', async (_name, arrange) => {
+      arrange();
+      seedConversation('conv-1', [makeMessage({ id: 'u1', content: 'go' })]);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      await useConversationStore
+        .getState()
+        .compactConversation('conv-1')
+        .catch(() => undefined);
+
+      expect(conversationIsCompacting('conv-1')).toBe(false);
+      expect(conversationIsBusy('conv-1')).toBe(false);
+    });
+
+    it('取消压缩只转发给后端，不提前解锁（解锁交给命令返回后的 finally）', async () => {
+      const release = holdCompaction();
+      agentCancelCompaction.mockResolvedValue(true);
+      seedConversation('conv-1', [makeMessage({ id: 'u1', content: 'go' })]);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      const pending = useConversationStore.getState().compactConversation('conv-1');
+      await expect(
+        useConversationStore.getState().cancelCompaction('conv-1'),
+      ).resolves.toBe(true);
+      expect(agentCancelCompaction).toHaveBeenCalledWith('conv-1');
+
+      // 摘要可能在取消到达前就跑完了（select! 只包住进行中的请求）→ 那一次仍会
+      // 落库，这段窗口里放消息进来就又踩回原来的坑，所以占位必须留到命令返回。
+      expect(conversationIsCompacting('conv-1')).toBe(true);
+
+      release();
+      await pending;
+      expect(conversationIsCompacting('conv-1')).toBe(false);
     });
   });
 

@@ -10,11 +10,18 @@ export type AgentEmptyStateReason =
 
 export function canSendAgentPrompt(
   session: Session | null | undefined,
-  isRunning: boolean,
+  /**
+   * 会话忙不忙 —— 有任务在跑、**或正在压缩上下文**都算。
+   *
+   * 由调用方算好（`isRunning || isCompacting`，或 `conversationIsBusy`），别只传
+   * 其中之一：压缩不是任务，只看 `isRunning` 时它完全隐形，而这期间发出去的消息
+   * 会被随后落下的压缩卡盖到后面、被归档边界从后续请求里抹掉。
+   */
+  busy: boolean,
   draft: string,
   hasImages = false,
 ): boolean {
-  if (isRunning) return false;
+  if (busy) return false;
   if (!session || session.status !== 'connected') return false;
   if (!session.configId) return false;
   return draft.trim().length > 0 || hasImages;

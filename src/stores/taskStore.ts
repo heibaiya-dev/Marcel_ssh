@@ -50,6 +50,23 @@ export interface TaskState {
    */
   usageByConversation: Record<string, ConversationUsageEntry>;
   unreadCompletedConversations: string[];
+  /**
+   * 正在手动压缩上下文的会话（key = conversationId；在册即为进行中）。
+   *
+   * **为什么压缩要上这张表**：压缩不是任务（不进 `tasks`），此前对「这个会话忙不
+   * 忙」的所有判定完全不可见。而压缩卡片按「**提交那一刻**的队尾」落位，从快照
+   * 到提交之间隔着一次完整的摘要调用（几十秒）——这期间写进来的消息会被卡片盖到
+   * 后面，再被归档边界（最新一张卡之前的行）从后续所有请求里抹掉，等于静默丢
+   * 上下文。在册期间 `conversationStore.conversationIsBusy` 为真，发送、`/` 菜单、
+   * 撤回、后台作业自动继续、二次压缩全部让路。
+   *
+   * 与 `tasks` 的分工：这张表**只**回答「能不能往这个会话写东西」，不代表界面上的
+   * 「任务」（不进任务中心抽屉、不推插件活动桥）——压缩不是可停止的任务，它是该
+   * 会话的一次独占操作，入口在 `conversationStore.compactConversation`。
+   *
+   * 只在前端存活期内有效（不落库）：压缩被中断/重启后本来就没有结果可留。
+   */
+  compacting: Record<string, true>;
 
   startTask: (
     sessionId: string,
@@ -100,6 +117,11 @@ export interface TaskState {
   clearActiveTaskIf: (taskId: string) => void;
   markConversationUnreadCompleted: (conversationId: string) => void;
   clearConversationUnreadCompleted: (conversationId: string) => void;
+  /** 进入「该会话正在手动压缩上下文」。**必须**与 `endCompaction` 成对，且放在
+   *  `try/finally` 里：漏掉解锁 = 该会话的输入框永久禁用、发送永久被拦。 */
+  beginCompaction: (conversationId: string) => void;
+  /** 退出压缩占位（成功 / 跳过 / 失败 / 被取消都要走到）。 */
+  endCompaction: (conversationId: string) => void;
 }
 
 const currentAssistantMessageId: Map<string, string> = new Map();
@@ -181,6 +203,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   plansDirty: false,
   usageByConversation: {},
   unreadCompletedConversations: [],
+  compacting: {},
 
   startTask: async (
     sessionId: string,
@@ -573,6 +596,22 @@ export const useTaskStore = create<TaskState>((set, get) => ({
           (id) => id !== conversationId,
         ),
       };
+    });
+  },
+
+  beginCompaction: (conversationId: string) => {
+    set((state) => {
+      if (state.compacting[conversationId]) return state;
+      return { compacting: { ...state.compacting, [conversationId]: true } };
+    });
+  },
+
+  endCompaction: (conversationId: string) => {
+    set((state) => {
+      if (!state.compacting[conversationId]) return state;
+      const next = { ...state.compacting };
+      delete next[conversationId];
+      return { compacting: next };
     });
   },
 }));

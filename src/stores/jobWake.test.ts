@@ -107,7 +107,7 @@ describe('jobWake（作业跑完自动继续）', () => {
       text: '后台作业 job_1（构建）已完成\n用 job_output 读取其输出并纳入结论。',
       jobIds: ['job_1'],
     });
-    useTaskStore.setState({ tasks: {}, activeTaskId: null });
+    useTaskStore.setState({ tasks: {}, activeTaskId: null, compacting: {} });
     useConversationStore.setState({ conversations: {}, messages: {} });
     useSessionStore.setState({ sessions: {}, activeSessionId: null });
     seedConversationLoaded();
@@ -181,6 +181,18 @@ describe('jobWake（作业跑完自动继续）', () => {
   it('会话里已经有任务在跑 → 不开轮（那一边会把结局注入进去）', async () => {
     seedBusyTask();
     await maybeContinueForConversation(CONV, SESSION);
+    expect(agentStartTask).not.toHaveBeenCalled();
+    expect(jobAckNotice).not.toHaveBeenCalled();
+  });
+
+  it('会话正在压缩上下文 → 不开轮（这一轮写进去的告知会被压缩卡盖到后面）', async () => {
+    // 压缩不是任务，只看 tasks 时它完全隐形：而压缩卡按「提交那一刻的队尾」落位，
+    // 这条自动继续写进去的告知会被卡片盖到后面、被归档边界从后续请求里抹掉 ——
+    // 而且这条路径不需要用户做任何操作，漏掉就是静默丢上下文。
+    useTaskStore.setState({ compacting: { [CONV]: true } });
+
+    await maybeContinueForConversation(CONV, SESSION);
+
     expect(agentStartTask).not.toHaveBeenCalled();
     expect(jobAckNotice).not.toHaveBeenCalled();
   });

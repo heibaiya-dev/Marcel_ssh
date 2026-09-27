@@ -224,8 +224,8 @@ export default function MobileChatHistorySheet({
             {!loadingMsgs && messages.length > 0 && (
               <AgentMessageList
                 messages={messages}
-                // 只读浏览：借 isRunning 将撤回按钮置为 disabled
-                isRunning
+                // 只读浏览：撤回入口一律禁用
+                rollbackDisabled
                 // 历史只读/检索视图：永不折叠回合（用户可能在翻找/搜索定位）
                 conversationId={selectedConvId ?? undefined}
                 foldTurns={false}
