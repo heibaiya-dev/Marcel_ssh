@@ -732,9 +732,36 @@ export function AgentPolicySection() {
                             className="w-full rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-2 text-xs font-mono text-zinc-100 focus:outline-none focus:border-indigo-500 resize-none"
                           />
                           <p className="text-xs text-zinc-500">
-                            判定结果与理由会连同对话上下文和这条命令一起发送到
-                            TypeSafe（api.typesafe.ai）——这是一台第三方服务器，
-                            命令里若带 token 或密码请注意。
+                            {agent.jevBaseUrl?.trim() ? (
+                              <>
+                                判定结果与理由会连同对话上下文和这条命令一起发送到
+                                你上面填的地址（
+                                <code>
+                                  {agent.jevBaseUrl.trim().replace(/\/+$/, '')}
+                                </code>
+                                ）。那要是一个第三方中转，命令里若带 token
+                                或密码请注意。
+                              </>
+                            ) : (
+                              <>
+                                判定结果与理由会连同对话上下文和这条命令一起发送到
+                                TypeSafe（<code>api.typesafe.ai</code>
+                                ）——这是一台第三方服务器，命令里若带 token
+                                或密码请注意。
+                              </>
+                            )}
+                          </p>
+                          <Toggle
+                            checked={agent.jevReasonFollowup ?? false}
+                            onChange={(checked) =>
+                              updateAgent({ jevReasonFollowup: checked })
+                            }
+                            label="被判人审或阻止时，再打一轮 Jev 追问原因"
+                          />
+                          <p className="text-xs text-zinc-500">
+                            第一轮的探针有时一个都命中不了，用户会看到「需要确认」
+                            却没有任何解释。打开后这类命令会多打一次请求（延迟与
+                            花费翻倍）专门问「为什么」；追问失败不影响判定。
                           </p>
                         </>
                       ) : (

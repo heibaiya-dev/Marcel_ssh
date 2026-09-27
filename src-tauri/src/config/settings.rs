@@ -187,6 +187,17 @@ pub struct AgentModeSettings {
     /// 变成噪音指令、静默劣化判定质量。两个引擎的判据形状不同，不能共用一个输入框。
     #[serde(default)]
     pub jev_approval_prompt: String,
+    /// 被判「需要人审 / 应当阻止」之后再打一轮 Jev，专门追问**原因**。
+    ///
+    /// 为什么需要这一轮：Jev 不生成文本，理由只能来自我们预设的 Noul 标签，而第一轮
+    /// 的探针有时全落在阈值以下（实测 `chmod -R 777` 就是），用户会看到「需要确认」
+    /// 却没有任何解释。第二轮不带判定问题、只带探针，并把第一轮的结论作为上下文
+    /// 告诉它，让它专注于「为什么需要人审」。
+    ///
+    /// **默认关**：它会让每条需要人审的命令多花一次请求（延迟与成本都翻倍）。
+    /// 追问失败**不影响判定**——第一轮的结论始终权威，第二轮只补理由。
+    #[serde(default)]
+    pub jev_reason_followup: bool,
     /// Optional model name override for the model-based command approval step.
     /// When empty, the main LLM model is used. Set to a smaller/faster model
     /// name to reduce approval latency and cost.
@@ -236,6 +247,7 @@ impl Default for AgentModeSettings {
             jev_model_id: String::new(),
             jev_base_url: String::new(),
             jev_approval_prompt: String::new(),
+            jev_reason_followup: false,
             model_approval_model: String::new(),
             model_approval_prompt: String::new(),
             system_prompt: String::new(),
@@ -545,7 +557,10 @@ impl UpdateMode {
             "notify" => UpdateMode::Notify,
             "off" => UpdateMode::Off,
             other => {
-                log::warn!("未知的更新方式 {:?}（可能来自更高版本），按「仅提醒」处理", other);
+                log::warn!(
+                    "未知的更新方式 {:?}（可能来自更高版本），按「仅提醒」处理",
+                    other
+                );
                 UpdateMode::Notify
             }
         }
@@ -895,6 +910,11 @@ mod tests {
         );
         assert_eq!(s.jev_model_id, "", "不得替用户凭空填上一个 Jev 型号");
         assert_eq!(s.jev_approval_prompt, "");
+        assert!(
+            !s.jev_reason_followup,
+            "缺 jevReasonFollowup 时必须关着——开着会让每条人审命令都多打一次请求，\
+             这种花费不能由一次升级替用户决定"
+        );
         // 旧字段原样保留，不被新字段挤掉。
         assert!(s.enable_model_command_approval);
         assert_eq!(s.model_approval_prompt, "我的老提示词");
@@ -1305,7 +1325,6 @@ mod tests {
         assert!(!UpdateMode::Off.auto_downloads());
     }
 
-
     /// 读 `src/lib/types.ts`，取 `export interface NAME { ... }` 的字段名。
     /// 跳过块注释 / 行注释，去掉可选标记 `?`。
     fn extract_interface_fields(source: &str, name: &str) -> std::collections::BTreeSet<String> {
@@ -1347,11 +1366,7 @@ mod tests {
                 break;
             }
             let field = trimmed.split([':', '?']).next().unwrap_or("").trim();
-            if !field.is_empty()
-                && field
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            if !field.is_empty() && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 fields.insert(field.to_string());
             }
         }
@@ -1359,8 +1374,7 @@ mod tests {
     }
 
     fn read_frontend_app_settings_interface() -> String {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/types.ts");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/types.ts");
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()))
     }
 
@@ -1465,8 +1479,8 @@ mod tests {
 
     /// 读前端 settingsStore 源码（那份手写的 DEFAULT 对象在里面）。
     fn read_frontend_settings_store() -> String {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../src/stores/settingsStore.ts");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/stores/settingsStore.ts");
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()))
     }
 

@@ -601,6 +601,14 @@ export interface AgentModeSettings {
    * 的 JSON」这类格式要求，而 Jev 不生成文本，喂过去只会变成噪音指令。
    */
   jevApprovalPrompt: string;
+  /**
+   * 被判「需要人审 / 应当阻止」之后再打一轮 Jev，专门追问**原因**。
+   *
+   * Jev 不生成文本，理由只能来自预设的 Noul 标签，而第一轮的探针有时全部落在阈值
+   * 以下——用户会看到「需要确认」却没有任何解释。打开后会对这类命令多打一次请求
+   * （延迟与成本都翻倍），追问失败**不影响判定**。
+   */
+  jevReasonFollowup: boolean;
   /** Custom system prompt for the approval step. Empty = use built-in prompt. */
   modelApprovalPrompt: string;
   systemPrompt: string;

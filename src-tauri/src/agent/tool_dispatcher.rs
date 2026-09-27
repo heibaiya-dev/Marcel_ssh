@@ -221,6 +221,7 @@ impl ToolDispatcher {
                     &agent_settings.jev_base_url,
                     &agent_settings.jev_approval_prompt,
                     is_plan_mode,
+                    agent_settings.jev_reason_followup,
                 ),
                 CommandApprovalEngine::Model => Self::build_model_approver(
                     approval_cfg,
@@ -309,6 +310,7 @@ impl ToolDispatcher {
         base_url: &str,
         custom_prompt: &str,
         is_plan_mode: bool,
+        reason_followup: bool,
     ) -> std::sync::Arc<dyn CommandApprover> {
         let cfg = match jev_cfg {
             Some(cfg) => cfg,
@@ -321,16 +323,26 @@ impl ToolDispatcher {
         // 日志里也得能看出实际用的是官方地址还是自定义网关。
         let cfg = cfg.with_base_url(base_url);
         log::info!(
-            "命令审批引擎: Jev ({} @ {}{})",
+            "命令审批引擎: Jev ({} @ {}{}{})",
             cfg.model_id,
             cfg.endpoint_url(),
             if cfg.is_custom_base_url() {
                 "，自定义根地址"
             } else {
                 ""
+            },
+            if reason_followup {
+                "，人审时追问原因（多一次请求）"
+            } else {
+                ""
             }
         );
-        match JevApprover::new(cfg, custom_prompt.to_string(), is_plan_mode) {
+        match JevApprover::new(
+            cfg,
+            custom_prompt.to_string(),
+            is_plan_mode,
+            reason_followup,
+        ) {
             Ok(a) => std::sync::Arc::new(a),
             Err(e) => {
                 // 构造失败（HTTP 客户端建不起来）属于极端情况。这里**不静默降级
@@ -1052,6 +1064,7 @@ mod tests {
             command_approval_engine: CommandApprovalEngine::Model,
             jev_model_id: String::new(),
             jev_base_url: String::new(),
+            jev_reason_followup: false,
             jev_approval_prompt: String::new(),
             model_approval_model: String::new(),
             model_approval_prompt: String::new(),
@@ -1610,6 +1623,7 @@ mod tests {
             command_approval_engine: CommandApprovalEngine::Model,
             jev_model_id: String::new(),
             jev_base_url: String::new(),
+            jev_reason_followup: false,
             jev_approval_prompt: String::new(),
             model_approval_model: String::new(),
             model_approval_prompt: String::new(),
@@ -1636,6 +1650,7 @@ mod tests {
             command_approval_engine: CommandApprovalEngine::Model,
             jev_model_id: String::new(),
             jev_base_url: String::new(),
+            jev_reason_followup: false,
             jev_approval_prompt: String::new(),
             model_approval_model: String::new(),
             model_approval_prompt: String::new(),
@@ -1672,6 +1687,7 @@ mod tests {
             command_approval_engine: CommandApprovalEngine::Model,
             jev_model_id: String::new(),
             jev_base_url: String::new(),
+            jev_reason_followup: false,
             jev_approval_prompt: String::new(),
             model_approval_model: String::new(),
             model_approval_prompt: String::new(),
@@ -1739,7 +1755,7 @@ mod tests {
     /// `None`）保证构造出口只有这一个。
     #[tokio::test]
     async fn unconfigured_jev_approver_reports_itself_on_every_call() {
-        let approver = ToolDispatcher::build_jev_approver(None, "", "", "", false);
+        let approver = ToolDispatcher::build_jev_approver(None, "", "", "", false, false);
         let err = approver
             .evaluate("ls -la", &[])
             .await

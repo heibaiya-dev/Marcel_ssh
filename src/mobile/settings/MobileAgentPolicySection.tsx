@@ -293,8 +293,22 @@ export function MobileAgentPolicySection() {
                   className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 font-mono text-xs text-zinc-100 outline-none focus:border-indigo-500"
                 />
                 <p className="text-xs text-zinc-500">
-                  判定结果与理由会连同对话上下文和这条命令一起发送到 TypeSafe（api.typesafe.ai）——这是一台第三方服务器，命令里若带 token 或密码请注意。
+                  {agent.jevBaseUrl?.trim()
+                    ? `判定结果与理由会连同对话上下文和这条命令一起发送到你上面填的地址（${agent.jevBaseUrl.trim().replace(/\/+$/, '')}）。那要是一个第三方中转，命令里若带 token 或密码请注意。`
+                    : '判定结果与理由会连同对话上下文和这条命令一起发送到 TypeSafe（api.typesafe.ai）——这是一台第三方服务器，命令里若带 token 或密码请注意。'}
                 </p>
+                <MobileSettingRow
+                  label="人审时追问原因"
+                  description="第一轮探针可能一个都没命中，用户看不到解释。打开后这类命令多打一次请求专门问「为什么」；追问失败不影响判定。"
+                  trailing={
+                    <Toggle
+                      checked={agent.jevReasonFollowup ?? false}
+                      onChange={(checked) =>
+                        updateAgent({ jevReasonFollowup: checked })
+                      }
+                    />
+                  }
+                />
               </>
             ) : (
               <>

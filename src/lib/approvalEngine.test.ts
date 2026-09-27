@@ -289,6 +289,7 @@ describe('命令审批引擎的跨语言契约', () => {
       'jev_model_id',
       'jev_base_url',
       'jev_approval_prompt',
+      'jev_reason_followup',
     ]) {
       expect(settingsRs, `AgentModeSettings 缺字段 ${field}`).toMatch(
         new RegExp(`pub ${field}:`),
@@ -308,6 +309,9 @@ describe('命令审批引擎的跨语言契约', () => {
     expect(defBody).toContain('jev_model_id: String::new()');
     expect(defBody).toContain('jev_base_url: String::new()');
     expect(defBody).toContain('jev_approval_prompt: String::new()');
+    // 追问开关默认必须是 false：开着会让每条人审命令多打一次请求（延迟与花费
+    // 都翻倍），这种花费不能由一次升级替用户打开。
+    expect(defBody).toContain('jev_reason_followup: false');
   });
 
   it('TS 的 AgentModeSettings 字段名，Rust 侧必须都认识', () => {

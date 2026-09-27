@@ -108,6 +108,8 @@ pub(crate) struct JevApprover {
     /// 就不能共用一个输入框。
     custom_instructions: String,
     plan_mode: bool,
+    /// 被判人审/阻止之后，再打一轮 Jev 专门追问原因（设置项，默认关）。
+    reason_followup: bool,
 }
 
 impl JevApprover {
@@ -115,12 +117,14 @@ impl JevApprover {
         config: JevConfig,
         custom_instructions: String,
         plan_mode: bool,
+        reason_followup: bool,
     ) -> Result<Self, AppError> {
         let client = JevClient::new(config).map_err(AppError::from)?;
         Ok(Self {
             client,
             custom_instructions,
             plan_mode,
+            reason_followup,
         })
     }
 
@@ -175,7 +179,59 @@ impl CommandApprover for JevApprover {
             .ask(&state, questions, &validate_response, None)
             .await
             .map_err(AppError::from)?;
-        map_judgement(&resp)
+
+        let judgement = map_judgement(&resp)?;
+        self.followup_reasons(command, recent_messages, resp, judgement)
+            .await
+    }
+}
+
+impl JevApprover {
+    /// 可选的原因追问轮（设置项，默认关）。
+    ///
+    /// **它只能补理由，不能改判定**——这是刻意的：如果追问失败或结果异常能改变
+    /// 判定，那么每条需要人审的命令就多了一次「被放行」的机会，多出来的这次请求
+    /// 反而成了新的故障面。所以下面所有失败路径都原样返回第一轮的结论。
+    async fn followup_reasons(
+        &self,
+        command: &str,
+        recent_messages: &[LlmMessage],
+        resp: JevResponse,
+        judgement: ApprovalJudgement,
+    ) -> Result<ApprovalJudgement, AppError> {
+        // 放行没有需要解释的地方，不值得为它多打一次请求。
+        if !self.reason_followup || matches!(judgement.decision, ModelApprovalDecision::Approve) {
+            return Ok(judgement);
+        }
+
+        let state = build_followup_state(command, recent_messages, &judgement.decision);
+        let questions = build_followup_questions();
+
+        let extra = match self
+            .client
+            .ask(&state, questions, &validate_reason_round, None)
+            .await
+        {
+            Ok(extra) => extra,
+            Err(e) => {
+                log::warn!("Jev 原因追问失败，保留第一轮判定与理由: {}", e);
+                return Ok(judgement);
+            }
+        };
+
+        // 两轮命中取并集（按探针表顺序去重）：追问只会**补上**理由，
+        // 不会因为第二轮没标出来就把第一轮已有的理由抹掉。
+        let merged = merge_reasons(&resp, &extra);
+        let decision = match &judgement.decision {
+            ModelApprovalDecision::Approve => ModelApprovalDecision::Approve,
+            ModelApprovalDecision::RouteToHuman(_) => ModelApprovalDecision::RouteToHuman(merged),
+            ModelApprovalDecision::Block(_) => ModelApprovalDecision::Block(merged),
+        };
+        Ok(ApprovalJudgement {
+            decision,
+            confidence: judgement.confidence,
+            engine: judgement.engine,
+        })
     }
 }
 
@@ -331,6 +387,82 @@ fn probe_hits(resp: &JevResponse, id: &str) -> bool {
         .map(|v| v >= REASON_THRESHOLD)
         .unwrap_or(false)
 }
+
+/// 合并两轮的探针命中，按探针表顺序输出标签。
+fn merge_reasons(first: &JevResponse, extra: &JevResponse) -> Vec<String> {
+    REASON_PROBES
+        .iter()
+        .filter(|p| probe_hits(first, p.id) || probe_hits(extra, p.id))
+        .map(|p| p.label.to_string())
+        .collect()
+}
+
+/// 追问轮的框定语——**每道题都会带上**。
+///
+/// 官方契约里没有「整个请求的说明」这种字段（`instructions` 是逐题给的），
+/// 所以这层框定只能写进每一道题里。
+///
+/// 两头都要堵：既不要因为「反正已经要人审了」就一律答「是」（标签会失去区分度，
+/// 五个全亮等于没说），也不要为了让它显得合理就一律答「否」——那正是第一轮
+/// 什么都标不出来的原因。
+const FOLLOWUP_FRAMING: &str = "这是第二轮追问：state 里的 `command` 在第一轮已经被判为 `first_round_decision` 里那个结论。这一轮不再判它该不该执行，只回答一个补充问题——它被这样判的**具体原因**是什么。按命令实际会做什么来答：不要因为它已经需要人审就一律答「是」，也不要为了让它显得合理就一律答「否」。";
+
+/// 第一轮判定的线上取值（作为追问轮的上下文）。
+fn decision_wire(decision: &ModelApprovalDecision) -> &'static str {
+    match decision {
+        ModelApprovalDecision::Approve => OPT_APPROVE,
+        ModelApprovalDecision::RouteToHuman(_) => OPT_ROUTE,
+        ModelApprovalDecision::Block(_) => OPT_BLOCK,
+    }
+}
+
+/// 追问轮的 state：与第一轮同一份上下文，另加一条「第一轮判成了什么」。
+fn build_followup_state(
+    command: &str,
+    messages: &[LlmMessage],
+    decision: &ModelApprovalDecision,
+) -> Value {
+    let mut state = build_state(command, messages);
+    if let Some(obj) = state.as_object_mut() {
+        obj.insert(
+            "first_round_decision".to_string(),
+            json!(decision_wire(decision)),
+        );
+    }
+    state
+}
+
+/// 追问轮的 questions：**只有理由探针，没有判定问题**。
+///
+/// 不给它判定题是这条设计的核心：追问轮在结构上就没有能力改变结论。
+fn build_followup_questions() -> Value {
+    let mut questions = Map::new();
+    for probe in REASON_PROBES {
+        questions.insert(
+            probe.id.to_string(),
+            json!({
+                "type": "noul",
+                "instructions": format!("{}\n{}", FOLLOWUP_FRAMING, probe.instructions),
+            }),
+        );
+    }
+    Value::Object(questions)
+}
+
+/// 追问轮的可用性判据：至少有一个探针答案回来了。
+///
+/// 刻意**不要求有探针过阈值**——「五个都不成立」是合法结果（只是没有标签可展示），
+/// 不该为此重试。这里只拦「答案整批没回来」这种哑火。
+fn validate_reason_round(resp: &JevResponse) -> Result<(), String> {
+    if REASON_PROBES.iter().any(|p| resp.noul(p.id).is_some()) {
+        return Ok(());
+    }
+    Err(format!(
+        "Jev 原因追问没返回任何探针答案（answers: {:?}）",
+        resp.answers.keys().collect::<Vec<_>>()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +717,7 @@ mod tests {
             JevConfig::new("test-key".into(), String::new(), Default::default()),
             custom.to_string(),
             plan_mode,
+            false,
         )
         .expect("Jev 客户端构造应成功")
     }
@@ -784,6 +917,26 @@ mod tests {
             .with_base_url(base_url),
             String::new(),
             plan_mode,
+            false,
+        )
+        .expect("approver 构造应成功")
+    }
+
+    /// 同上，但打开「人审时追问原因」。
+    fn followup_approver_at(base_url: &str) -> JevApprover {
+        JevApprover::new(
+            JevConfig::new(
+                "test-key".into(),
+                String::new(),
+                NetPolicy {
+                    retry_delay_secs: 0.0,
+                    ..NetPolicy::default()
+                },
+            )
+            .with_base_url(base_url),
+            String::new(),
+            false,
+            true,
         )
         .expect("approver 构造应成功")
     }
@@ -916,6 +1069,171 @@ mod tests {
             "连不上应当是 Llm 类错误，实际 {err:?}"
         );
     }
+
+    // ── 追问轮（设置开关，默认关） ────────────────────────────────
+
+    /// 第一轮判成「人审」但**五个探针一个都没命中**——实测 `chmod -R 777` 就是这个形态：
+    /// 用户会看到「需要确认」却没有任何解释。追问轮要解决的正是这个。
+    fn wire_route_without_reasons() -> Value {
+        json!({
+            "model": "jev-1.13.0",
+            "answers": {
+                DECISION_ID: {"type": "choice", "choice": OPT_ROUTE, "confidence": 0.62},
+                "deletes_data": {"type": "noul", "noul": 0.02},
+                "changes_system": {"type": "noul", "noul": 0.39},
+                "touches_secrets": {"type": "noul", "noul": 0.06},
+                "irreversible": {"type": "noul", "noul": 0.16},
+                "beyond_task": {"type": "noul", "noul": 0.12},
+            },
+            "usage": {"input_tokens": 500, "output_tokens": 5},
+        })
+    }
+
+    /// 追问轮的应答：只有探针、没有 decision。
+    fn wire_reason_round(hits: &[&str]) -> Value {
+        let mut answers = Map::new();
+        for probe in REASON_PROBES {
+            answers.insert(
+                probe.id.to_string(),
+                json!({
+                    "type": "noul",
+                    "noul": if hits.contains(&probe.id) { 0.8 } else { 0.05 },
+                }),
+            );
+        }
+        json!({ "model": "jev-1.13.0", "answers": answers })
+    }
+
+    /// 开关默认关：一条命令只打一次请求。
+    #[tokio::test]
+    async fn reason_followup_is_off_by_default() {
+        let mock = MockJev::start(vec![Reply::json(200, wire_route_without_reasons())]).await;
+        let approver = approver_at(&mock.base_url, "test-key", false);
+
+        let j = approver
+            .evaluate("chmod -R 777 /var/www", &[])
+            .await
+            .expect("该成功");
+
+        assert_eq!(j.decision, ModelApprovalDecision::RouteToHuman(vec![]));
+        assert_eq!(mock.request_count(), 1, "开关没开就不该有第二次请求");
+    }
+
+    /// 放行不需要解释，追问轮不该被打（省一次请求与费用）。
+    #[tokio::test]
+    async fn reason_followup_is_skipped_for_approvals() {
+        let mock = MockJev::start(vec![Reply::json(200, wire_response(OPT_APPROVE))]).await;
+        let approver = followup_approver_at(&mock.base_url);
+
+        let j = approver.evaluate("ls -la", &[]).await.expect("该成功");
+
+        assert_eq!(j.decision, ModelApprovalDecision::Approve);
+        assert_eq!(mock.request_count(), 1, "放行不该触发追问");
+    }
+
+    /// 追问轮只问原因、带上第一轮结论，并把两轮命中合并成最终理由。
+    #[tokio::test]
+    async fn reason_followup_asks_only_reasons_and_merges_hits() {
+        let mock = MockJev::start(vec![
+            Reply::json(200, wire_route_without_reasons()),
+            Reply::json(200, wire_reason_round(&["changes_system"])),
+        ])
+        .await;
+        let approver = followup_approver_at(&mock.base_url);
+
+        let j = approver
+            .evaluate("chmod -R 777 /var/www/html", &[])
+            .await
+            .expect("该成功");
+
+        assert_eq!(mock.request_count(), 2, "开关开着时人审要多打一轮");
+        // 第一轮什么都没标出来，第二轮标出了 changes_system → 用户终于看得到理由
+        assert_eq!(
+            j.decision,
+            ModelApprovalDecision::RouteToHuman(vec!["会改动系统级配置或权限".to_string()])
+        );
+        // 判定与置信度仍来自第一轮
+        assert_eq!(j.confidence, Some(0.62));
+        assert_eq!(j.engine, "jev");
+
+        // 第二轮发出去的东西
+        let body = &mock.request_bodies()[1];
+        assert_eq!(body["state"]["first_round_decision"], OPT_ROUTE);
+        assert_eq!(body["state"]["command"], "chmod -R 777 /var/www/html");
+        let questions = body["questions"].as_object().unwrap();
+        assert_eq!(questions.len(), REASON_PROBES.len());
+        assert!(
+            !questions.contains_key(DECISION_ID),
+            "追问轮在结构上就不该有判定题——有的话它就有了改变结论的能力"
+        );
+        for probe in REASON_PROBES {
+            assert_eq!(body["questions"][probe.id]["type"], "noul");
+            let text = body["questions"][probe.id]["instructions"]
+                .as_str()
+                .unwrap();
+            assert!(text.contains("第二轮追问"), "探针 {} 缺追问框定", probe.id);
+            assert!(
+                text.contains(probe.instructions),
+                "探针 {} 的原始问法不能被框定吃掉",
+                probe.id
+            );
+        }
+    }
+
+    /// **追问失败不能改判定。** 第一轮的结论是权威的，第二轮只是补充说明。
+    ///
+    /// 这是这个开关的主要风险面：如果追问挂了会把命令放行（或反过来），那每条需要
+    /// 人审的命令就多出一次被误判的机会，多打的这一次请求反而成了新的故障面。
+    #[tokio::test]
+    async fn reason_followup_failure_keeps_the_first_round_verdict() {
+        let mock = MockJev::start(vec![
+            Reply::json(200, wire_response(OPT_BLOCK)),
+            Reply::json(503, json!({"detail": "overloaded"})),
+        ])
+        .await;
+        let approver = followup_approver_at(&mock.base_url);
+
+        let j = approver
+            .evaluate("mkfs.ext4 /dev/sdb1", &[])
+            .await
+            .expect("追问失败不该让整个审批失败");
+
+        assert_eq!(
+            j.decision,
+            ModelApprovalDecision::Block(vec![
+                "会删除或覆盖数据".to_string(),
+                "影响不可撤销".to_string(),
+            ]),
+            "追问失败必须原样保留第一轮的判定与理由"
+        );
+    }
+
+    /// 两轮取并集：第二轮没标出来的，不能把第一轮已有的理由抹掉。
+    #[tokio::test]
+    async fn reason_followup_never_drops_first_round_reasons() {
+        let mock = MockJev::start(vec![
+            Reply::json(200, wire_response(OPT_BLOCK)),
+            Reply::json(200, wire_reason_round(&["touches_secrets"])),
+        ])
+        .await;
+        let approver = followup_approver_at(&mock.base_url);
+
+        let j = approver
+            .evaluate("dd if=/dev/zero of=/dev/sda", &[])
+            .await
+            .expect("该成功");
+
+        assert_eq!(
+            j.decision,
+            ModelApprovalDecision::Block(vec![
+                "会删除或覆盖数据".to_string(),
+                "会接触凭据或密钥".to_string(),
+                "影响不可撤销".to_string(),
+            ]),
+            "顺序按探针表；第一轮那两条不能被第二轮的丢掉"
+        );
+    }
+
     // ── 真实端点上的判定质量实测（需要 Key，默认被 ignore） ──────────────
 
     /// 一条实测用例。
@@ -1108,6 +1426,12 @@ mod tests {
             .with_base_url(&base_url),
             String::new(),
             false,
+            std::env::var("JEV_LIVE_REASON_FOLLOWUP")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    v == "1" || v == "true" || v == "on"
+                })
+                .unwrap_or(false),
         )
         .expect("approver 构造应成功");
 
@@ -1240,6 +1564,35 @@ mod tests {
                     }
                 );
 
+                // 追问轮走的是 `evaluate` 里那条真实路径。这里显式调它一次，
+                // 否则这个开关就成了「写了但从没被执行过」的代码——而它的效果
+                // 恰恰只能靠真实端点看出来（第二轮到底有没有给出不同的概率）。
+                if approver.reason_followup {
+                    let judged = approver
+                        .followup_reasons(case.command, &messages, resp.clone(), judgement)
+                        .await
+                        .expect("追问失败不该让整条实测失败");
+                    let merged = match &judged.decision {
+                        ModelApprovalDecision::RouteToHuman(r)
+                        | ModelApprovalDecision::Block(r) => r.join("、"),
+                        ModelApprovalDecision::Approve => {
+                            "（追问把判定改成了放行——不该发生）".into()
+                        }
+                    };
+                    println!(
+                        "     追问后理由 {}（判定 {}）",
+                        if merged.is_empty() {
+                            "仍然为空".to_string()
+                        } else {
+                            merged
+                        },
+                        match judged.decision {
+                            ModelApprovalDecision::Approve => "approve",
+                            ModelApprovalDecision::RouteToHuman(_) => "route_to_human",
+                            ModelApprovalDecision::Block(_) => "block",
+                        }
+                    );
+                }
             }
         }
 

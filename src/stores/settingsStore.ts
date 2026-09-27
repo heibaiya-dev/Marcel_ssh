@@ -17,6 +17,9 @@ const DEFAULT_AGENT_MODE_SETTINGS: AgentModeSettings = {
   jevModelId: '',
   jevBaseUrl: '',
   jevApprovalPrompt: '',
+  // 默认关：开着会让每条需要人审的命令多打一次请求（延迟与花费都翻倍），
+  // 这种成本不能由一次升级替用户决定。
+  jevReasonFollowup: false,
   modelApprovalPrompt: '',
   systemPrompt: '',
   maxToolRounds: 500,
