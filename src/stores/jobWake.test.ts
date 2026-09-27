@@ -12,7 +12,7 @@ const { listenMock, agentStartTask, jobPendingNotice, jobAckNotice } = vi.hoiste
 vi.mock('@tauri-apps/api/event', () => ({ listen: listenMock }));
 vi.mock('@/lib/tauri', () => ({ agentStartTask, jobPendingNotice, jobAckNotice }));
 
-import { maybeContinueForConversation } from '@/stores/jobWake';
+import { initJobWake, maybeContinueForConversation } from '@/stores/jobWake';
 import { useConversationStore } from '@/stores/conversationStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useTaskStore } from '@/stores/taskStore';
@@ -85,6 +85,18 @@ function seedBusyTask() {
   useTaskStore.setState((s) => ({ tasks: { ...s.tasks, [task.id]: task } }));
 }
 
+/**
+ * 把一条 `job://updated` 按**后端真实载荷**投递给 jobWake 的监听器。
+ *
+ * 载荷形状照抄后端 `JobInfo` 的 serde 输出（snake_case，无 camelCase 别名）——
+ * 与 `jobStore.mapJob` 的注释写的是同一条契约。
+ */
+function emitJobUpdated(payload: Record<string, unknown>) {
+  const call = listenMock.mock.calls.find(([name]) => name === 'job://updated');
+  if (!call) throw new Error('job://updated 没有订阅者');
+  (call[1] as (event: { payload: unknown }) => void)({ payload });
+}
+
 describe('jobWake（作业跑完自动继续）', () => {
   beforeEach(() => {
     __resetAllAutoContinues();
@@ -123,6 +135,37 @@ describe('jobWake（作业跑完自动继续）', () => {
 
     // 真的开出去了才确认已读（送不出去就不算已读）
     expect(jobAckNotice).toHaveBeenCalledWith(['job_1']);
+  });
+
+  it('事件载荷是后端真实形状（snake_case）时也要唤醒', async () => {
+    // 这条是实况 bug 的回归：后端 `JobInfo` 是 serde 默认的 snake_case，事件里
+    // 发出来的是 `owner_conversation_id` / `session_id`，没有 camelCase 别名。
+    // 按 camelCase 读 → 字段全是 undefined → 撞上「无归属 → 不唤醒」的早退，
+    // 作业跑完什么都不发生（没有系统告知卡、结局也交不回模型）。
+    // 上面的用例直接调 maybeContinueForConversation 传 camelCase 参数，碰不到
+    // 这条边，所以它一直是绿的。
+    const unsub = initJobWake();
+    try {
+      emitJobUpdated({
+        job_id: 'job_1',
+        session_id: SESSION,
+        task_id: 'task-1',
+        owner_conversation_id: CONV,
+        description: '构建',
+        command: 'pnpm build',
+        status: 'completed',
+        started_at_millis: 1000,
+        finished_at_millis: 2000,
+        total_output_bytes: 42,
+      });
+
+      await vi.waitFor(() => expect(agentStartTask).toHaveBeenCalledTimes(1));
+      // 开出去的那一轮仍是「作业告知」身份
+      expect(agentStartTask.mock.calls[0][7]).toBe('job_notice');
+      expect(jobAckNotice).toHaveBeenCalledWith(['job_1']);
+    } finally {
+      unsub();
+    }
   });
 
   it('给别的会话自动继续**不抢** activeTaskId（不打扰用户正在看的会话）', async () => {

@@ -33,7 +33,7 @@ import {
   conversationHasRunningTask,
   useConversationStore,
 } from './conversationStore';
-import { useJobStore } from './jobStore';
+import { mapJob, useJobStore } from './jobStore';
 import { useTaskStore } from './taskStore';
 import { canAutoContinue, spendAutoContinue } from './wakeBudget';
 
@@ -125,7 +125,12 @@ export async function maybeContinueForConversation(
   }
 }
 
-/** 从一条作业事件里认出「哪条会话的作业跑完了」，并尝试自动继续。 */
+/**
+ * 从一条作业事件里认出「哪条会话的作业跑完了」，并尝试自动继续。
+ *
+ * 收的是**已归一化**的 JobInfo（camelCase）：事件路径在订阅处过
+ * `jobStore.mapJob`，前台补扫那条路径直接拿 store 里的值。
+ */
 function handleJobEvent(job: JobInfo): void {
   if (!isSettled(job)) return;
   const conversationId = job.ownerConversationId;
@@ -157,8 +162,11 @@ function sweepSettledJobs(): void {
  */
 export function initJobWake(): Unsubscribe {
   const unsubs: Unsubscribe[] = [
-    subscribeTauriEvent<JobInfo>('job://updated', (payload) => {
-      if (payload && typeof payload === 'object') handleJobEvent(payload);
+    // 事件载荷是后端 `JobInfo` 的 serde 输出（snake_case，无 camelCase 别名）：
+    // 必须过 `mapJob` 归一后再读字段 —— 直接按 `ownerConversationId` 读会是
+    // undefined，撞上「无归属 → 不唤醒」的早退，整条自动继续静默失效。
+    subscribeTauriEvent<Record<string, unknown>>('job://updated', (payload) => {
+      if (payload && typeof payload === 'object') handleJobEvent(mapJob(payload));
     }),
   ];
 

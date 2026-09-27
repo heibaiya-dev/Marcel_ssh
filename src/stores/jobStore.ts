@@ -21,22 +21,43 @@ interface JobState {
   initEventListener: () => () => void;
 }
 
-/** 后端 JobInfo（snake_case serde）→ 前端 camelCase。 */
-function mapJob(raw: Record<string, unknown>): JobInfo {
+/**
+ * 后端 JobInfo（snake_case serde）→ 前端 camelCase。
+ *
+ * **凡是拿到后端作业载荷的地方都要过这里**（`job_list` / `job_kill`，以及
+ * `job://started` / `job://updated` 两个事件的载荷）：后端 serde 没写 camelCase
+ * 别名，事件里直接发出来的是 `owner_conversation_id` 这种形状，按 camelCase 读
+ * 只会读到 `undefined`。逐字段两种拼写都认，是为了不管哪一侧先改名都不会静默
+ * 退化成空值。
+ */
+export function mapJob(raw: Record<string, unknown>): JobInfo {
   return {
     jobId: String(raw.job_id ?? raw.jobId ?? ''),
     sessionId: String(raw.session_id ?? raw.sessionId ?? ''),
-    taskId: raw.task_id != null ? String(raw.task_id) : null,
+    taskId:
+      raw.task_id != null
+        ? String(raw.task_id)
+        : raw.taskId != null
+          ? String(raw.taskId)
+          : null,
     description: String(raw.description ?? ''),
     command: String(raw.command ?? ''),
     status: (raw.status as JobInfo['status']) ?? 'running',
     ownerConversationId:
-      raw.owner_conversation_id != null ? String(raw.owner_conversation_id) : null,
+      raw.owner_conversation_id != null
+        ? String(raw.owner_conversation_id)
+        : raw.ownerConversationId != null
+          ? String(raw.ownerConversationId)
+          : null,
     // 结算细节（退出码 / 信号 / 失败原因）：缺省就是没记过，展示层不编造。
     detail: raw.detail != null ? String(raw.detail) : null,
     startedAtMillis: Number(raw.started_at_millis ?? raw.startedAtMillis ?? Date.now()),
     finishedAtMillis:
-      raw.finished_at_millis != null ? Number(raw.finished_at_millis) : null,
+      raw.finished_at_millis != null
+        ? Number(raw.finished_at_millis)
+        : raw.finishedAtMillis != null
+          ? Number(raw.finishedAtMillis)
+          : null,
     totalOutputBytes: Number(raw.total_output_bytes ?? raw.totalOutputBytes ?? 0),
   };
 }
