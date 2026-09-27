@@ -28,7 +28,7 @@ import { TurnFoldGroup } from "./TurnFoldGroup";
 
 interface Props {
   messages: AgentMessage[];
-  isThinking: boolean;
+  isThinking?: boolean;
   isRunning?: boolean;
   onRollback?: (message: AgentMessage) => void;
   onCopy?: (message: AgentMessage) => void;
@@ -551,7 +551,6 @@ function AgentMessageList({
             >
               <ToolCallCard
                 message={msg}
-                autoExpand={isThinking}
                 messageId={msg.id}
                 onExpandChange={handleToolExpandChange}
               />
@@ -629,7 +628,6 @@ function AgentMessageList({
                         key={`${group.kind}-${group.tools[0].id}`}
                         kind={group.kind}
                         messages={group.tools}
-                        autoExpand={false}
                         matchedIds={matchedSet}
                         flashId={flashId}
                       />
@@ -649,7 +647,6 @@ function AgentMessageList({
               key={`${item.kind}-${item.tools[0].id}`}
               kind={item.kind}
               messages={item.tools}
-              autoExpand={isThinking}
               forceExpand={item.tools.some(
                 (t) => matchedSet.has(t.id) || t.id === highlightMessageId,
               )}

@@ -353,7 +353,6 @@ export default function ChatHistoryModal({ open, onClose }: Props) {
               {!loadingMsgs && messages.length > 0 && (
                 <AgentMessageList
                   messages={messages}
-                  isThinking={false}
                   highlightMessageId={highlightMessageId}
                   matchedMessageIds={activeMatchIds}
                   searchKeyword={isSearching ? debouncedQuery.trim() : undefined}

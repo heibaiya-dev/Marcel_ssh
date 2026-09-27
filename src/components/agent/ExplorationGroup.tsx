@@ -22,7 +22,6 @@ export function isPlanToolMessage(msg: AgentMessage): boolean {
 interface Props {
   kind?: ToolGroupKind;
   messages: AgentMessage[];
-  autoExpand?: boolean;
   /** 搜索命中组内消息时强制展开，便于定位 */
   forceExpand?: boolean;
   matchedIds?: Set<string>;
@@ -64,22 +63,15 @@ function GroupLabel({ kind, count }: { kind: ToolGroupKind; count: number }) {
 function ExplorationGroup({
   kind = 'exploration',
   messages,
-  autoExpand,
   forceExpand = false,
   matchedIds,
   flashId = null,
 }: Props) {
-  const [expanded, setExpanded] = useState(Boolean(autoExpand || forceExpand));
+  const [expanded, setExpanded] = useState(forceExpand);
 
   useEffect(() => {
-    if (forceExpand) {
-      setExpanded(true);
-      return;
-    }
-    if (!autoExpand) {
-      setExpanded(false);
-    }
-  }, [autoExpand, forceExpand]);
+    setExpanded(forceExpand);
+  }, [forceExpand]);
 
   // 折叠态只显示「已探索 N 次读取」，联网工具的降级/被网站拦截标记会随之消失。
   // 这里把组内异常汇总到分组标题上，保证折叠时也不会漏掉"这次其实是降级/被拦"。
@@ -150,7 +142,7 @@ function ExplorationGroup({
                       aria-hidden
                     />
                   )}
-                  <ToolCallCard message={msg} autoExpand={autoExpand || forceExpand} />
+                  <ToolCallCard message={msg} autoExpand={forceExpand} />
                 </div>
               );
             })}

@@ -3,10 +3,16 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import AgentMessageList, { alignedWindowStart } from '@/components/agent/AgentMessageList';
 import type { AgentMessage } from '@/lib/types';
 
-vi.mock('@/stores/settingsStore', () => ({
-  useSettingsStore: (selector?: (s: unknown) => unknown) =>
-    selector?.({ settings: { foldCompletedTurns: false } }) ?? { settings: { foldCompletedTurns: false } },
-}));
+// 注意：不能写成 `selector?.(state) ?? state` —— 选择器取到 undefined 时会被
+// ?? 换成整个 state 对象，`hideThinkingDisplay` 于是变成真值，思考区整块不渲染
+//（与 scrollFollow.test.tsx 同一个坑）。
+vi.mock('@/stores/settingsStore', () => {
+  const state = { settings: { foldCompletedTurns: false } };
+  return {
+    useSettingsStore: (selector?: (s: unknown) => unknown) =>
+      selector ? selector(state) : state,
+  };
+});
 
 vi.mock('@/lib/externalLinks', () => ({
   openExternalLink: vi.fn(),
@@ -55,7 +61,6 @@ describe('AgentMessageList Pagination & Infinite Scroll', () => {
     const html = renderToStaticMarkup(
       <AgentMessageList
         messages={messages}
-        isThinking={false}
       />
     );
 
@@ -69,7 +74,6 @@ describe('AgentMessageList Pagination & Infinite Scroll', () => {
     const html = renderToStaticMarkup(
       <AgentMessageList
         messages={messages}
-        isThinking={false}
       />
     );
 
@@ -88,7 +92,6 @@ describe('AgentMessageList Pagination & Infinite Scroll', () => {
     const html = renderToStaticMarkup(
       <AgentMessageList
         messages={messages}
-        isThinking={false}
         highlightMessageId="msg-10"
       />
     );
@@ -96,5 +99,64 @@ describe('AgentMessageList Pagination & Infinite Scroll', () => {
     // 含有 highlightMessageId="msg-10" 时自动扩展包含早期消息
     expect(html).toContain('Message content 10');
     expect(html).toContain('Message content 120');
+  });
+});
+
+describe('思考中不自动展开历史工具卡片', () => {
+  const TOOL_OUTPUT = 'MARKER_TOOL_OUTPUT_9f2c';
+  const THINKING_TEXT = 'MARKER_THINKING_9f2c';
+
+  // 一个回合：user → 工具结果 → 正在思考的 assistant。
+  // 卡片按 msg.id 挂载、展开态只取挂载初值，所以"切进正在思考的会话"必然
+  // 让全部卡片重新挂载——曾经的整列表级 isThinking 就是在这条路径上把每张
+  // 卡都初始化成展开的。
+  const turnMessages = (thinking: boolean): AgentMessage[] => [
+    { id: 'u1', role: 'user', content: '跑一下', timestamp: '2026-01-01T00:00:00Z' },
+    {
+      id: 't1',
+      role: 'tool',
+      content: '',
+      timestamp: '2026-01-01T00:00:01Z',
+      toolResult: {
+        toolName: 'execute_command',
+        summary: 'ls',
+        result: TOOL_OUTPUT,
+        success: true,
+        blocked: false,
+        arguments: { command: 'ls' },
+      },
+    },
+    {
+      id: 'a1',
+      role: 'assistant',
+      content: '',
+      reasoningContent: THINKING_TEXT,
+      isThinking: thinking,
+      timestamp: '2026-01-01T00:00:02Z',
+    },
+  ];
+
+  it('卡片保持收起，正在流的思考内容照旧显示', () => {
+    const html = renderToStaticMarkup(
+      <AgentMessageList messages={turnMessages(true)} />,
+    );
+
+    // 卡片本身在（不是整块没渲染），但输出区没有展开
+    expect(html).toContain('data-message-id="t1"');
+    expect(html).not.toContain(TOOL_OUTPUT);
+    // 取消自动展开不影响实时性：思考内容仍然直接可见
+    expect(html).toContain(THINKING_TEXT);
+  });
+
+  it('思考与否展开态一致（不再取决于会话是否有人在思考）', () => {
+    const thinking = renderToStaticMarkup(
+      <AgentMessageList messages={turnMessages(true)} />,
+    );
+    const idle = renderToStaticMarkup(
+      <AgentMessageList messages={turnMessages(false)} />,
+    );
+
+    expect(thinking).not.toContain(TOOL_OUTPUT);
+    expect(idle).not.toContain(TOOL_OUTPUT);
   });
 });

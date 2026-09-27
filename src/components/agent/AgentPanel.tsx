@@ -857,11 +857,6 @@ export default function AgentPanel() {
   const currentModeInfo =
     AGENT_MODES.find((m) => m.value === mode) ?? AGENT_MODES[1];
 
-  const isThinking = useMemo(
-    () => messages.some((m) => m.role === "assistant" && m.isThinking),
-    [messages],
-  );
-
   const jobs = useJobStore((s) => s.jobs);
   // 占用环读数（百分比 / 未配置窗口的降级都由 `lib/tokenUsage.ts` 定，
   // 与移动端共用同一份口径）
@@ -1074,7 +1069,6 @@ export default function AgentPanel() {
           {canInteract && (
             <AgentMessageList
               messages={messages}
-              isThinking={isThinking}
               isRunning={isRunning}
               onRollback={handleRollbackMessage}
               onCopy={handleCopyMessage}

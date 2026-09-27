@@ -242,10 +242,6 @@ export default function MobileAgentHost({
 
   const currentModeInfo =
     AGENT_MODES.find((m) => m.value === mode) ?? AGENT_MODES[1];
-  const isThinking = useMemo(
-    () => messages.some((m) => m.role === "assistant" && m.isThinking),
-    [messages],
-  );
 
   useEffect(() => {
     if (!ids?.configId || !ids?.sessionId) return;
@@ -857,7 +853,6 @@ export default function MobileAgentHost({
           {canInteract && (
             <AgentMessageList
               messages={messages}
-              isThinking={isThinking}
               isRunning={isRunning}
               messagesEndRef={messagesEndRef}
               onRollback={(m) => void handleRollbackMessage(m)}

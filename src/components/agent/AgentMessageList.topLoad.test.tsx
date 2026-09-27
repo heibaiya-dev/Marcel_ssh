@@ -110,7 +110,7 @@ async function mountList(messageCount: number) {
   root = createRoot(host);
   await act(async () => {
     root!.render(
-      <AgentMessageList messages={createMockMessages(messageCount)} isThinking={false} />,
+      <AgentMessageList messages={createMockMessages(messageCount)} />,
     );
   });
   return host;
