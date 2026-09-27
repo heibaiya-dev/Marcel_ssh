@@ -649,6 +649,105 @@ describe('agentStreamHandlers', () => {
       });
       expect(handler._messages[convId][0].toolResult?.arguments).toBeUndefined();
     });
+
+    it('长参数只 parse 到语法完整为止：parse 次数不随分片数增长', () => {
+      // 旧实现每个 delta 都对累计全文 JSON.parse（Θ(B²)）；
+      // 回归门槛：完整前 0 次、完整时 1 次，parse 输入总量 ≈ 参数本身大小。
+      const handler = mockHandler({ [convId]: [] });
+      handleToolCallStart(handler, taskId, convId, {
+        type: 'toolCallStart',
+        id: 'tc-big-1',
+        name: 'write_file',
+      });
+
+      const content = `x${'y'.repeat(128 * 1024)}`;
+      const fullArgs = JSON.stringify({ path: '/tmp/big.txt', content });
+      const chunkSize = 64;
+      const parseCalls: number[] = [];
+      const parseSpy = vi.spyOn(JSON, 'parse');
+      const recordCalls = () => parseSpy.mock.calls.forEach((c) => parseCalls.push((c[0] as string).length));
+      try {
+        for (let i = 0; i < fullArgs.length; i += chunkSize) {
+          handleToolCallDelta(handler, taskId, convId, {
+            type: 'toolCallDelta',
+            id: 'tc-big-1',
+            argumentsDelta: fullArgs.slice(i, i + chunkSize),
+          });
+        }
+        recordCalls();
+      } finally {
+        parseSpy.mockRestore();
+      }
+
+      expect(parseCalls).toHaveLength(1);
+      expect(parseCalls[0]).toBe(fullArgs.length);
+      const args = handler._messages[convId][0].toolResult?.arguments as {
+        path: string;
+        content: string;
+      };
+      expect(args.path).toBe('/tmp/big.txt');
+      expect(args.content).toBe(content);
+    });
+
+    it('render_html: 末片完整参数即时发布，不被 150ms 节流门延迟', () => {
+      const handler = mockHandler({ [convId]: [] });
+      handleToolCallStart(handler, taskId, convId, {
+        type: 'toolCallStart',
+        id: 'tc-html-3',
+        name: 'render_html',
+      });
+
+      // 第一帧先建立预览（同样时刻），第二帧带着闭合括号到达 —— 两者在同一毫秒，
+      // 节流门若是罩住了完整 parse 分支，参数就会滞留在 __streaming 草稿上。
+      handleToolCallDelta(handler, taskId, convId, {
+        type: 'toolCallDelta',
+        id: 'tc-html-3',
+        argumentsDelta: '{"title":"t","fragment":"<p>tail',
+      });
+      expect(handler._messages[convId][0].toolResult?.arguments?.__streaming).toBe(true);
+
+      handleToolCallDelta(handler, taskId, convId, {
+        type: 'toolCallDelta',
+        id: 'tc-html-3',
+        argumentsDelta: '</p>"}',
+      });
+      const args = handler._messages[convId][0].toolResult?.arguments;
+      expect(args).toEqual({ title: 't', fragment: '<p>tail</p>' });
+      expect(args?.__streaming).toBeUndefined();
+    });
+
+    it('语法完整但 parse 失败（坏转义）不进入反复 parse，预览照常', () => {
+      const handler = mockHandler({ [convId]: [] });
+      handleToolCallStart(handler, taskId, convId, {
+        type: 'toolCallStart',
+        id: 'tc-bad-1',
+        name: 'render_html',
+      });
+
+      const parseSpy = vi.spyOn(JSON, 'parse');
+      try {
+        // \u 后面跟着非 hex：语法完整（引号与括号都闭合）但 JSON.parse 必失败
+        handleToolCallDelta(handler, taskId, convId, {
+          type: 'toolCallDelta',
+          id: 'tc-bad-1',
+          argumentsDelta: '{"title":"\\uZZ","fragment":"<p>x</p>"}',
+        });
+        const parseCallsAfterComplete = parseSpy.mock.calls.length;
+        expect(parseCallsAfterComplete).toBeLessThanOrEqual(1);
+
+        // 后续 delta（provider 尾巴/重传）不再触发第二次 parse
+        handleToolCallDelta(handler, taskId, convId, {
+          type: 'toolCallDelta',
+          id: 'tc-bad-1',
+          argumentsDelta: ' ',
+        });
+        expect(parseSpy.mock.calls.length).toBe(parseCallsAfterComplete);
+      } finally {
+        parseSpy.mockRestore();
+      }
+      // 失败后参数不回填，等 toolResult 收尾
+      expect(handler._messages[convId][0].toolResult?.arguments).toBeUndefined();
+    });
   });
 
   describe('compaction handlers', () => {

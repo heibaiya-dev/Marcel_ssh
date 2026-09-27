@@ -1,4 +1,86 @@
 /**
+ * 增量 JSON 完整性追踪。
+ *
+ * 流式 tool call arguments 每个 delta 到达时，判断「累计文本是否已是语法
+ * 完整的 JSON」只需要看**新增字符**：引号/转义/括号深度都是流式状态。
+ * 这让「完整才 JSON.parse 一次」成为可能——否则每个 delta 都要对累计全文
+ * parse 一次（Θ(B²)，长参数流式期间全是注定失败的 SyntaxError）。
+ *
+ * 状态机与上面的词法扫描共享同一套 JSON 规则；只跟踪结构性状态，
+ * 不产出内容。同一规则只此一处实现。
+ */
+
+export interface JsonStreamTracker {
+  /** 是否已见到首个结构字符（`{`）——空串/纯空白不算完整。 */
+  started: boolean;
+  /** 是否在字符串字面量内（引号未闭合）。 */
+  inString: boolean;
+  /** 转义尾巴剩余字符数（0=不在转义中；1=反斜杠后的说明符；`\u` 后为 4 个 hex）。 */
+  escape: number;
+  /** 当前转义尾巴是 `\uXXXX` 的 hex 段（说明符 `u` 已消费）。 */
+  unicode: boolean;
+  /** 未闭合的 `{`/`[` 总深度。 */
+  depth: number;
+  /** 结构已坏（深度为负等）：永不判完整，等 toolResult 收尾。 */
+  broken: boolean;
+}
+
+export function createJsonStreamTracker(): JsonStreamTracker {
+  return { started: false, inString: false, escape: 0, unicode: false, depth: 0, broken: false };
+}
+
+/** 喂入一段新增字符（按 UTF-16 单元前进；结构性字符都是 ASCII）。 */
+export function feedJsonChunk(tracker: JsonStreamTracker, delta: string): void {
+  if (tracker.broken) return;
+  for (let i = 0; i < delta.length; i++) {
+    const ch = delta[i];
+    if (tracker.inString) {
+      if (tracker.escape > 0) {
+        if (tracker.escape === 1 && !tracker.unicode && ch === 'u') {
+          // 这个字符是 \u 的说明符；其后还有 4 个 hex
+          tracker.unicode = true;
+          tracker.escape = 4;
+        } else {
+          tracker.escape--;
+          if (tracker.escape === 0) tracker.unicode = false;
+        }
+        continue;
+      }
+      if (ch === '\\') {
+        tracker.escape = 1;
+      } else if (ch === '"') {
+        tracker.inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      tracker.inString = true;
+    } else if (ch === '{' || ch === '[') {
+      tracker.started = true;
+      tracker.depth++;
+    } else if (ch === '}' || ch === ']') {
+      tracker.depth--;
+      if (tracker.depth < 0) {
+        tracker.broken = true;
+        return;
+      }
+    }
+    // 标量字面量/空白：不影响完整性
+  }
+}
+
+/** 累计文本是否已构成语法完整的 JSON 顶层值。 */
+export function isJsonComplete(tracker: JsonStreamTracker): boolean {
+  return (
+    tracker.started &&
+    !tracker.broken &&
+    !tracker.inString &&
+    tracker.escape === 0 &&
+    tracker.depth === 0
+  );
+}
+
+/**
  * Partial-JSON 字符串字段提取。
  *
  * 背景：LLM 流式输出 tool call arguments 时（toolCallDelta 事件累积），

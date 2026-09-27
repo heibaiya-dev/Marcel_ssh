@@ -7,7 +7,7 @@ import type {
   ModelApprovalDonePayload,
 } from '@/lib/types';
 import { applyCompactionSplice } from './messageConversion';
-import { extractPartialStringField } from '@/lib/partialJson';
+import { extractPartialStringField, createJsonStreamTracker, feedJsonChunk, isJsonComplete, type JsonStreamTracker } from '@/lib/partialJson';
 import { toolPartialPreview } from '@/lib/toolCatalog';
 import { useConversationStore } from './conversationStore';
 import { useTaskStore } from './taskStore';
@@ -178,10 +178,36 @@ export function handleToolCallDelta(
   streamState.pendingToolArgs.set(ev.id, accumulated);
   setStreamState(taskId, streamState);
 
+  // 增量完整性追踪：只扫新增字符，语法完整才值得 JSON.parse 一次。
+  // 旧实现在这里对每个 delta 全量 parse（Θ(B²)，长参数流式期间全是
+  // 注定失败的 SyntaxError）；150ms 节流只护预览、护不了 parse。
+  let tracker = argTrackers.get(ev.id);
+  if (!tracker) {
+    tracker = { state: createJsonStreamTracker(), decided: null };
+    argTrackers.set(ev.id, tracker);
+  }
+  feedJsonChunk(tracker.state, ev.argumentsDelta);
+
   let parsed: Record<string, unknown> | null = null;
-  try {
-    parsed = JSON.parse(accumulated);
-  } catch {
+  if (tracker.decided === null && isJsonComplete(tracker.state)) {
+    try {
+      parsed = JSON.parse(accumulated);
+    } catch {
+      parsed = null;
+    }
+    // 「完整但 parse 失败」（坏转义等）同样定局：不再反复 parse，预览
+    // 照常走，最终参数由 toolResult 权威收尾。
+    tracker.decided = parsed === null ? 'failed' : 'parsed';
+  }
+  if (tracker.decided === 'parsed') {
+    // 完整参数已在到达那一刻发布（末片即时，不受下面 150ms 门影响）。
+    // 之后同 id 再来的尾巴（空白/重传）不回填、不退回预览草稿。
+    if (parsed === null) {
+      partialFlushAt.delete(ev.id);
+      return;
+    }
+    partialFlushAt.delete(ev.id);
+  } else if (tracker.decided === 'failed') {
     parsed = null;
   }
 
@@ -234,6 +260,10 @@ export function handleToolCallDelta(
 
 /** toolCallId → 上次 partial 提取刷新的时间戳（节流用）。 */
 const partialFlushAt: Map<string, number> = new Map();
+
+/** toolCallId → 增量完整性追踪状态与 parse 定局（parsed/failed）。 */
+const argTrackers: Map<string, { state: JsonStreamTracker; decided: 'parsed' | 'failed' | null }> =
+  new Map();
 
 /** 从消息列表反查 pending 工具消息的 toolName。 */
 function getPendingToolName(
@@ -347,10 +377,11 @@ export function cleanupStreamState(taskId: string) {
   if (state?.flushRafId != null) {
     cancelAnimationFrame(state.flushRafId);
   }
-  // 清掉本任务未落定 tool call 的 partial 节流时间戳，避免 Map 泄漏
+  // 清掉本任务未落定 tool call 的 partial 节流时间戳与 parse 追踪，避免 Map 泄漏
   if (state) {
     for (const toolCallId of state.pendingToolCalls.keys()) {
       partialFlushAt.delete(toolCallId);
+      argTrackers.delete(toolCallId);
     }
   }
   taskStreamState.delete(taskId);
@@ -428,6 +459,7 @@ export function handleToolResult(
         };
         streamState.pendingToolCalls.delete(tr.toolCallId);
         partialFlushAt.delete(tr.toolCallId);
+        argTrackers.delete(tr.toolCallId);
         streamState.assistantMessageId = null;
         streamState.messageIndex = -1;
         streamState.toolResultCount = 0;
