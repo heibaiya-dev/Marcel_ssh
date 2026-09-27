@@ -17,15 +17,8 @@ use serde_json::json;
 
 use crate::agent::risk::Disposition;
 use crate::agent::tools::{AgentTool, ToolContext, ToolOutput};
-use crate::command_exec::{CancelReason, JobCaller, JobFilter, JobStatus};
+use crate::command_exec::{CancelReason, JobCaller, JobFilter, JobOutputResult, JobStatus};
 use crate::error::AppError;
-
-/// 单次 `job_output` 回给模型的字节上限。
-///
-/// 超出就只回前一段并把 `offset` 推到读到的位置：模型可以继续用
-/// `offset` 往下读，整段内容一条不丢（这是 offset 语义的好处，不学
-/// DSH 的滚动窗口——那个窗口滑过就把开头吞了）。
-const MAX_JOB_READ_BYTES: usize = 32_000;
 
 /// 单次 `job_output(wait=true)` 的等待上限（对齐 DSH 的 `maxWaitTimeoutMs`）。
 ///
@@ -112,50 +105,21 @@ fn job_status_suffix(
 /// 「服务端自己再跑一次产生同样的输出」，这里不编造别的出路。
 fn lossy_notice(skipped_bytes: usize, spill_path: Option<&str>) -> String {
     let where_to = match spill_path {
-        Some(path) => format!("；完整输出文件在本机：{}", path),
-        None => "；完整输出文件也不可用（写入被放弃或未覆盖该区间）".to_string(),
+        Some(path) => format!("；本机溢出文件：{}（该缺口未能从文件补齐）", path),
+        None => "；溢出文件也不可用（写入被放弃或未覆盖该区间）".to_string(),
     };
     format!(
-        "[有 {} 字节的输出不在本应用里了（内存窗口已滑出）{}。下面是其后仍能读到的部分。]",
+        "[本次跳过了 {} 字节无法读取的输出（内存窗口已滑出）{}。返回的 offset 已跨过该缺口；已展示的前缀和后续尾巴不代表连续内容。]",
         skipped_bytes, where_to
     )
 }
 
-/// 按单次上限切一段回读结果。切在字符边界上，返回（给模型的文本、
-/// 下次该用的 offset、截断说明）。
-///
-/// 续读偏移必须从**这段文本在输出流里的起点**推（`text_start_offset + cut`），
-/// 不能拿请求的 `from_offset` 推：回读丢内容时文本起点在请求起点之后
-/// （只回尾巴时起点是内存窗口起点），按请求起点推出来的偏移会落回已读过
-/// 的那段之前，模型会反复拿到同一段首字节。
-fn chunk_read(
-    text: &str,
-    text_start_offset: usize,
-    next_offset: usize,
-    skipped_bytes: usize,
-) -> (String, usize, Option<String>) {
-    if text.len() <= MAX_JOB_READ_BYTES {
-        return (text.to_string(), next_offset, None);
-    }
-    let mut cut = MAX_JOB_READ_BYTES;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let kept = &text[..cut];
-    let remaining = text.len() - cut;
-    let resume = text_start_offset + cut;
-    let note = if skipped_bytes > 0 {
-        format!(
-            "[本次只回读了从输出流第 {} 字节起的这段文本的前 {} 字节（这段还剩 {} 字节没读，其中夹着 {} 字节读不到的空洞——那部分内容已经不在本应用里了）：用 job_output(job_id=…, offset={}) 接着往下读，不要从头再读。]",
-            text_start_offset, cut, remaining, skipped_bytes, resume
-        )
-    } else {
-        format!(
-            "[本次只回读了从输出流第 {} 字节起的这段文本的前 {} 字节（这段还剩 {} 字节没读）：用 job_output(job_id=…, offset={}) 接着往下读，内容不会丢。]",
-            text_start_offset, cut, remaining, resume
-        )
-    };
-    (kept.to_string(), resume, Some(note))
+/// 存储层已按预算分页。只说明未扫描的快照范围，不把它冒充为保证可读的字节数。
+fn continuation_notice(next_offset: usize, snapshot_end: usize) -> Option<String> {
+    (next_offset < snapshot_end).then(|| format!(
+        "[本次快照中还有 {} 字节的输出范围未读（其中若有缺口，续读时会明确说明）：用 job_output(job_id=…, offset={}) 接着往下读，不要从头再读。offset 是原始字节偏移，不要用显示文本长度重算。]",
+        snapshot_end - next_offset, next_offset
+    ))
 }
 
 // ───────────────────────── job_output ─────────────────────────
@@ -253,6 +217,7 @@ impl AgentTool for JobOutputTool {
             .job_output(
                 job_id,
                 offset,
+                JobOutputResult::MAX_READ_BYTES,
                 wait,
                 Duration::from_millis(timeout_ms),
                 tool_caller(ctx),
@@ -267,21 +232,27 @@ impl AgentTool for JobOutputTool {
                 result.spill_path.as_deref(),
             ));
         }
-        let (delta, offset_used, chunk_note) = chunk_read(
-            &result.delta,
-            result.text_start_offset,
-            result.offset,
-            result.skipped_bytes,
-        );
-        if let Some(note) = chunk_note {
+        if result.invalid_utf8 {
+            notes.push("[输出含无效 UTF-8，显示时已使用替换字符；offset 仍按原始字节推进，不代表丢失了额外字节。]".to_string());
+        }
+        if let Some(note) = continuation_notice(result.offset, result.snapshot_end) {
             notes.push(note);
         }
 
-        let status_suffix = job_status_suffix(result.status, result.cancel_reason, result.detail.as_deref());
-        let mut output_text = if delta.is_empty() {
-            "(无新输出)".to_string()
+        let status_suffix = job_status_suffix(
+            result.status,
+            result.cancel_reason,
+            result.detail.as_deref(),
+        );
+        let mut output_text = if result.delta.is_empty() {
+            if result.lossy {
+                "(该输出区间已无法读取)"
+            } else {
+                "(无新输出)"
+            }
+            .to_string()
         } else {
-            delta
+            result.delta
         };
         output_text.push_str(&status_suffix);
         for note in notes {
@@ -298,8 +269,10 @@ impl AgentTool for JobOutputTool {
 
         Ok(ToolOutput::ok(summary, output_text).with_metadata(json!({
             "job_id": result.job_id,
-            "offset": offset_used,
+            "offset": result.offset,
             "text_start_offset": result.text_start_offset,
+            "snapshot_end": result.snapshot_end,
+            "invalid_utf8": result.invalid_utf8,
             "status": result.status.to_string(),
             "detail": result.detail,
             "cancel_reason": result.cancel_reason,
@@ -388,7 +361,11 @@ impl AgentTool for JobKillTool {
             .await?;
 
         let summary = format!("job_kill({}) -> {}", job_id, info.status);
-        let status_line = job_status_suffix(info.status, Some(CancelReason::Agent), info.detail.as_deref());
+        let status_line = job_status_suffix(
+            info.status,
+            Some(CancelReason::Agent),
+            info.detail.as_deref(),
+        );
         let output = if status_before == Some(JobStatus::Interrupted) {
             // 上一次应用运行留下的作业：这侧早没有可关闭的通道了。说清
             // 「我们止不了它」以及现在能做什么，别假装刚把它终止了。
@@ -518,7 +495,7 @@ impl AgentTool for JobListTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_read, job_status_suffix, lossy_notice, termination_message, MAX_JOB_READ_BYTES};
+    use super::{continuation_notice, job_status_suffix, lossy_notice, termination_message};
     use crate::command_exec::{CancelReason, JobStatus};
 
     #[test]
@@ -583,14 +560,21 @@ mod tests {
         );
         // 终止来源文案优先于 detail（谁终止的比机器状态更重要）
         assert_eq!(
-            job_status_suffix(JobStatus::Killed, Some(CancelReason::Agent), Some("signal: KILL")),
+            job_status_suffix(
+                JobStatus::Killed,
+                Some(CancelReason::Agent),
+                Some("signal: KILL")
+            ),
             "\n[作业已被 Agent 终止（job_kill），命令未完成。]"
         );
     }
 
     #[test]
     fn lossy_notice_reports_bytes_and_where_to_find_more() {
-        let with_spill = lossy_notice(4096, Some("/home/u/.config/app/jobs_temp/marcel-job-job_1-1.log"));
+        let with_spill = lossy_notice(
+            4096,
+            Some("/home/u/.config/app/jobs_temp/marcel-job-job_1-1.log"),
+        );
         assert!(with_spill.contains("4096"));
         assert!(with_spill.contains("marcel-job-job_1-1.log"));
         let without = lossy_notice(12, None);
@@ -599,65 +583,23 @@ mod tests {
     }
 
     #[test]
-    fn oversized_read_is_chunked_with_a_resumable_offset() {
-        let long = "a".repeat(MAX_JOB_READ_BYTES + 500);
-        // 无空洞路径：文本起点 = 请求起点
-        let (text, next, note) = chunk_read(&long, 0, long.len(), 0);
-        assert_eq!(text.len(), MAX_JOB_READ_BYTES);
-        let note = note.expect("超上限必有说明");
-        assert!(note.contains(&format!("offset={}", MAX_JOB_READ_BYTES)));
-        assert_eq!(next, MAX_JOB_READ_BYTES);
-        // 不超上限：原样返回、不加说明
-        let short = "abc";
-        let (text, next, note) = chunk_read(short, 3, 3, 0);
-        assert_eq!(text, short);
-        assert_eq!(next, 3);
-        assert!(note.is_none());
-    }
-
-    /// 回归：续读偏移必须按文本起点推，不能按请求的 offset 推。
-    ///
-    /// 丢内容时（溢出文件不可用 / 超上限）回读只能给内存尾巴，文本起点是
-    /// 内存窗口起点——比请求起点靠后一大截。旧算法用 `from_offset + cut`
-    /// 推续读偏移，落回尾巴开头之前，模型每次续读都拿到同一段首字节。
-    #[test]
-    fn chunked_read_resumes_from_the_text_start_not_the_requested_offset() {
-        let ring_start = 128 * 1024;
-        let skipped = 4096;
-        let tail = "b".repeat(MAX_JOB_READ_BYTES + 64);
-        // 调用方请求 offset=0，但返回文本的起点是 128KB 处的尾巴起点
-        let (kept, resume, note) = chunk_read(&tail, ring_start, ring_start + tail.len(), skipped);
-
-        assert_eq!(kept.len(), MAX_JOB_READ_BYTES);
-        assert_eq!(
-            resume,
-            ring_start + MAX_JOB_READ_BYTES,
-            "续读偏移要落在文本之内（起点 + 已取走字节数），不能回到请求起点"
-        );
-
-        let note = note.expect("超上限必有说明");
-        assert!(note.contains(&format!("offset={}", resume)));
-        assert!(
-            note.contains(&format!("第 {} 字节", ring_start)),
-            "{}",
-            note
-        );
-        assert!(
-            note.contains(&format!("{} 字节读不到", skipped)),
-            "{}",
-            note
-        );
+    fn continuation_uses_storage_cursor_not_display_length() {
+        // UTF-8 替换或缺口都可能让显示长度 != 原始游标；这里禁止再算 cut。
+        let note = continuation_notice(131_077, 200_000).unwrap();
+        assert!(note.contains("offset=131077"));
+        assert!(note.contains("68923 字节的输出范围未读"));
+        assert!(note.contains("若有缺口"));
+        assert!(!note.contains("内容不会丢"));
+        assert!(continuation_notice(200_000, 200_000).is_none());
+        assert!(continuation_notice(200_001, 200_000).is_none());
     }
 
     #[test]
-    fn chunk_split_stays_on_char_boundary() {
-        // 上限正好落在多字节字符中间时，切点必须往回收（否则会 panic）
-        let unit = "测"; // 3 字节
-        let count = MAX_JOB_READ_BYTES / unit.len() + 1;
-        let text = unit.repeat(count);
-        let (kept, next, _) = chunk_read(&text, 0, text.len(), 0);
-        assert!(kept.len() <= MAX_JOB_READ_BYTES);
-        assert!(text.is_char_boundary(kept.len()));
-        assert_eq!(next, kept.len());
+    fn gap_notice_never_promises_a_complete_spill_file() {
+        let note = lossy_notice(4096, Some("local.log"));
+        assert!(note.contains("4096"));
+        assert!(note.contains("未能从文件补齐"));
+        assert!(note.contains("offset 已跨过"));
+        assert!(!note.contains("完整输出文件在本机"));
     }
 }

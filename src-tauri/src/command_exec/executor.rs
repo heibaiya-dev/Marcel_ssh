@@ -86,15 +86,30 @@ impl ExecExit {
 /// 失败（与旧语义一致，但退出事实随 [`ExecExit`] 一起交给调用方，
 /// 不再让调用方从输出内容猜）。
 #[derive(Debug)]
-pub enum ExecOutcome {
+pub enum ExecOutcome<T = String> {
     /// 命令正常结束（非零退出码、被信号终止都算「正常结束」，
     /// 具体事实见 `exit`）。
-    Completed { output: String, exit: ExecExit },
+    Completed { output: T, exit: ExecExit },
     /// 超时：已显式关闭通道，`output` 为已收到的部分输出。
-    TimedOut { output: String },
+    TimedOut { output: T },
     /// 被取消（用户取消或断连级联）：已显式关闭通道并停止等待；
     /// 远端进程不保证随之结束（见模块注释）。
     Cancelled { reason: CancelReason },
+}
+
+impl<T> ExecOutcome<T> {
+    pub fn map_output<U>(self, map: impl FnOnce(T) -> U) -> ExecOutcome<U> {
+        match self {
+            Self::Completed { output, exit } => ExecOutcome::Completed {
+                output: map(output),
+                exit,
+            },
+            Self::TimedOut { output } => ExecOutcome::TimedOut {
+                output: map(output),
+            },
+            Self::Cancelled { reason } => ExecOutcome::Cancelled { reason },
+        }
+    }
 }
 
 /// 输出 chunk 回调：后台作业据此实时沉淀输出（环形缓冲 + 溢出文件）。
@@ -111,24 +126,17 @@ pub trait ExecTransport: Send + Sync {
         cancel: Option<&watch::Receiver<CancelReason>>,
     ) -> Result<ExecOutcome, AppError>;
 
-    /// 带输出 chunk 回调的执行变体（后台作业据此实时沉淀输出）。
-    /// 默认实现：整体执行完后把输出一次性回调——对无流式能力的
-    /// transport（mock / 兼容 shim）语义正确：作业仍能读到完整输出。
+    /// 输出只交给回调，结果仅携带退出事实，不再返回第二份全文。
+    /// 默认适配无流式能力的 transport；生产传输层须在读取时逐块交付。
     async fn exec_observable(
         &self,
         ticket: &CommandTicket,
         app: Option<&AppHandle>,
         on_chunk: ChunkCallback,
         cancel: Option<&watch::Receiver<CancelReason>>,
-    ) -> Result<ExecOutcome, AppError> {
+    ) -> Result<ExecOutcome<()>, AppError> {
         let outcome = self.exec(ticket, app, cancel).await?;
-        match &outcome {
-            ExecOutcome::Completed { output, .. } | ExecOutcome::TimedOut { output } => {
-                on_chunk(output);
-            }
-            ExecOutcome::Cancelled { .. } => {}
-        }
-        Ok(outcome)
+        Ok(outcome.map_output(|output| on_chunk(&output)))
     }
 }
 
@@ -155,7 +163,7 @@ impl ExecTransport for SshExecTransport {
             &ticket.command,
             ticket.timeout,
             streaming,
-            None,
+            String::new(),
             cancel,
         )
         .await
@@ -167,7 +175,7 @@ impl ExecTransport for SshExecTransport {
         app: Option<&AppHandle>,
         on_chunk: ChunkCallback,
         cancel: Option<&watch::Receiver<CancelReason>>,
-    ) -> Result<ExecOutcome, AppError> {
+    ) -> Result<ExecOutcome<()>, AppError> {
         let streaming = ticket
             .streaming
             .as_ref()
@@ -178,7 +186,7 @@ impl ExecTransport for SshExecTransport {
             &ticket.command,
             ticket.timeout,
             streaming,
-            Some(&on_chunk),
+            on_chunk,
             cancel,
         )
         .await
@@ -210,13 +218,45 @@ where
     }
 }
 
+/// 前台收集返回值；后台交给回调，输出只由作业缓冲保存。
+pub(crate) trait OutputSink: Send {
+    type Output;
+    fn push(&mut self, chunk: &str);
+    fn finish(self) -> Self::Output;
+}
+
+impl OutputSink for String {
+    type Output = String;
+
+    fn push(&mut self, chunk: &str) {
+        self.push_str(chunk);
+    }
+
+    fn finish(self) -> String {
+        self
+    }
+}
+
+impl<F> OutputSink for std::sync::Arc<F>
+where
+    F: Fn(&str) + Send + Sync + ?Sized,
+{
+    type Output = ();
+
+    fn push(&mut self, chunk: &str) {
+        self(chunk);
+    }
+
+    fn finish(self) {}
+}
+
 /// 统一执行核心。
 ///
 /// - `streaming = Some((app, event_name, stream_id))` 时，每个输出 chunk 以
 ///   `{type:"toolOutput", toolCallId, chunk}` payload 发射（与旧
 ///   `exec_command_streamed` 协议逐字节一致）。
-/// - `on_chunk = Some(cb)` 时，每个输出 chunk 同步回调给调用方
-///   （后台作业的输出沉淀由此接入；与 streaming 互不干扰，可同时启用）。
+/// - `output` 决定输出归属：`String` 收集前台结果，`ChunkCallback` 逐块
+///   交给后台作业，执行层不重复保存（与 streaming 互不干扰）。
 /// - `cancel = Some(rx)` 时，取消信号与数据、超时三者共同竞争（biased，
 ///   取消优先）；取消后宽限关闭通道并返回 `Cancelled`。
 /// - 超时后宽限关闭通道，返回 `TimedOut`（含部分输出）。
@@ -225,22 +265,21 @@ where
 /// - channel 以 `None` 结束（`None ⟺ 会话死亡`）时一律返回
 ///   `Err("SSH 连接已断开")`，不当正常完成（见模块文档；旧实现此处返回
 ///   部分输出，后来那版又会把它误判成正常结束）。
-pub(crate) async fn run_raw(
+pub(crate) async fn run_raw<O: OutputSink>(
     ssh: &SshManager,
     session_id: &str,
     command: &str,
     timeout: Duration,
     streaming: Option<(&AppHandle, &str, &str)>,
-    on_chunk: Option<&ChunkCallback>,
+    output: O,
     cancel: Option<&watch::Receiver<CancelReason>>,
-) -> Result<ExecOutcome, AppError> {
+) -> Result<ExecOutcome<O::Output>, AppError> {
     let conn = ssh
         .get_connection(session_id)
         .await
         .ok_or_else(|| AppError::Ssh(format!("会话不存在: {}", session_id)))?;
 
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
+    let deadline = tokio::time::sleep(timeout).deadline();
 
     let mut channel = conn
         .handle
@@ -255,7 +294,31 @@ pub(crate) async fn run_raw(
         .await
         .map_err(|e| AppError::Ssh(format!("执行命令失败: {}", e)))?;
 
-    let mut output = String::new();
+    let result = read_channel(&mut channel, deadline, streaming, output, cancel).await;
+    if result.is_err() {
+        let still_registered = ssh.is_generation_active(session_id, conn.generation).await;
+        log::warn!(
+            "command_exec: 会话 {} 的 exec 通道未收到 Eof/Close 就结束了（第 {} 代连接仍在注册表: {}），按断连收尾",
+            session_id,
+            conn.generation,
+            still_registered
+        );
+    }
+    result
+}
+
+async fn read_channel<S, O: OutputSink>(
+    channel: &mut Channel<S>,
+    deadline: tokio::time::Instant,
+    streaming: Option<(&AppHandle, &str, &str)>,
+    mut output: O,
+    cancel: Option<&watch::Receiver<CancelReason>>,
+) -> Result<ExecOutcome<O::Output>, AppError>
+where
+    S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static,
+{
+    let deadline = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline);
     let mut ended_without_close = false;
     // 远端回报的退出事实。OpenSSH 在 EOF / close 之前先发 exit-status，
     // 所以我们在这条通道关掉之前就能拿到它（没拿到就是 None，如实上报）。
@@ -275,35 +338,14 @@ pub(crate) async fn run_raw(
                 let reason = cancel
                     .map(|rx| *rx.borrow())
                     .unwrap_or(CancelReason::User);
-                graceful_close(&mut channel).await;
+                graceful_close(channel).await;
                 return Ok(ExecOutcome::Cancelled { reason });
             }
             msg = channel.wait() => {
                 match msg {
-                    Some(ChannelMsg::Data { data }) => {
-                        let chunk = String::from_utf8_lossy(&data).to_string();
-                        output.push_str(&chunk);
-                        if let Some(cb) = on_chunk {
-                            cb(&chunk);
-                        }
-                        if let Some((app, event_name, stream_id)) = streaming {
-                            emit_event(
-                                app,
-                                event_name,
-                                &serde_json::json!({
-                                    "type": "toolOutput",
-                                    "toolCallId": stream_id,
-                                    "chunk": chunk,
-                                }),
-                            );
-                        }
-                    }
-                    Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        let chunk = String::from_utf8_lossy(&data).to_string();
-                        output.push_str(&chunk);
-                        if let Some(cb) = on_chunk {
-                            cb(&chunk);
-                        }
+                    Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        let chunk = String::from_utf8_lossy(&data);
+                        output.push(&chunk);
                         if let Some((app, event_name, stream_id)) = streaming {
                             emit_event(
                                 app,
@@ -335,26 +377,20 @@ pub(crate) async fn run_raw(
             _ = &mut deadline => {
                 // 停止等待并显式关闭通道：不杀远端进程（见模块注释），
                 // 静默 / 重定向了输出 / 已脱离会话的命令会继续在远端跑。
-                graceful_close(&mut channel).await;
-                return Ok(ExecOutcome::TimedOut { output });
+                graceful_close(channel).await;
+                return Ok(ExecOutcome::TimedOut { output: output.finish() });
             }
         }
     }
 
     if let Some(err) = silent_channel_end_error(ended_without_close) {
-        // 仅供诊断：注册表里这一代还在 = 清理任务还没跑完（`None` 与清理
-        // 常被同一事件唤醒），不在 = 清理已完成。**不参与判定**。
-        let still_registered = ssh.is_generation_active(session_id, conn.generation).await;
-        log::warn!(
-            "command_exec: 会话 {} 的 exec 通道未收到 Eof/Close 就结束了（第 {} 代连接仍在注册表: {}），按断连收尾",
-            session_id,
-            conn.generation,
-            still_registered
-        );
         return Err(err);
     }
 
-    Ok(ExecOutcome::Completed { output, exit })
+    Ok(ExecOutcome::Completed {
+        output: output.finish(),
+        exit,
+    })
 }
 
 /// channel 以 `None` 结束（没有 Eof / Close）时的收尾判据：**一律断连**，
@@ -385,6 +421,384 @@ pub(crate) fn timeout_preview(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::future::Future;
+
+    thread_local! {
+        static MEASURE_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static LARGEST_ALLOCATION: Cell<usize> = const { Cell::new(0) };
+        static TOTAL_ALLOCATED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct MeasuredAllocator;
+
+    fn record_allocation(bytes: usize) {
+        if MEASURE_ALLOCATIONS.try_with(Cell::get).unwrap_or(false) {
+            let _ = LARGEST_ALLOCATION.try_with(|peak| peak.set(peak.get().max(bytes)));
+            let _ = TOTAL_ALLOCATED.try_with(|total| total.set(total.get().saturating_add(bytes)));
+        }
+    }
+
+    unsafe impl GlobalAlloc for MeasuredAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_allocation(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_allocation(layout.size());
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_allocation(new_size);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
+
+    struct AllocationScope(bool);
+
+    impl AllocationScope {
+        fn enter() -> Self {
+            LARGEST_ALLOCATION.with(|peak| peak.set(0));
+            TOTAL_ALLOCATED.with(|total| total.set(0));
+            Self(MEASURE_ALLOCATIONS.with(|enabled| enabled.replace(true)))
+        }
+    }
+
+    impl Drop for AllocationScope {
+        fn drop(&mut self) {
+            MEASURE_ALLOCATIONS.with(|enabled| enabled.set(self.0));
+        }
+    }
+
+    // 只度量读取循环的 poll；SSH 驱动和其它并行测试不参与计数。
+    async fn measure_allocations<F: Future>(future: F) -> (F::Output, usize, usize) {
+        tokio::pin!(future);
+        let mut peak = 0;
+        let mut total = 0;
+        let output = std::future::poll_fn(|cx| {
+            let _scope = AllocationScope::enter();
+            let result = future.as_mut().poll(cx);
+            peak = peak.max(LARGEST_ALLOCATION.with(Cell::get));
+            total += TOTAL_ALLOCATED.with(Cell::get);
+            result
+        })
+        .await;
+        (output, peak, total)
+    }
+
+    struct TestPeer {
+        channels: tokio::sync::mpsc::UnboundedSender<Channel<russh::server::Msg>>,
+    }
+
+    impl russh::server::Handler for TestPeer {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: Channel<russh::server::Msg>,
+            _: &mut russh::server::Session,
+        ) -> Result<bool, Self::Error> {
+            self.channels.send(channel).unwrap();
+            Ok(true)
+        }
+    }
+
+    struct TestClient;
+
+    impl russh::client::Handler for TestClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _: &russh::keys::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    async fn test_channels() -> (
+        russh::client::Handle<TestClient>,
+        Channel<russh::client::Msg>,
+        Channel<russh::server::Msg>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let key = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]);
+        let config = russh::server::Config {
+            keys: vec![key.into()],
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            russh::server::run_stream(Arc::new(config), server_io, TestPeer { channels: tx })
+                .await
+                .unwrap()
+        });
+        let mut client = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_io,
+            TestClient,
+        )
+        .await
+        .unwrap();
+        let _session = server.await.unwrap();
+        assert!(client
+            .authenticate_none("synthetic-test")
+            .await
+            .unwrap()
+            .success());
+        let channel = client.channel_open_session().await.unwrap();
+        let peer = rx.recv().await.unwrap();
+        (client, channel, peer)
+    }
+
+    #[tokio::test]
+    async fn observable_output_does_not_retain_a_second_copy() {
+        let (_client, mut channel, peer) = test_channels().await;
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let count = bytes.clone();
+        let sink: ChunkCallback = Arc::new(move |chunk| {
+            count.fetch_add(chunk.len(), Ordering::Relaxed);
+        });
+        let sender = tokio::spawn(async move {
+            let chunk = vec![b'x'; 16 * 1024];
+            for _ in 0..512 {
+                peer.data(&chunk[..]).await.unwrap();
+                peer.extended_data(1, &chunk[..]).await.unwrap();
+            }
+            peer.exit_status(3).await.unwrap();
+            peer.eof().await.unwrap();
+        });
+        let (outcome, largest_allocation, total_allocated) = measure_allocations(read_channel(
+            &mut channel,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            None,
+            sink,
+            None,
+        ))
+        .await;
+        sender.await.unwrap();
+        assert_eq!(bytes.load(Ordering::Relaxed), 16 * 1024 * 1024);
+        assert!(
+            largest_allocation <= 64 * 1024,
+            "largest allocation: {largest_allocation}"
+        );
+        assert!(
+            total_allocated < 1024 * 1024,
+            "executor allocated {total_allocated} bytes for a borrowed stream"
+        );
+        match outcome.unwrap() {
+            ExecOutcome::Completed { output, exit } => {
+                assert_eq!(exit.code, Some(3));
+                assert_eq!(std::mem::size_of_val(&output), 0);
+                eprintln!(
+                    "observable: delivered={} bytes, returned_output={} bytes, largest_allocation={largest_allocation}, total_allocated={total_allocated}",
+                    bytes.load(Ordering::Relaxed),
+                    std::mem::size_of_val(&output)
+                );
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_preserves_stdout_stderr_and_exit() {
+        let (_client, mut channel, peer) = test_channels().await;
+        let sender = tokio::spawn(async move {
+            peer.data("开始\n".as_bytes()).await.unwrap();
+            peer.extended_data(1, "警告\n".as_bytes()).await.unwrap();
+            peer.data(&b"\xffdone"[..]).await.unwrap();
+            peer.exit_status(7).await.unwrap();
+            peer.eof().await.unwrap();
+        });
+        let outcome = read_channel(
+            &mut channel,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            None,
+            String::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        sender.await.unwrap();
+        match outcome {
+            ExecOutcome::Completed { output, exit } => {
+                assert_eq!(output, "开始\n警告\n\u{fffd}done");
+                assert_eq!(exit.code, Some(7));
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn observable_preserves_chunk_order() {
+        let (_client, mut channel, peer) = test_channels().await;
+        let received = Arc::new(parking_lot::Mutex::new(String::new()));
+        let buffer = received.clone();
+        let sink: ChunkCallback = Arc::new(move |chunk| buffer.lock().push_str(chunk));
+        let sender = tokio::spawn(async move {
+            peer.data("stdout 一\n".as_bytes()).await.unwrap();
+            peer.extended_data(1, "stderr 二\n".as_bytes())
+                .await
+                .unwrap();
+            peer.data("stdout 三\n".as_bytes()).await.unwrap();
+            peer.exit_status(0).await.unwrap();
+            peer.eof().await.unwrap();
+        });
+        let outcome = read_channel(
+            &mut channel,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            None,
+            sink,
+            None,
+        )
+        .await
+        .unwrap();
+        sender.await.unwrap();
+        assert_eq!(*received.lock(), "stdout 一\nstderr 二\nstdout 三\n");
+        assert!(matches!(
+            outcome,
+            ExecOutcome::Completed {
+                exit: ExecExit { code: Some(0), .. },
+                ..
+            }
+        ));
+    }
+
+    async fn send_until_closed(mut peer: Channel<russh::server::Msg>) {
+        peer.data(&b"partial"[..]).await.unwrap();
+        while let Some(message) = peer.wait().await {
+            if matches!(message, ChannelMsg::Close) {
+                let _ = peer.close().await;
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_timeout_keeps_partial_output_and_closes_channel() {
+        let (_client, mut channel, peer) = test_channels().await;
+        let sender = tokio::spawn(send_until_closed(peer));
+        let outcome = read_channel(
+            &mut channel,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            None,
+            String::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ExecOutcome::TimedOut { output } if output == "partial"));
+        tokio::time::timeout(Duration::from_secs(3), sender)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn observable_timeout_keeps_delivered_output_and_closes_channel() {
+        let (_client, mut channel, peer) = test_channels().await;
+        let received = Arc::new(parking_lot::Mutex::new(String::new()));
+        let buffer = received.clone();
+        let sink: ChunkCallback = Arc::new(move |chunk| buffer.lock().push_str(chunk));
+        let sender = tokio::spawn(send_until_closed(peer));
+        let outcome = read_channel(
+            &mut channel,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            None,
+            sink,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ExecOutcome::TimedOut { output: () }));
+        assert_eq!(*received.lock(), "partial");
+        tokio::time::timeout(Duration::from_secs(3), sender)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn observable_cancel_preserves_delivery_and_reason() {
+        let (_client, mut channel, peer) = test_channels().await;
+        let received = Arc::new(parking_lot::Mutex::new(String::new()));
+        let buffer = received.clone();
+        let (cancel_tx, cancel_rx) = watch::channel(CancelReason::User);
+        let sink: ChunkCallback = Arc::new(move |chunk| {
+            buffer.lock().push_str(chunk);
+            cancel_tx.send(CancelReason::Task).unwrap();
+        });
+        let sender = tokio::spawn(send_until_closed(peer));
+        let outcome = read_channel(
+            &mut channel,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            None,
+            sink,
+            Some(&cancel_rx),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ExecOutcome::Cancelled {
+                reason: CancelReason::Task
+            }
+        ));
+        assert_eq!(*received.lock(), "partial");
+        tokio::time::timeout(Duration::from_secs(3), sender)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnected_channel_still_reports_an_error() {
+        let (client, mut channel, peer) = test_channels().await;
+        let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel();
+        let notify = Arc::new(parking_lot::Mutex::new(Some(disconnect_tx)));
+        let sink: ChunkCallback = Arc::new(move |_| {
+            if let Some(tx) = notify.lock().take() {
+                let _ = tx.send(());
+            }
+        });
+        let sender = tokio::spawn(async move {
+            peer.data(&b"before disconnect"[..]).await.unwrap();
+            disconnect_rx.await.unwrap();
+            client
+                .disconnect(russh::Disconnect::ByApplication, "test disconnect", "")
+                .await
+                .unwrap();
+        });
+        let result = read_channel(
+            &mut channel,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            None,
+            sink,
+            None,
+        )
+        .await;
+        sender.await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("SSH 连接已断开"));
+    }
 
     #[test]
     fn timeout_preview_truncates_by_chars() {

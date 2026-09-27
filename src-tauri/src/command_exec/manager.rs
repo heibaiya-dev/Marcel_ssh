@@ -232,7 +232,9 @@ impl ManagerInner {
     /// 取锁顺序与全局一致（先 `jobs` 再实例），并且**在锁外**调钩子——
     /// 钩子会去碰 SSH 会话与子资源表，不能在我们的锁里做。
     fn run_task_drain_hook(&self, task_id: &Option<String>) {
-        let Some(tid) = task_id.as_deref() else { return };
+        let Some(tid) = task_id.as_deref() else {
+            return;
+        };
         let hook = self.task_drain_hook.read().clone();
         let Some(hook) = hook else { return };
         let busy = {
@@ -451,11 +453,8 @@ impl CommandExecutionManager {
     pub fn with_transport(transport: Arc<dyn ExecTransport>) -> Self {
         static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "marcel-cmd-test-{}-{}",
-            std::process::id(),
-            seq
-        ));
+        let base =
+            std::env::temp_dir().join(format!("marcel-cmd-test-{}-{}", std::process::id(), seq));
         // **先清空再构造**：目录名是「进程 id + 本进程第几次调用」，两次运行
         // 之间会重名（操作系统会复用 pid，而某个测试排到第几个 seq 会随「同一
         // 文件里有哪些测试」漂移）。不清理的话，上一次运行留下的台账会被这次
@@ -542,7 +541,9 @@ impl CommandExecutionManager {
             .exec(&ticket, app, Some(&cancel_rx))
             .await
         {
-            Ok(ExecOutcome::Completed { output, exit }) => SubmitOutcome::Completed { output, exit },
+            Ok(ExecOutcome::Completed { output, exit }) => {
+                SubmitOutcome::Completed { output, exit }
+            }
             Ok(ExecOutcome::TimedOut { output }) => SubmitOutcome::TimedOut { output },
             Ok(ExecOutcome::Cancelled { reason }) => SubmitOutcome::Cancelled { reason },
             Err(error) => SubmitOutcome::Failed { error },
@@ -765,6 +766,8 @@ impl CommandExecutionManager {
 
     /// 读取作业增量输出。`wait=true` 时挂起等待，直到有新输出或作业
     /// 结算（`tokio::sync::watch` 通知，非忙轮询），最长等 `timeout`。
+    /// `budget` 是单页显示字节预算，归一到 4..=JobOutputResult::MAX_READ_BYTES
+    /// （至少容得下一个 UTF-8 字符）；文件读取最多额外 3 字节用于字符边界。
     ///
     /// 读到终态即视为「这条作业的结局已经被消费」，置位 `settled_notified`
     /// ——与 DSH 的 `reported` 同义：读取方已经知道结果，系统不必再为它
@@ -777,60 +780,52 @@ impl CommandExecutionManager {
         &self,
         job_id: &str,
         offset: usize,
+        budget: usize,
         wait: bool,
         timeout: Duration,
         caller: JobCaller<'_>,
     ) -> Result<JobOutputResult, AppError> {
-        let (instance, from_ledger) = self.resolve_job(job_id, caller)?;
-        if from_ledger {
-            // 台账投影：没有通道可等、没有取消可发，作业也早已结算——直接
-            // 给当前能读到的部分，不占用调用方的超时。
+        // 台账回退包含文件 metadata；定位同样移到 blocking worker。
+        // Unscoped 与无归属 Agent 的 allows 语义相同，跨线程只带拥有的身份值。
+        let owner = match caller {
+            JobCaller::Unscoped => None,
+            JobCaller::Agent {
+                owner_conversation_id,
+            } => owner_conversation_id.map(str::to_owned),
+        };
+        let manager = self.clone();
+        let id = job_id.to_owned();
+        let (instance, from_ledger) = tokio::task::spawn_blocking(move || {
+            manager.resolve_job(
+                &id,
+                JobCaller::Agent {
+                    owner_conversation_id: owner.as_deref(),
+                },
+            )
+        })
+        .await
+        .map_err(|error| AppError::Agent(format!("作业定位失败: {error}")))??;
+
+        let notify_rx = {
             let inst = instance.lock();
-            return Ok(Self::job_output_snapshot(&inst, offset));
-        }
-
-        // 已完结或已有超出 offset 的新输出：立即返回
-        {
-            let mut inst = instance.lock();
-            if inst.info.status != JobStatus::Running {
-                inst.settled_notified = true;
-                return Ok(Self::job_output_snapshot(&inst, offset));
+            if from_ledger
+                || !wait
+                || inst.info.status.is_terminal()
+                || inst.total_bytes_written > offset
+            {
+                None
+            } else {
+                // 检查与订阅在同一把锁内：不会漏掉两者之间到达的输出/结算。
+                Some(inst.notify_tx.subscribe())
             }
-            if inst.total_bytes_written > offset {
-                return Ok(Self::job_output_snapshot(&inst, offset));
-            }
-        }
-
-        if !wait {
-            let inst = instance.lock();
-            return Ok(Self::job_output_snapshot(&inst, offset));
-        }
-
-        let mut notify_rx = instance.lock().notify_tx.subscribe();
-        let sleep = tokio::time::sleep(timeout);
-        tokio::pin!(sleep);
-        tokio::select! {
-            _ = &mut sleep => {
-                let mut inst = instance.lock();
-                // 等待超时：job 可能已结算（通知刚错过）——如实返回，
-                // 由调用方（模型 job_output）自行判断；若已结算则视为
-                // 已被看到，标记 notified 防系统重复注入。
-                if inst.info.status != JobStatus::Running {
-                    inst.settled_notified = true;
-                }
-                Ok(Self::job_output_snapshot(&inst, offset))
-            }
-            _ = notify_rx.changed() => {
-                let mut inst = instance.lock();
-                // 新输出或结算到达。若已结算（模型主动 wait 等到结果），
-                // 标记 notified——等价 DSH reported：等待方已消费结算，
-                // 不再需要额外的「作业已完成」系统通知。
-                if inst.info.status != JobStatus::Running {
-                    inst.settled_notified = true;
-                }
-                Ok(Self::job_output_snapshot(&inst, offset))
+        };
+        if let Some(mut notify_rx) = notify_rx {
+            tokio::select! {
+                _ = tokio::time::sleep(timeout) => {}
+                _ = notify_rx.changed() => {}
             }
         }
+        Self::job_output_snapshot(instance, offset, budget).await
     }
 
     /// 只读地看一眼作业当前状态，不消费输出、不改动任何读取游标
@@ -935,26 +930,46 @@ impl CommandExecutionManager {
         });
     }
 
-    fn job_output_snapshot(inst: &JobInstance, offset: usize) -> JobOutputResult {
-        let read = inst.read_output_from(offset);
-        JobOutputResult {
-            job_id: inst.info.job_id.clone(),
-            delta: read.text,
-            offset: read.next_offset,
-            // 本次返回的文本在整个输出流里的起始偏移（丢内容时文本从更靠后的
-            // 位置开始，不等于调用方传进来的 offset——调用方据此知道读到的是
-            // 哪一段）。原样透传 job 层的读数，本层不重算。
-            text_start_offset: read.text_start_offset,
-            status: inst.info.status,
-            cancel_reason: inst.cancel_reason,
-            detail: inst.info.detail.clone(),
-            lossy: read.lossy,
-            skipped_bytes: read.skipped_bytes,
-            spill_path: inst
-                .spill_path()
-                .map(|p| p.display().to_string())
-                .filter(|_| inst.spill_bytes() > 0),
-        }
+    async fn job_output_snapshot(
+        instance: Arc<PlMutex<JobInstance>>,
+        offset: usize,
+        budget: usize,
+    ) -> Result<JobOutputResult, AppError> {
+        tokio::task::spawn_blocking(move || {
+            let (snapshot, info, cancel_reason, spill_path) = {
+                let mut inst = instance.lock();
+                if inst.info.status.is_terminal() {
+                    inst.settled_notified = true;
+                }
+                (
+                    inst.output_snapshot(offset, budget),
+                    inst.info.clone(),
+                    inst.cancel_reason,
+                    inst.spill_path()
+                        .map(|p| p.display().to_string())
+                        .filter(|_| inst.spill_bytes() > 0),
+                )
+            };
+            // 实例锁已释放：文件打开、seek、有限读取与解码均不堵追加/结算，
+            // 且不在 tokio async worker 上做磁盘 I/O。
+            let read = snapshot.read();
+            JobOutputResult {
+                job_id: info.job_id,
+                delta: read.text,
+                offset: read.next_offset,
+                text_start_offset: read.text_start_offset,
+                snapshot_end: read.snapshot_end,
+                invalid_utf8: read.invalid_utf8,
+                status: info.status,
+                cancel_reason,
+                detail: info.detail,
+                lossy: read.lossy,
+                skipped_bytes: read.skipped_bytes,
+                spill_path,
+            }
+        })
+        .await
+        .map_err(|error| AppError::Agent(format!("作业输出读取失败: {error}")))
     }
 
     /// 某会话名下仍在运行的后台作业数（并发准入用）。恢复出来的历史作业
@@ -1104,7 +1119,11 @@ impl CommandExecutionManager {
     /// 记录（内存收敛不是删除）。两条来源共用同一套过滤与状态投影，
     /// 否则同一批数据会在「内存里」与「台账里」之间分叉出两种答案；
     /// 台账投影不可能显示成 `running`（见 `resolve_job`）。
-    pub async fn list_jobs(&self, filter: JobFilter<'_>, status_filter: Option<&str>) -> Vec<JobInfo> {
+    pub async fn list_jobs(
+        &self,
+        filter: JobFilter<'_>,
+        status_filter: Option<&str>,
+    ) -> Vec<JobInfo> {
         let status = status_filter.and_then(JobStatus::parse_filter);
         let mut res = Vec::new();
         let mut in_memory: HashSet<String> = HashSet::new();
@@ -1439,7 +1458,11 @@ fn remove_file_quietly(path: &Path) {
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!("command_exec: 删除作业输出文件 {} 失败: {}", path.display(), e),
+        Err(e) => log::warn!(
+            "command_exec: 删除作业输出文件 {} 失败: {}",
+            path.display(),
+            e
+        ),
     }
 }
 
@@ -1487,27 +1510,21 @@ async fn run_background_worker(
 
     // 取消信号直达 executor（见 submit_opt）：kill / 任务取消 / 断连级联
     // 都会触发通道的宽限关闭，然后以 Cancelled 结算。
-    let outcome = match inner
+    let outcome = inner
         .transport
         .exec_observable(&ticket, app.as_ref(), sink, Some(&cancel_rx))
-        .await
-    {
-        Ok(ExecOutcome::Completed { output, exit }) => SubmitOutcome::Completed { output, exit },
-        Ok(ExecOutcome::TimedOut { output }) => SubmitOutcome::TimedOut { output },
-        Ok(ExecOutcome::Cancelled { reason }) => SubmitOutcome::Cancelled { reason },
-        Err(error) => SubmitOutcome::Failed { error },
-    };
+        .await;
 
     let (exec_status, job_status, cancel_reason, detail) = match &outcome {
         // 非零退出码与「被信号打死」都算正常结束（与旧语义一致），但退出
         // 事实进 detail：模型据此知道命令到底成功没有，不必读输出猜。
-        SubmitOutcome::Completed { exit, .. } => (
+        Ok(ExecOutcome::Completed { output: (), exit }) => (
             ExecutionStatus::Completed,
             JobStatus::Completed,
             None,
             Some(exit.describe()).filter(|d| !d.is_empty()),
         ),
-        SubmitOutcome::TimedOut { .. } => (
+        Ok(ExecOutcome::TimedOut { output: () }) => (
             ExecutionStatus::TimedOut,
             JobStatus::Failed,
             None,
@@ -1516,7 +1533,7 @@ async fn run_background_worker(
         // 终止来源随 CancelReason 流入作业实例：User（界面终止）/
         // Agent（job_kill）/ Task（任务停止级联）→ killed 并记录来源；
         // 断连级联 → failed（会话已不存在）。执行记录沿用同一语义。
-        SubmitOutcome::Cancelled { reason } => match reason {
+        Ok(ExecOutcome::Cancelled { reason }) => match reason {
             CancelReason::Disconnected => (
                 ExecutionStatus::Cancelled,
                 JobStatus::Failed,
@@ -1525,7 +1542,7 @@ async fn run_background_worker(
             ),
             r => (ExecutionStatus::Killed, JobStatus::Killed, Some(*r), None),
         },
-        SubmitOutcome::Failed { error } => {
+        Err(error) => {
             let msg = format!("\n[Error: {}]", error);
             instance.lock().append_output(msg.as_bytes(), &temp_dir);
             (
@@ -1727,18 +1744,12 @@ mod tests {
             app: Option<&AppHandle>,
             on_chunk: crate::command_exec::executor::ChunkCallback,
             cancel: Option<&watch::Receiver<CancelReason>>,
-        ) -> Result<ExecOutcome, AppError> {
+        ) -> Result<ExecOutcome<()>, AppError> {
             if let MockBehavior::OutputThenHang(text) = &self.behavior {
                 on_chunk(text);
             }
             let outcome = self.exec(ticket, app, cancel).await?;
-            match &outcome {
-                ExecOutcome::Completed { output, .. } | ExecOutcome::TimedOut { output } => {
-                    on_chunk(output);
-                }
-                ExecOutcome::Cancelled { .. } => {}
-            }
-            Ok(outcome)
+            Ok(outcome.map_output(|output| on_chunk(&output)))
         }
     }
 
@@ -1775,7 +1786,15 @@ mod tests {
         }
 
         let read = mgr
-            .job_output(&info.job_id, 0, false, Duration::ZERO, JobCaller::Unscoped).await
+            .job_output(
+                &info.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
+            .await
             .unwrap();
         assert_eq!(read.status, JobStatus::Completed);
         assert_eq!(read.detail.as_deref(), Some("exit code: 2"));
@@ -1787,12 +1806,17 @@ mod tests {
     async fn job_ids_stay_monotonic_across_restart() {
         // 模拟应用重启：同一台账文件被第二个 manager 读回来。旧 job_id
         // 绝不能复用——模型历史里可能一直记着上一次运行的 job_1。
-        let base = std::env::temp_dir().join(format!("marcel-ledger-restart-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("marcel-ledger-restart-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
 
         let first = manager_at(MockBehavior::Return("ok", false), base.clone());
         let a = first
-            .submit_background(None, CommandTicket::new("s1", "one", CommandSource::Agent), None)
+            .submit_background(
+                None,
+                CommandTicket::new("s1", "one", CommandSource::Agent),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(a.job_id, "job_1");
@@ -1800,14 +1824,26 @@ mod tests {
 
         let second = manager_at(MockBehavior::Return("ok", false), base.clone());
         let b = second
-            .submit_background(None, CommandTicket::new("s1", "two", CommandSource::Agent), None)
+            .submit_background(
+                None,
+                CommandTicket::new("s1", "two", CommandSource::Agent),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(b.job_id, "job_2", "重启后序号必须接着数，不能回到 job_1");
 
         // 老 id 在新进程里查不到，且给的是可解释的说明（不是裸 not found）
         let err = second
-            .job_output("job_9", 0, false, Duration::ZERO, JobCaller::Unscoped).await
+            .job_output(
+                "job_9",
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
+            .await
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("job_9"));
@@ -1920,7 +1956,14 @@ mod tests {
             let mut seen = false;
             for _ in 0..200 {
                 let read = mgr
-                    .job_output(&info.job_id, 0, false, Duration::ZERO, JobCaller::Unscoped)
+                    .job_output(
+                        &info.job_id,
+                        0,
+                        JobOutputResult::MAX_READ_BYTES,
+                        false,
+                        Duration::ZERO,
+                        JobCaller::Unscoped,
+                    )
                     .await
                     .unwrap();
                 if !read.delta.is_empty() {
@@ -1951,6 +1994,7 @@ mod tests {
             .job_output(
                 &job_id,
                 0,
+                JobOutputResult::MAX_READ_BYTES,
                 false,
                 Duration::ZERO,
                 JobCaller::Agent {
@@ -1974,6 +2018,7 @@ mod tests {
             .job_output(
                 &job_id,
                 0,
+                JobOutputResult::MAX_READ_BYTES,
                 false,
                 Duration::ZERO,
                 JobCaller::Agent {
@@ -2009,12 +2054,26 @@ mod tests {
         };
         // 自己的：照常可读
         assert!(mgr
-            .job_output(&mine.job_id, 0, false, Duration::ZERO, agent("conv_a"))
+            .job_output(
+                &mine.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                agent("conv_a")
+            )
             .await
             .is_ok());
         // 别人的：读 / 杀都被挡，且文案说明是归属问题而不是 id 打错
         let read_err = mgr
-            .job_output(&mine.job_id, 0, false, Duration::ZERO, agent("conv_b"))
+            .job_output(
+                &mine.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                agent("conv_b"),
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -2304,7 +2363,15 @@ mod tests {
 
         // 输出经 sink 沉淀，可增量回读
         let out = mgr
-            .job_output(&info.job_id, 0, false, Duration::ZERO, JobCaller::Unscoped).await
+            .job_output(
+                &info.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
+            .await
             .unwrap();
         assert_eq!(out.delta, "job output");
         assert_eq!(out.status, JobStatus::Completed);
@@ -2314,7 +2381,9 @@ mod tests {
         assert!(snaps.iter().any(|s| s.display_command == "long-cmd"));
 
         // list_jobs 反映完结状态
-        let jobs = mgr.list_jobs(JobFilter::Session("s1"), Some("completed")).await;
+        let jobs = mgr
+            .list_jobs(JobFilter::Session("s1"), Some("completed"))
+            .await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_id, info.job_id);
     }
@@ -2352,12 +2421,22 @@ mod tests {
         let status = wait_for_job_settlement(&mgr, &info.job_id, "s1").await;
         assert_eq!(status, JobStatus::Killed);
 
-        let jobs = mgr.list_jobs(JobFilter::Session("s1"), Some("killed")).await;
+        let jobs = mgr
+            .list_jobs(JobFilter::Session("s1"), Some("killed"))
+            .await;
         assert_eq!(jobs.len(), 1);
 
         // job_output 带出终止来源：Agent 自己 job_kill → Agent
         let out = mgr
-            .job_output(&info.job_id, 0, false, Duration::ZERO, JobCaller::Unscoped).await
+            .job_output(
+                &info.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
+            .await
             .unwrap();
         assert_eq!(out.cancel_reason, Some(CancelReason::Agent));
     }
@@ -2418,7 +2497,15 @@ mod tests {
             Some("exit code: 0".into()),
         );
         let out = mgr
-            .job_output(&info.job_id, 0, false, Duration::ZERO, JobCaller::Unscoped).await
+            .job_output(
+                &info.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
+            .await
             .unwrap();
         assert_eq!(out.status, JobStatus::Completed);
         assert_eq!(
@@ -2450,7 +2537,15 @@ mod tests {
         let status = wait_for_job_settlement(&mgr, &info.job_id, "s1").await;
         assert_eq!(status, JobStatus::Killed);
         let out = mgr
-            .job_output(&info.job_id, 0, false, Duration::ZERO, JobCaller::Unscoped).await
+            .job_output(
+                &info.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
+            .await
             .unwrap();
         assert_eq!(out.cancel_reason, Some(CancelReason::Task));
     }
@@ -2469,7 +2564,15 @@ mod tests {
         // wait=true：worker 结算后立即返回，不傻等满超时
         let started = std::time::Instant::now();
         let out = mgr
-            .job_output(&info.job_id, 0, true, Duration::from_secs(5), JobCaller::Unscoped).await
+            .job_output(
+                &info.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                true,
+                Duration::from_secs(5),
+                JobCaller::Unscoped,
+            )
+            .await
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(out.delta, "done");
@@ -2491,7 +2594,15 @@ mod tests {
         let status = wait_for_job_settlement(&mgr, &info.job_id, "s1").await;
         assert_eq!(status, JobStatus::Failed);
         let out = mgr
-            .job_output(&info.job_id, 0, false, Duration::ZERO, JobCaller::Unscoped).await
+            .job_output(
+                &info.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
+            .await
             .unwrap();
         assert!(
             out.delta.contains("boom"),
@@ -2504,7 +2615,15 @@ mod tests {
     async fn job_output_unknown_id_errors() {
         let mgr = manager(MockBehavior::Return("x", false));
         let err = mgr
-            .job_output("nope", 0, false, Duration::ZERO, JobCaller::Unscoped).await
+            .job_output(
+                "nope",
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"));
     }
@@ -2611,7 +2730,9 @@ mod tests {
 
         let settled = mgr.take_settled_jobs_for_task("agent-task-13");
         assert!(settled.is_empty(), "自己杀的作业不该再通知一轮");
-        let jobs = mgr.list_jobs(JobFilter::Session("s1"), Some("killed")).await;
+        let jobs = mgr
+            .list_jobs(JobFilter::Session("s1"), Some("killed"))
+            .await;
         assert_eq!(jobs.len(), 1, "作业本身仍要能从列表里看到");
     }
 
@@ -2663,7 +2784,15 @@ mod tests {
             .await
             .unwrap();
         let out = mgr
-            .job_output(&info.job_id, 0, true, Duration::from_secs(5), JobCaller::Unscoped).await
+            .job_output(
+                &info.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                true,
+                Duration::from_secs(5),
+                JobCaller::Unscoped,
+            )
+            .await
             .unwrap();
         assert_eq!(out.status, JobStatus::Completed);
 
@@ -2674,15 +2803,182 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn job_output_reads_spill_off_runtime_without_holding_instance_lock() {
+        use super::super::job::MAX_RING_BUFFER_BYTES;
+        use std::sync::atomic::AtomicBool;
+
+        let mgr = manager(MockBehavior::Hang);
+        let (tx, _) = watch::channel(0);
+        let mut inst = JobInstance::new(
+            "job_snapshot_test".into(),
+            0,
+            "s1".into(),
+            Some("snapshot-task".into()),
+            Some("snapshot-owner".into()),
+            None,
+            "test".into(),
+            tx,
+        );
+        let bytes = vec![b'a'; MAX_RING_BUFFER_BYTES + 17];
+        inst.append_output(&bytes, &mgr.inner.temp_dir);
+        let original_end = bytes.len();
+        let instance = Arc::new(PlMutex::new(inst));
+        let weak = Arc::downgrade(&instance);
+        let runtime_thread = std::thread::current().id();
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let dir = mgr.inner.temp_dir.clone();
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        instance.lock().before_spill_read = Some(Arc::new(move || {
+            assert_ne!(
+                std::thread::current().id(),
+                runtime_thread,
+                "读盘不能堵单线程 tokio worker"
+            );
+            let instance = weak.upgrade().unwrap();
+            let mut inst = instance.try_lock().expect("实际读盘点必须已经释放实例锁");
+            observed.store(true, Ordering::SeqCst);
+            // 读盘前推进输出和结算：返回的原快照不应被新 ring 覆盖/新状态污染。
+            inst.append_output(&vec![b'b'; MAX_RING_BUFFER_BYTES + 29], &dir);
+            inst.finalize_with_detail(JobStatus::Completed, None, Some("exit code: 0".into()));
+            drop(inst);
+            entered_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+        }));
+        mgr.inner
+            .jobs
+            .lock()
+            .insert("job_snapshot_test".into(), instance.clone());
+        let reading_mgr = mgr.clone();
+        let read_task = tokio::spawn(async move {
+            reading_mgr
+                .job_output(
+                    "job_snapshot_test",
+                    12,
+                    16,
+                    false,
+                    Duration::ZERO,
+                    JobCaller::Unscoped,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // 慢盘停住时 async runtime 仍能处理定时器/其它任务。
+        tokio::time::timeout(Duration::from_secs(1), tokio::task::yield_now())
+            .await
+            .unwrap();
+        resume_tx.send(()).unwrap();
+        let read = read_task.await.unwrap().unwrap();
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(read.delta, "a".repeat(16));
+        assert_eq!(read.offset, 28);
+        assert_eq!(read.snapshot_end, original_end);
+        assert_eq!(read.status, JobStatus::Running);
+        assert!(!read.lossy);
+        assert!(
+            !instance.lock().settled_notified,
+            "快照之后才结算，不能吞掉尚未返回给调用方的通知"
+        );
+        instance.lock().before_spill_read = None;
+        let settled = mgr
+            .job_output(
+                "job_snapshot_test",
+                28,
+                16,
+                true,
+                Duration::from_secs(5),
+                JobCaller::Unscoped,
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled.status, JobStatus::Completed);
+        assert_eq!(settled.detail.as_deref(), Some("exit code: 0"));
+        assert!(instance.lock().settled_notified);
+        assert!(mgr.take_settled_jobs_for_task("snapshot-task").is_empty());
+    }
+
+    #[tokio::test]
+    async fn paged_output_preserves_ledger_state_and_terminal_empty_increment() {
+        let base = cross_run_base("paged-output");
+        let mgr = manager_at(MockBehavior::Return("abcdefghij", false), base.clone());
+        let info = mgr
+            .submit_background(
+                None,
+                CommandTicket::new("s1", "test", CommandSource::Agent).owned_by("conv-page"),
+                None,
+            )
+            .await
+            .unwrap();
+        wait_for_job_settlement(&mgr, &info.job_id, "s1").await;
+        let before = std::fs::read(base.join("jobs.json")).unwrap();
+        mgr.inner.jobs.lock().remove(&info.job_id);
+        let mut offset = 0;
+        let mut output = String::new();
+        while offset < 10 {
+            let read = mgr
+                .job_output(
+                    &info.job_id,
+                    offset,
+                    4,
+                    true,
+                    Duration::from_secs(5),
+                    JobCaller::Agent {
+                        owner_conversation_id: Some("conv-page"),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(read.status, JobStatus::Completed);
+            assert_eq!(read.snapshot_end, 10);
+            assert!(read.delta.len() <= 4);
+            assert_eq!(read.offset, offset + read.delta.len());
+            assert!(!read.lossy);
+            output.push_str(&read.delta);
+            offset = read.offset;
+        }
+        assert_eq!(output, "abcdefghij");
+        let empty = mgr
+            .job_output(
+                &info.job_id,
+                offset,
+                0,
+                true,
+                Duration::from_secs(5),
+                JobCaller::Unscoped,
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.offset, 10);
+        assert!(empty.delta.is_empty());
+        assert!(!empty.lossy);
+        assert_eq!(empty.status, JobStatus::Completed);
+        assert_eq!(
+            std::fs::read(base.join("jobs.json")).unwrap(),
+            before,
+            "分页不改写台账"
+        );
+        assert!(
+            !mgr.inner.jobs.lock().contains_key(&info.job_id),
+            "只读投影不能重新占据注册表"
+        );
+    }
+
     // ────────── 台账回读：写者/读者字段集一致（跨重启的回归） ──────────
 
     /// 每个测试用独立配置目录（台账 + 溢出目录都钉在里面）。
     fn cross_run_base(tag: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "marcel-ledger-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("marcel-ledger-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         base
     }
@@ -2730,7 +3026,14 @@ mod tests {
         assert_eq!(jobs[0].total_output_bytes, CAPTURED);
 
         let read = mgr
-            .job_output("job_1", 0, false, Duration::ZERO, JobCaller::Unscoped)
+            .job_output(
+                "job_1",
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
             .await
             .unwrap();
         assert!(read.lossy, "被截断的那段读不到，必须如实报 lossy");
@@ -2774,7 +3077,14 @@ mod tests {
             "总量不能因为「没有落点」就归零"
         );
         let read = mgr
-            .job_output("job_1", 0, false, Duration::ZERO, JobCaller::Unscoped)
+            .job_output(
+                "job_1",
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
             .await
             .unwrap();
         assert_eq!(read.status, JobStatus::Failed);
@@ -2816,7 +3126,14 @@ mod tests {
         // 「应用重启」：同一配置目录重建 manager，来源要从台账读回来
         let mgr = manager_at(MockBehavior::Hang, base.clone());
         let out = mgr
-            .job_output(&job_id, 0, false, Duration::ZERO, JobCaller::Unscoped)
+            .job_output(
+                &job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
             .await
             .unwrap();
         assert_eq!(out.status, JobStatus::Killed);
@@ -2853,7 +3170,14 @@ mod tests {
 
         let mgr = manager_at(MockBehavior::Hang, base.clone());
         let out = mgr
-            .job_output(&job_id, 0, false, Duration::ZERO, JobCaller::Unscoped)
+            .job_output(
+                &job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2896,7 +3220,14 @@ mod tests {
             JobStatus::Completed
         );
         let read = mgr
-            .job_output(&info.job_id, 0, false, Duration::ZERO, JobCaller::Unscoped)
+            .job_output(
+                &info.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
             .await
             .unwrap();
         assert_eq!(read.status, JobStatus::Completed);
@@ -2914,6 +3245,7 @@ mod tests {
             .job_output(
                 &info.job_id,
                 0,
+                JobOutputResult::MAX_READ_BYTES,
                 false,
                 Duration::ZERO,
                 JobCaller::Agent {
@@ -2928,7 +3260,14 @@ mod tests {
         // wait=true 对台账投影不生效：没有通道可等，立即返回而不是挂满超时
         let started = std::time::Instant::now();
         let waited = mgr
-            .job_output(&info.job_id, 0, true, Duration::from_secs(5), JobCaller::Unscoped)
+            .job_output(
+                &info.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                true,
+                Duration::from_secs(5),
+                JobCaller::Unscoped,
+            )
             .await
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -2962,11 +3301,22 @@ mod tests {
         // ——内存收敛几分钟就能让一条记录从列表里消失。
         let mgr = manager(MockBehavior::Return("x", false));
         let msg = mgr
-            .job_output("job_nope", 0, false, Duration::ZERO, JobCaller::Unscoped)
+            .job_output(
+                "job_nope",
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
             .await
             .unwrap_err()
             .to_string();
-        assert!(!msg.contains("另一个对话"), "归属不是这里的可能原因: {}", msg);
+        assert!(
+            !msg.contains("另一个对话"),
+            "归属不是这里的可能原因: {}",
+            msg
+        );
         assert!(!msg.contains("只保留最近 7 天"), "保留期不许写死: {}", msg);
         assert!(msg.contains("job_list"), "要给出下一步动作: {}", msg);
         assert!(msg.contains("台账"), "要说明已查过台账: {}", msg);
@@ -3020,7 +3370,10 @@ mod tests {
 
         // 真的交给模型之后确认 → 不再播报；重复确认是幂等的
         assert_eq!(mgr.ack_job_notices(&[mine.job_id.clone()]), 1);
-        assert!(mgr.pending_job_notices("conv-a").is_empty(), "确认过的不再播报");
+        assert!(
+            mgr.pending_job_notices("conv-a").is_empty(),
+            "确认过的不再播报"
+        );
         assert_eq!(mgr.ack_job_notices(&[mine.job_id.clone()]), 0);
 
         // 别的会话不受影响
@@ -3074,7 +3427,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(mgr.pending_job_notices("conv-c").is_empty(), "还在跑就没有结局可播");
+        assert!(
+            mgr.pending_job_notices("conv-c").is_empty(),
+            "还在跑就没有结局可播"
+        );
 
         mgr.kill_job(&info.job_id, CancelReason::User, JobCaller::Unscoped)
             .await
