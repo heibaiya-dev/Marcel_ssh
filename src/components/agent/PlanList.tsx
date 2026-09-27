@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
-import { useAgentStore } from '@/stores/agentStore';
+import { useTaskStore } from '@/stores/taskStore';
+import { useConversationStore } from '@/stores/conversationStore';
 import type { PlanItem, PlanItemStatus } from '@/lib/types';
 
 // ────────────────────────── SVG Status Icons ──────────────────────────
@@ -91,8 +92,8 @@ export default function PlanList() {
   // 占位 task（sessionId 为空，重启残留）的 status 已是 'completed'，同样走
   // 隐藏检查——重启前已全完成的 plan 重启后不应再显示；只有中断（有非终态
   // item）的 plan 才会因 allTerminal=false 而保留。
-  const plan = useAgentStore((s) => {
-    const convId = s.activeConversationId;
+  const convId = useConversationStore((s) => s.activeConversationId);
+  const plan = useTaskStore((s) => {
     if (!convId) return null;
     const tasksForConv = Object.values(s.tasks)
       .filter((t) => t.conversationId === convId)
@@ -118,12 +119,10 @@ export default function PlanList() {
     }
     return null;
   });
-  // Subscribe to plansDirty to force re-render on plan item updates
-  useAgentStore((s) => s.plansDirty);
   const [collapsed, setCollapsed] = useState(false);
 
-  // 检测 plan 全部进入终态时自动折叠（plan-completed 事件触发后 plansDirty
-  // 翻转，useEffect 依赖 plansDirty 重新检测）。用户可手动展开查看。
+  // plan-* 事件总是写入新的 plan 对象，订阅选中 plan 即可；不订阅全局
+  // plansDirty，避免后台会话的计划更新唤醒这里。全终态自动折叠后仍可手动展开。
   const allTerminal = plan
     ? plan.items.length > 0 &&
       plan.items.every((item) =>

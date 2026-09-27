@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useUpdateStore, isUpdateVisible } from '@/stores/updateStore';
-import { useAgentStore } from '@/stores/agentStore';
+import { useTaskStore } from '@/stores/taskStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { openExternalLink } from '@/lib/externalLinks';
@@ -42,7 +42,7 @@ export default function UpdatePill() {
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   // Agent 任务运行中 / 有活跃 SSH 会话 → 安装（会退出应用 / 重启）前必须确认
-  const agentBusy = useAgentStore((s) => {
+  const agentBusy = useTaskStore((s) => {
     const t = s.activeTaskId ? s.tasks[s.activeTaskId] : null;
     return t ? isTaskBusy(t.status) : false;
   });

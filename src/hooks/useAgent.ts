@@ -1,24 +1,23 @@
-import { useCallback, useEffect } from 'react';
-import { useAgentStore } from '@/stores/agentStore';
+import { useCallback, useEffect, useMemo } from 'react';
+import { useShallow } from 'zustand/react/shallow';
+import { useTaskStore } from '@/stores/taskStore';
+import { useConversationStore } from '@/stores/conversationStore';
 import { bus } from '@/plugins/injection/bus';
 import { isTaskBusy } from '@/lib/agentStatus';
 import { conversationUsageView } from '@/lib/tokenUsage';
-import type { AgentMode } from '@/lib/types';
+import type { AgentMessage } from '@/lib/types';
+
+// 缺少消息缓存时也返回稳定引用；这里只读取，不向 store 补写/清空旧数据。
+const EMPTY_MESSAGES: AgentMessage[] = [];
 
 export function useAgent() {
-  const store = useAgentStore((s) => ({
+  const conversation = useConversationStore(useShallow((s) => ({
+    // 会话列表由双端 UI 展示，元数据变化仍须响应；消息只订阅当前会话的桶。
     conversations: s.conversations,
     activeConversationId: s.activeConversationId,
-    messagesMap: s.messages,
-    tasks: s.tasks,
-    activeTaskId: s.activeTaskId,
-    mode: s.mode,
-    inputDraft: s.inputDraft,
-    usageByConversation: s.usageByConversation,
-    startTask: s.startTask,
-    stopTask: s.stopTask,
-    setMode: s.setMode,
-    setInputDraft: s.setInputDraft,
+    messages: s.activeConversationId
+      ? (s.messages[s.activeConversationId] ?? EMPTY_MESSAGES)
+      : EMPTY_MESSAGES,
     newConversation: s.newConversation,
     switchConversation: s.switchConversation,
     loadConversation: s.loadConversation,
@@ -31,20 +30,29 @@ export function useAgent() {
     loadConnectionConversations: s.loadConnectionConversations,
     syncActiveToConnection: s.syncActiveToConnection,
     syncActiveToSession: s.syncActiveToSession,
-  }));
-
-  const activeTask = store.activeTaskId ? (store.tasks[store.activeTaskId] ?? null) : null;
+  })));
+  const { activeConversationId } = conversation;
+  const task = useTaskStore(useShallow((s) => ({
+    activeTask: s.activeTaskId ? (s.tasks[s.activeTaskId] ?? null) : null,
+    activeUsage: activeConversationId ? s.usageByConversation[activeConversationId] : undefined,
+    mode: s.mode,
+    inputDraft: s.inputDraft,
+    startTask: s.startTask,
+    stopTask: s.stopTask,
+    setMode: s.setMode,
+    setInputDraft: s.setInputDraft,
+  })));
+  const { activeTask, startTask, stopTask } = task;
 
   // 当前会话的用量读数：实时事件优先、落库数据兜底（重启后打开会话走后者）。
   // 合成规则只在 `lib/tokenUsage.ts` 里写一遍，桌面与移动端共用。
-  const activeUsageView = conversationUsageView(
-    store.activeConversationId ? store.usageByConversation[store.activeConversationId] : undefined,
-    store.activeConversationId ? store.conversations[store.activeConversationId] : undefined,
+  const activeConversation = activeConversationId
+    ? conversation.conversations[activeConversationId]
+    : undefined;
+  const activeUsageView = useMemo(
+    () => conversationUsageView(task.activeUsage, activeConversation),
+    [task.activeUsage, activeConversation],
   );
-
-  const messages = store.activeConversationId
-    ? (store.messagesMap[store.activeConversationId] ?? [])
-    : [];
 
   const isRunning = activeTask ? isTaskBusy(activeTask.status) : false;
 
@@ -66,119 +74,28 @@ export function useAgent() {
       imageDataUrls?: string[],
       replaceImagePaths?: string[],
     ) => {
-      return store.startTask(sessionId, prompt, connectionId, imageDataUrls, replaceImagePaths);
+      return startTask(sessionId, prompt, connectionId, imageDataUrls, replaceImagePaths);
     },
-    [store.startTask],
+    [startTask],
   );
 
   const stopActiveTask = useCallback(async () => {
     if (activeTask) {
-      return store.stopTask(activeTask.id);
+      return stopTask(activeTask.id);
     }
-  }, [activeTask, store.stopTask]);
-
-  const setMode = useCallback(
-    (newMode: AgentMode) => {
-      store.setMode(newMode);
-    },
-    [store.setMode],
-  );
-
-  const newConversation = useCallback(
-    async (sessionId: string, connectionId: string) => {
-      return store.newConversation(sessionId, connectionId);
-    },
-    [store.newConversation],
-  );
-
-  const switchConversation = useCallback(
-    async (conversationId: string) => {
-      return store.switchConversation(conversationId);
-    },
-    [store.switchConversation],
-  );
-
-  const loadConversation = useCallback(
-    async (conversationId: string) => {
-      return store.loadConversation(conversationId);
-    },
-    [store.loadConversation],
-  );
-
-  const renameConversation = useCallback(
-    async (conversationId: string, title: string) => {
-      return store.renameConversation(conversationId, title);
-    },
-    [store.renameConversation],
-  );
-
-  const deleteConversation = useCallback(
-    async (conversationId: string) => {
-      return store.deleteConversation(conversationId);
-    },
-    [store.deleteConversation],
-  );
-
-  const setConversationPinned = useCallback(
-    async (conversationId: string, pinned: boolean) => {
-      return store.setConversationPinned(conversationId, pinned);
-    },
-    [store.setConversationPinned],
-  );
-
-  const rollbackToMessage = useCallback(
-    async (conversationId: string, messageId: string) => {
-      return store.rollbackToMessage(conversationId, messageId);
-    },
-    [store.rollbackToMessage],
-  );
-
-  const loadConnectionConversations = useCallback(
-    async (connectionId: string) => {
-      return store.loadConnectionConversations(connectionId);
-    },
-    [store.loadConnectionConversations],
-  );
-
-  const syncActiveToConnection = useCallback(
-    async (connectionId: string, sessionId?: string) => {
-      return store.syncActiveToConnection(connectionId, sessionId);
-    },
-    [store.syncActiveToConnection],
-  );
-
-  const syncActiveToSession = useCallback(
-    async (sessionId: string, connectionId: string) => {
-      return store.syncActiveToSession(sessionId, connectionId);
-    },
-    [store.syncActiveToSession],
-  );
+  }, [activeTask, stopTask]);
 
   return {
-    messages,
+    ...conversation,
     activeTask,
     isRunning,
-    mode: store.mode,
-    inputDraft: store.inputDraft,
+    mode: task.mode,
+    inputDraft: task.inputDraft,
     /** 当前会话的用量读数（含子 agent）；无会话/无数据时为 null。 */
     activeUsageView,
-    conversations: store.conversations,
-    activeConversationId: store.activeConversationId,
     sendPrompt,
     stopActiveTask,
-    setMode,
-    setInputDraft: store.setInputDraft,
-    newConversation,
-    switchConversation,
-    loadConversation,
-    renameConversation,
-    deleteConversation,
-    setConversationPinned,
-    setConversationModel: store.setConversationModel,
-    setConversationEffort: store.setConversationEffort,
-    rollbackToMessage,
-    loadConnectionConversations,
-    syncActiveToConnection,
-    syncActiveToSession,
+    setMode: task.setMode,
+    setInputDraft: task.setInputDraft,
   };
 }

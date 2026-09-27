@@ -20,7 +20,7 @@ import GlobalInteractionOverlay from '@/components/agent/GlobalInteractionOverla
 import { initInteractionListener } from '@/stores/interactionStore';
 import { initJobWake } from '@/stores/jobWake';
 import { useSettingsStore } from '@/stores/settingsStore';
-import { useAgentStore } from '@/stores/agentStore';
+import { useTaskStore } from '@/stores/taskStore';
 import { useSkillStore } from '@/stores/skillStore';
 import { usePluginStore } from '@/stores/pluginStore';
 import { useMarketStore } from '@/stores/marketStore';
@@ -109,7 +109,7 @@ export default function App() {
   const defaultAgentMode = useSettingsStore((s) => s.settings.defaultAgentMode);
   const workspaceLayout = useSettingsStore((s) => s.settings.workspaceLayout);
   const updateSettings = useSettingsStore((s) => s.update);
-  const setAgentMode = useAgentStore((s) => s.setMode);
+  const setAgentMode = useTaskStore((s) => s.setMode);
   const fetchSkills = useSkillStore((s) => s.fetchSkills);
   const fetchPlugins = usePluginStore((s) => s.fetchPlugins);
   const syncInjections = usePluginStore((s) => s.syncInjections);

@@ -1,13 +1,13 @@
 import { useSessionStore } from '@/stores/sessionStore';
-import { useAgentStore } from '@/stores/agentStore';
+import { useTaskStore } from '@/stores/taskStore';
 import { AGENT_MODES } from '@/lib/constants';
 import type { AgentMode } from '@/lib/types';
 
 export default function TerminalToolbar() {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const sessions = useSessionStore((s) => s.sessions);
-  const mode = useAgentStore((s) => s.mode);
-  const setMode = useAgentStore((s) => s.setMode);
+  const mode = useTaskStore((s) => s.mode);
+  const setMode = useTaskStore((s) => s.setMode);
 
   const activeSession = activeSessionId ? sessions[activeSessionId] ?? null : null;
 

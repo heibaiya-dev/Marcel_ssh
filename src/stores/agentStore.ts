@@ -1,15 +1,4 @@
+// 仅保留所属 store 的导出；React 消费者直接向所属 store 传 selector，
+// 不再提供先全量订阅 task/conversation 再执行 selector 的组合 hook。
 export { useTaskStore } from './taskStore';
 export { useConversationStore } from './conversationStore';
-
-import { useTaskStore } from './taskStore';
-import { useConversationStore } from './conversationStore';
-import type { TaskState } from './taskStore';
-import type { ConversationState } from './conversationStore';
-
-type AgentState = TaskState & ConversationState;
-
-export function useAgentStore<T>(selector: (state: AgentState) => T): T {
-  const taskState = useTaskStore();
-  const convState = useConversationStore();
-  return selector({ ...taskState, ...convState } as AgentState);
-}
