@@ -1138,6 +1138,65 @@ impl ConversationDb {
         messages.reverse();
         Ok((messages, has_more))
     }
+
+    /// 压缩落库的定位查询：找出 tail 行的 `(created_at, timestamp)`，以及它
+    /// **之前最近一张**压缩卡的 id（恒单卡——旧卡已被吸收，最多删一张）。
+    ///
+    /// `tail_db_id = Some`（自动压缩）按 id 定位被压区间末条；`None`（手动
+    /// 压缩）取队尾最后一行（created_at, rowid 最大，与前端队尾追加位置一致）。
+    /// 会话为空或 tail 行不存在返回 `None`。
+    ///
+    /// 只取定位所需的行，**不读全量历史**——旧实现为找这一行把全部归档正文
+    /// 拉进内存（每次压缩 Θ(全部历史)）。`card_prefix` 由调用方传入
+    /// （`COMPACTION_CARD_PREFIX` 的权威定义在 persister 侧）。
+    pub fn locate_compaction_tail(
+        &self,
+        conversation_id: &str,
+        tail_db_id: Option<&str>,
+        card_prefix: &str,
+    ) -> RusqliteResult<Option<(String, String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let like = format!("{}%", card_prefix);
+
+        let tail: Option<(String, String, i64)> = match tail_db_id {
+            Some(id) => tx
+                .query_row(
+                    "SELECT created_at, timestamp, rowid FROM messages
+                     WHERE conversation_id = ?1 AND id = ?2",
+                    [conversation_id, id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?,
+            None => tx
+                .query_row(
+                    "SELECT created_at, timestamp, rowid FROM messages
+                     WHERE conversation_id = ?1
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    [conversation_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?,
+        };
+        let Some((created_at, timestamp, rowid)) = tail else {
+            return Ok(None);
+        };
+
+        // created_at 用**原始 TEXT**（与写库同源），不做 DateTime 往返，
+        // 保证 commit_compaction 写出的卡片 created_at 与旧行可比。
+        let card_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM messages
+                 WHERE conversation_id = ?1 AND role = 'system' AND content LIKE ?2
+                   AND (created_at < ?3 OR (created_at = ?3 AND rowid < ?4))
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                rusqlite::params![conversation_id, like, created_at, rowid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(Some((created_at, timestamp, card_id)))
+    }
+
     // ───────────────────── 历史回读（只读，agent 侧入口） ─────────────────────
     //
     // 每个方法都是「一次持锁 + 一个事务」把「解析锚点/窗口」与「取行」做完：

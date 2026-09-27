@@ -227,11 +227,10 @@ impl ConversationPersister {
     /// 提交一次上下文压缩到会话库（压缩由 LLM 完成后、splice 之外的结构化落库）。
     ///
     /// 算法（统一 id 指针 / 手动队尾，取代位置数数与指纹验证）：
-    /// 1. 定位：
-    ///    - `outcome.tail_db_id` 有值（自动压缩）→ 被压区间末条消息的 DB row id，
-    ///      在 `load_messages` 行序中直接按 id 查行；
-    ///    - `None`（**手动压缩 = 队尾语义**，本会话消息可能没有 db_id）→ 取
-    ///      **最后一行**（卡片 = 对话末尾，与前端队尾追加位置严格一致）；
+    /// 1. 定位（[`ConversationDb::locate_compaction_tail`] 单事务完成，不读
+    ///    全量历史正文）：`tail_db_id` 有值（自动压缩）按 id 查被压区间末条；
+    ///    `None`（**手动压缩 = 队尾语义**，本会话消息可能没有 db_id）取最后一行
+    ///    （卡片 = 对话末尾，与前端队尾追加位置严格一致）；
     /// 2. 吸收：定位行**之前最近一张**压缩卡（恒单卡——旧卡已被吸收）删除；
     /// 3. 提交：插入新卡片，`created_at` / `timestamp` 取**定位行**的值 →
     ///    `load_messages` 行序 = 原文 + 卡片紧贴被压区间末尾（保留尾部之前 /
@@ -240,57 +239,36 @@ impl ConversationPersister {
     /// 返回是否真正提交（false = 行不存在 / 库为空 / 失败；**不落任何卡片**，
     /// 原文完整保留）。
     pub fn persist_compaction(&self, outcome: &CompactionOutcome) -> bool {
-        let rows = match self.conv_db.load_messages(&self.conversation_id) {
+        let located = match self.conv_db.locate_compaction_tail(
+            &self.conversation_id,
+            outcome.tail_db_id.as_deref(),
+            COMPACTION_CARD_PREFIX,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 log::warn!(
-                    "persist_compaction: load failed for {}: {}",
+                    "persist_compaction: locate failed for {}: {}",
                     self.conversation_id,
                     e
                 );
                 return false;
             }
         };
-        // 定位：自动按 id 查行；手动（None）取最后一行（队尾）
-        let tail_idx = match &outcome.tail_db_id {
-            Some(tail_id) => match rows.iter().position(|r| r.id == *tail_id) {
-                Some(i) => i,
-                None => {
-                    log::warn!(
-                        "persist_compaction: tail row {} not found for {}; skipping persist",
-                        tail_id,
-                        self.conversation_id
-                    );
-                    return false;
-                }
-            },
-            None => match rows.len().checked_sub(1) {
-                Some(i) => i,
-                None => {
-                    log::warn!(
-                        "persist_compaction: no rows to anchor manual tail for {}; skipping persist",
-                        self.conversation_id
-                    );
-                    return false;
-                }
-            },
+        let Some((created_at, timestamp, remove_card_id)) = located else {
+            log::warn!(
+                "persist_compaction: tail row {:?} not found for {} (empty conversation?); skipping persist",
+                outcome.tail_db_id,
+                self.conversation_id,
+            );
+            return false;
         };
+        // 吸收：定位行之前最近一张旧压缩卡（恒单卡——只留最新一张）
+        let remove_card_ids: Vec<String> = remove_card_id.into_iter().collect();
 
         let card_content = format!(
             "{COMPACTION_CARD_PREFIX}已整理 {} 条历史消息（约 {} tokens）\n\n{}",
             outcome.shadowed_messages, outcome.shadowed_tokens, outcome.summary
         );
-        // 吸收：定位行之前最近一张旧压缩卡（恒单卡——只留最新一张）
-        let mut remove_card_ids: Vec<String> = Vec::new();
-        for row in rows[..tail_idx].iter().rev() {
-            if row.role == "system" && row.content.starts_with(COMPACTION_CARD_PREFIX) {
-                remove_card_ids.push(row.id.clone());
-                break;
-            }
-        }
-        let span_end = &rows[tail_idx];
-        let created_at = span_end.created_at.to_rfc3339();
-        let timestamp = span_end.timestamp.clone();
 
         if let Err(e) = self.conv_db.commit_compaction(
             &self.conversation_id,
