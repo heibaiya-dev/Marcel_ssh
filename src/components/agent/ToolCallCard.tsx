@@ -9,25 +9,19 @@ import {
 } from '@/hooks/useStickyFollow';
 import { INNER_FOLLOW_THRESHOLD_PX } from '@/lib/agentScroll';
 import { readWebToolStatus, webToolChips, webToolNotice } from '@/lib/webToolStatus';
-import type { ChipTone } from '@/lib/webToolStatus';
 import {
   asArgString,
   fileChangeToolName,
   isPlanTool,
   isSubagentTool,
   toolDisplayName,
-  toolIconPaths,
   toolLabel,
   toolPreview,
   toolSpec,
 } from '@/lib/toolCatalog';
-
-/** 状态小标记的配色：中性=后端标识，warning=降级/被网站拦截。 */
-const CHIP_TONE_CLASS: Record<ChipTone, string> = {
-  neutral: 'bg-zinc-600/60 text-zinc-200',
-  warning: 'bg-amber-500/10 text-amber-300',
-  danger: 'bg-red-500/10 text-red-300',
-};
+// 卡片骨架（容器 + 标题行）与图标/小标记是共用的：「系统告知」卡用的是同一副
+// 壳（见 `jobNoticeCard`），样式只留这一份。
+import { ToolCardFrame, ToolChip, ToolIcon } from './toolCardChrome';
 
 interface Props {
   message: AgentMessage;
@@ -35,21 +29,6 @@ interface Props {
   /** Stable id for parent expand tracking (avoids inline closures). */
   messageId?: string;
   onExpandChange?: (messageId: string, expanded: boolean) => void;
-}
-
-/**
- * 工具标题图标。路径表在 `@/lib/toolCatalog`（一个工具一行），这里只负责用
- * 统一的描边 svg 包起来 —— 13 个图标原本各抄一遍 `<svg className="w-3.5 h-3.5"
- * fill="none" stroke="currentColor" viewBox="0 0 24 24">`，改尺寸要改 13 处。
- */
-function ToolIcon({ toolName }: { toolName: string }) {
-  return (
-    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      {toolIconPaths(toolName).map((d, i) => (
-        <path key={i} strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={d} />
-      ))}
-    </svg>
-  );
 }
 
 /** 打开 subagent 工具对应的子agent对话（查看完整调研过程）。 */
@@ -245,77 +224,50 @@ function ToolCallCard({ message, autoExpand, messageId, onExpandChange }: Props)
     const webNotice = webStatus ? webToolNotice(webStatus) : null;
 
     return (
-      <div
-        ref={cardRefCb}
-        className={`min-w-0 max-w-full rounded-md border ${tr.blocked ? 'border-red-800/60 bg-red-950/30' : (tr.wasTimeout || tr.wasAborted) ? 'border-amber-700/60 bg-amber-950/20' : 'border-zinc-700/60 bg-zinc-800/50'}`}
+      <ToolCardFrame
+        containerRef={cardRefCb}
+        toolName={tr.toolName}
+        label={displayName}
+        tone={tr.blocked ? 'danger' : tr.wasTimeout || tr.wasAborted ? 'warning' : 'default'}
+        busy={isExecuting}
+        expanded={expanded}
+        onToggle={() => !isExecuting && setExpanded((v) => !v)}
+        chips={
+          <>
+            {targetHost && (
+              <ToolChip
+                title={`目标机器：${targetHost}`}
+                className="flex items-center gap-1 max-w-[160px]"
+              >
+                <svg className="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+                <span className="truncate">{displayHost}</span>
+              </ToolChip>
+            )}
+            {subMode && <ToolChip>读写子agent</ToolChip>}
+            {webChips.map((chip) => (
+              <ToolChip key={chip.key} tone={chip.tone} title={chip.title}>
+                {chip.label}
+              </ToolChip>
+            ))}
+          </>
+        }
+        preview={preview}
+        trailing={
+          <>
+            {tr.blocked && (
+              <span className="flex-shrink-0 text-xs text-red-400 font-medium">已阻止</span>
+            )}
+            {!tr.blocked && tr.wasAborted && (
+              <span className="flex-shrink-0 text-xs text-amber-400 font-medium">已中断</span>
+            )}
+            {!tr.blocked && !tr.wasAborted && tr.wasTimeout && (
+              <span className="flex-shrink-0 text-xs text-amber-400 font-medium">超时</span>
+            )}
+          </>
+        }
       >
-        <button
-          onClick={() => !isExecuting && setExpanded((v) => !v)}
-          className="group w-full min-w-0 text-left"
-        >
-          <div className="flex items-center justify-between px-3 py-1.5 min-w-0">
-            <div className="flex items-center gap-2 min-w-0">
-              <span className="flex items-center gap-1.5 flex-shrink-0 text-xs font-mono px-1.5 py-0.5 rounded-lg bg-zinc-700/80 text-zinc-300">
-                <ToolIcon toolName={tr.toolName} />
-                <span>{displayName}</span>
-              </span>
-              {targetHost && (
-                <span
-                  className="flex-shrink-0 text-[11px] px-1.5 py-0.5 rounded-md bg-zinc-600/60 text-zinc-200 font-medium flex items-center gap-1 max-w-[160px]"
-                  title={`目标机器：${targetHost}`}
-                >
-                  <svg className="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
-                  </svg>
-                  <span className="truncate">{displayHost}</span>
-                </span>
-              )}
-              {subMode && (
-                <span className="flex-shrink-0 text-[11px] px-1.5 py-0.5 rounded-md bg-zinc-600/60 text-zinc-200 font-medium">
-                  读写子agent
-                </span>
-              )}
-              {webChips.map((chip) => (
-                <span
-                  key={chip.key}
-                  className={`flex-shrink-0 text-[11px] px-1.5 py-0.5 rounded-md font-medium ${CHIP_TONE_CLASS[chip.tone]}`}
-                  title={chip.title}
-                >
-                  {chip.label}
-                </span>
-              ))}
-              {preview && (
-                <span className="text-sm text-zinc-400 truncate font-mono">{preview}</span>
-              )}
-              {tr.blocked && (
-                <span className="flex-shrink-0 text-xs text-red-400 font-medium">已阻止</span>
-              )}
-              {!tr.blocked && tr.wasAborted && (
-                <span className="flex-shrink-0 text-xs text-amber-400 font-medium">已中断</span>
-              )}
-              {!tr.blocked && !tr.wasAborted && tr.wasTimeout && (
-                <span className="flex-shrink-0 text-xs text-amber-400 font-medium">超时</span>
-              )}
-            </div>
-            <div className="flex items-center gap-2 flex-shrink-0">
-              {isExecuting ? (
-                <svg className="animate-spin h-4 w-4 flex-shrink-0 text-zinc-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-              ) : (
-                <svg
-                  className={`w-4 h-4 flex-shrink-0 text-zinc-500 group-hover:text-zinc-300 transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`}
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                </svg>
-              )}
-            </div>
-          </div>
-        </button>
         {/* 运行中的 subagent 卡片：提供"查看"入口跳转子对话（实时调研过程） */}
         {isSubagentTool(tr.toolName) && isExecuting && (
           (() => {
@@ -444,7 +396,7 @@ function ToolCallCard({ message, autoExpand, messageId, onExpandChange }: Props)
             </div>
           )
         )}
-      </div>
+      </ToolCardFrame>
     );
   }
 
@@ -492,15 +444,15 @@ function ToolCallCard({ message, autoExpand, messageId, onExpandChange }: Props)
               <span>{displayName}</span>
             </span>
             {tcHost && (
-              <span
-                className="flex-shrink-0 text-[11px] px-1.5 py-0.5 rounded-md bg-zinc-600/60 text-zinc-200 font-medium flex items-center gap-1 max-w-[160px]"
+              <ToolChip
                 title={`目标机器：${tcHost}`}
+                className="flex items-center gap-1 max-w-[160px]"
               >
                 <svg className="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
                 </svg>
                 <span className="truncate">{tcDisplayHost}</span>
-              </span>
+              </ToolChip>
             )}
             {preview && (
               <span className="text-sm text-zinc-400 truncate font-mono">{preview}</span>

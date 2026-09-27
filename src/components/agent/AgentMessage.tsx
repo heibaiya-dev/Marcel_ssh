@@ -13,6 +13,9 @@ import {
 } from '@/hooks/useStickyFollow';
 import { INNER_FOLLOW_THRESHOLD_PX } from '@/lib/agentScroll';
 import { openExternalLink } from '@/lib/externalLinks';
+import { parseJobNotice } from '@/lib/jobNotice';
+import { useJobStore } from '@/stores/jobStore';
+import { ToolCardFrame, type ToolCardTone } from './toolCardChrome';
 import 'katex/dist/katex.min.css';
 
 interface Props {
@@ -365,30 +368,11 @@ function AgentMessage({
   // ─── Job notice: system-authored, NOT the user's own words ───
   //
   // 后台作业跑完、这一轮已经结束，系统自动开一轮把结局交给模型，那条 prompt
-  // 就是它。渲染成独立的告知卡（不是用户气泡）：混在用户气泡里会让人以为
-  // 自己发过这句话，而且它也确实不算「你说的话」（自动继续的额度只由真的
-  // 用户输入重置）。第一行是作业结局的一行摘要，其余是需要模型做的事。
+  // 就是它。渲染成一张工具卡（同一个组件骨架，见 `JobNoticeCard`）：它不是
+  // 用户说的话（自动继续的额度只由真的用户输入重置），也不该是一段看着像
+  // 谁发的正文 —— 卡片的形态本身就说明「这是系统/模型做的事」。
   if (isNotice) {
-    const [summary, ...rest] = message.content.split('\n');
-    return (
-      <div className="my-1.5 flex justify-start">
-        <div className="flex max-w-[88%] items-start gap-2 rounded-xl border border-zinc-700/70 bg-zinc-800/40 px-3 py-2">
-          <span className="mt-[3px] flex-shrink-0 rounded border border-zinc-600/70 px-1.5 py-[1px] text-[10px] leading-4 text-zinc-400">
-            系统告知
-          </span>
-          <div className="min-w-0 text-[13px] leading-relaxed text-zinc-300">
-            <div className="break-words font-medium text-zinc-200 [overflow-wrap:anywhere]">
-              {highlightPlainText(summary ?? '', searchKeyword)}
-            </div>
-            {rest.length > 0 && (
-              <div className="mt-0.5 whitespace-pre-wrap break-words text-zinc-400 [overflow-wrap:anywhere]">
-                {highlightPlainText(rest.join('\n'), searchKeyword)}
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-    );
+    return <JobNoticeCard message={message} searchKeyword={searchKeyword} />;
   }
 
   // ─── System message ───
@@ -544,6 +528,119 @@ function AgentMessage({
 }
 
 export default memo(AgentMessage);
+
+/**
+ * 作业状态 → 卡片色调与展开区里的状态字色。文案由后端给
+ * （`build_job_settlement_notice`），**认不出的状态照原样显示、只是不着色**
+ * —— 后端将来多一种说法时界面不会变哑巴。
+ *
+ * 标题行**不放状态胶囊**：正常结束（已完成）就安安静静一张卡，出问题才靠卡片
+ * 色调与展开区里的状态字出声 —— 与工具卡只在「被阻止 / 超时」时才标红一致。
+ * 色调用的是 {@link ToolCardTone}（同一套壳的色调）。
+ */
+const JOB_STATUS_STYLE: Record<string, { tone: ToolCardTone; text: string }> = {
+  已完成: { tone: 'default', text: 'text-emerald-400' },
+  执行失败: { tone: 'danger', text: 'text-red-400' },
+  已被终止: { tone: 'warning', text: 'text-amber-400' },
+  随应用退出中断: { tone: 'warning', text: 'text-amber-400' },
+  仍在运行: { tone: 'default', text: 'text-sky-400' },
+};
+
+const UNKNOWN_JOB_STATUS = { tone: 'default' as ToolCardTone, text: 'text-zinc-500' };
+
+/**
+ * 「系统告知」卡：后台作业的结算告知（`role=notice`）。
+ *
+ * 长得跟工具调用卡一样（同一个 `ToolCardFrame` 骨架、同一套宽度与展开行为）：
+ * 左边「后台作业」胶囊 + `$ 命令` 摘要（与当初那条 bash 卡显示的是同一行），
+ * 点开是每个作业一行（含状态）与给模型的指令。它不是用户说的话，所以不用用户
+ * 气泡；给模型的那句「用 `job_output` 去读输出」是操作说明而不是结论，**默认
+ * 收起** —— 折叠态只留干净的一行。
+ */
+function JobNoticeCard({
+  message,
+  searchKeyword,
+}: {
+  message: AgentMessageType;
+  searchKeyword?: string;
+}) {
+  const { jobs, notes } = parseJobNotice(message.content);
+  const head = jobs[0];
+  // 摘要行照抄 bash 卡：`$ 命令`。命令按 job_id 从作业 store 取（作业是在这次
+  // 运行里派发的就一定在），取不到（应用重启后又过了台账保留期）就回落成告知
+  // 文本里的描述 —— 摘要行永远有东西，不会因为查不到作业而空掉。
+  const jobCommand = useJobStore((s) => (head ? s.jobs[head.jobId]?.command : undefined));
+  const preview = head
+    ? jobs.length > 1
+      ? `${jobs
+          .slice(0, 3)
+          .map((j) => j.jobId)
+          .join('、')}${jobs.length > 3 ? ` 等 ${jobs.length} 个作业` : ''}`
+      : jobCommand
+        ? `$ ${jobCommand}`
+        : head.description
+    : (notes[0] ?? '');
+  const bodyNotes = head ? notes : notes.slice(1);
+  const notesText = bodyNotes.join('\n');
+
+  // 搜索命中的若是收起区里的字（比如 job_output），直接展开 —— 否则用户只看到
+  // 一张高亮的卡片，找不到命中在哪。
+  const keyword = searchKeyword?.trim().toLowerCase() ?? '';
+  const notesMatched = !!keyword && notesText.toLowerCase().includes(keyword);
+  const [expanded, setExpanded] = useState(false);
+  useEffect(() => {
+    if (notesMatched) setExpanded(true);
+  }, [notesMatched]);
+
+  const headTone = head ? (JOB_STATUS_STYLE[head.status] ?? UNKNOWN_JOB_STATUS).tone : 'default';
+
+  return (
+    <div className="my-1 flex min-w-0 justify-start">
+      {/* 宽度策略与工具卡一致：收起时最多 85%，展开后占满 */}
+      <div className={`min-w-0 ${expanded ? 'w-full' : 'max-w-[85%]'}`}>
+        <ToolCardFrame
+          // 图标借 bash 的终端图标：作业就是后台跑的 shell 命令（toolCatalog
+          // 里没有 job_* 的行，默认图标是个齿轮，放在这里认不出是什么）。
+          toolName="bash"
+          // 认不出格式时连身份一起换：它确实还是一句系统告知，只是不再是一行
+          // 作业（那种情况下预览给的是原文第一行）。
+          label={head ? '后台作业' : '系统告知'}
+          tone={headTone}
+          preview={preview}
+          expanded={expanded}
+          onToggle={() => setExpanded((v) => !v)}
+        >
+          {expanded && (
+            <div className="min-w-0 border-t border-zinc-700/50 px-3 py-1.5">
+              <ul className="mb-1 space-y-0.5">
+                {jobs.map((job) => {
+                  const style = JOB_STATUS_STYLE[job.status] ?? UNKNOWN_JOB_STATUS;
+                  return (
+                    <li key={job.jobId} className="flex items-baseline gap-2 text-xs">
+                      <span className="flex-shrink-0 font-mono text-zinc-300">{job.jobId}</span>
+                      <span
+                        className="min-w-0 flex-1 truncate text-zinc-400"
+                        title={job.description}
+                      >
+                        {job.description}
+                      </span>
+                      <span className={`flex-shrink-0 ${style.text}`}>{job.status}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+              {notesText && (
+                <div className="whitespace-pre-wrap break-words text-xs text-zinc-500 [overflow-wrap:anywhere]">
+                  {highlightPlainText(notesText, searchKeyword)}
+                </div>
+              )}
+            </div>
+          )}
+        </ToolCardFrame>
+      </div>
+    </div>
+  );
+}
 
 /** 压缩进行中卡片：实时生成的摘要文本是主角，逐字增长即"没卡住"。 */
 function CompactionRunningCard({ message }: { message: AgentMessageType }) {
