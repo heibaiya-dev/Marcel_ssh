@@ -403,11 +403,12 @@ export async function agentLoadActiveMessages(
 export async function agentLoadEarlierMessages(
   conversationId: string,
   beforeMessageId: string,
-): Promise<StoredMessage[]> {
-  return invoke<StoredMessage[]>("agent_load_earlier_messages", {
-    conversationId,
-    beforeMessageId,
-  });
+  limit: number,
+): Promise<{ messages: StoredMessage[]; hasMore: boolean }> {
+  return invoke<{ messages: StoredMessage[]; hasMore: boolean }>(
+    "agent_load_earlier_messages",
+    { conversationId, beforeMessageId, limit },
+  );
 }
 
 export async function agentLoadPlansByConversation(

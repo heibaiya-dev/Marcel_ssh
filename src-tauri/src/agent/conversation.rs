@@ -303,6 +303,16 @@ pub struct ActiveMessagesResult {
     pub checkpoint_id: Option<String>,
 }
 
+/// 归档翻页一页的加载结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EarlierMessagesResult {
+    /// 本页消息（按时间升序，紧跟在请求锚点之前）。
+    pub messages: Vec<StoredMessage>,
+    /// 本页之前是否还有更早的归档（调用方据此决定能不能继续翻）。
+    pub has_more: bool,
+}
+
 // ───────────────────── 历史回读（agent 侧只读入口） ─────────────────────
 //
 // 压缩从不删原文：它只把一段历史从**内存里**的 LLM 消息数组里 splice 掉、
@@ -614,6 +624,11 @@ impl ConversationDb {
 
             CREATE INDEX IF NOT EXISTS idx_conversations_connection ON conversations(connection_id);
             CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
+            -- 归档翻页（load_earlier_messages）：锚点 (created_at,rowid) 向前取页
+            -- 必须走索引序而不是全表排序。rowid 隐含在索引项末尾，等值 created_at
+            -- 的 rowid 决胜与 DESC 反向扫描都不需要 TEMP B-TREE。
+            CREATE INDEX IF NOT EXISTS idx_messages_conv_time
+                ON messages(conversation_id, created_at);
             -- 注意：idx_conversations_parent 依赖 parent_conversation_id 列，
             -- 旧库（无该列）在此处建索引会报 no such column 导致整个 execute_batch
             -- 失败（进而 ConversationDb::new 失败、AppState fallback 到内存空库，
@@ -1072,12 +1087,19 @@ impl ConversationDb {
         }
     }
 
-    /// 加载指定消息之前的更早归档历史消息（按需翻页加载）。
+    /// 加载指定消息之前的更早归档历史消息（按需翻页）。
+    ///
+    /// 只取锚点前**最近的 `limit` 条**（与 `fetch_side` 同构：DESC 取
+    /// `limit+1` 条当探针判断还有没有更多，再反转成升序），不再一次读出
+    /// 全部归档——UI 每次只展示一页，全量读取是 Θ(B) 的重复搬运与锁占用。
+    /// 返回 `(升序消息, 是否还有更早的)`；锚点不存在返回空且 `has_more=false`
+    ///（调用方按「没有更早历史」处理，与旧行为一致）。
     pub fn load_earlier_messages(
         &self,
         conversation_id: &str,
         before_message_id: &str,
-    ) -> RusqliteResult<Vec<StoredMessage>> {
+        limit: usize,
+    ) -> RusqliteResult<(Vec<StoredMessage>, bool)> {
         let conn = self.conn.lock().unwrap();
 
         // 获取 before_message 的 created_at 与 rowid 作为切分点
@@ -1090,7 +1112,7 @@ impl ConversationDb {
             .optional()?;
 
         let Some((created_at, rowid)) = point else {
-            return Ok(vec![]);
+            return Ok((vec![], false));
         };
 
         let mut stmt = conn.prepare(
@@ -1099,20 +1121,23 @@ impl ConversationDb {
                 FROM messages
                 WHERE conversation_id = ?1 
                 AND (created_at < ?2 OR (created_at = ?2 AND rowid < ?3))
-                ORDER BY created_at ASC, rowid ASC",
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?4",
                 messages_select_columns()
             ))?;
 
-        let messages = stmt
+        let mut messages = stmt
             .query_map(
-                rusqlite::params![conversation_id, created_at, rowid],
+                rusqlite::params![conversation_id, created_at, rowid, (limit as i64) + 1],
                 Self::map_stored_message,
             )?
             .collect::<RusqliteResult<Vec<_>>>()?;
 
-        Ok(messages)
+        let has_more = messages.len() > limit;
+        messages.truncate(limit);
+        messages.reverse();
+        Ok((messages, has_more))
     }
-
     // ───────────────────── 历史回读（只读，agent 侧入口） ─────────────────────
     //
     // 每个方法都是「一次持锁 + 一个事务」把「解析锚点/窗口」与「取行」做完：
@@ -3928,11 +3953,109 @@ mod tests {
         assert_eq!(cp_id, active2.messages[0].id);
 
         // 3. 测试 load_earlier_messages 从卡片开始向前拉取归档历史
-        let earlier = db.load_earlier_messages(&conv.id, &cp_id).expect("earlier");
+        let (earlier, has_more) = db.load_earlier_messages(&conv.id, &cp_id, 50).expect("earlier");
         assert_eq!(earlier.len(), 3); // u1, a1, t1
+        assert!(!has_more);
         assert_eq!(earlier[0].content, "u1");
         assert_eq!(earlier[1].content, "a1");
         assert_eq!(earlier[2].content, "t1");
+    }
+
+    /// 归档翻页必须真分页：每页 ≤ limit、跨页无重复无缺失、页序升序接续锚点。
+    /// 旧实现一次读出全部归档（无 LIMIT），这条测试在旧代码上直接失败。
+    #[test]
+    fn earlier_messages_page_through_the_archive_without_loss() {
+        let db = create_test_db();
+        let conv = db.create_conversation("conn_1", "paging").expect("create");
+
+        // 8 条归档（含相同 created_at 不同 rowid、中文/emoji 正文）+ 一张压缩卡
+        let archived: Vec<(&str, &str, &str)> = vec![
+            ("u1", "第 1 条", "2026-01-01T00:00:00Z"),
+            ("a1", "第 2 条 🎉", "2026-01-01T00:00:01Z"),
+            ("a2", "第 3 条（同秒前段）", "2026-01-01T00:00:02Z"),
+            ("a3", "第 4 条（同秒后段）", "2026-01-01T00:00:02Z"),
+            ("t1", "第 5 条", "2026-01-01T00:00:03Z"),
+            ("u2", "第 6 条", "2026-01-01T00:00:04Z"),
+            ("a4", "第 7 条", "2026-01-01T00:00:05Z"),
+            ("u3", "第 8 条", "2026-01-01T00:00:06Z"),
+        ];
+        for (role, content, ts) in &archived {
+            db.save_message(&conv.id, role, content, ts, None, None)
+                .expect("archive row");
+        }
+        let rows = db.load_messages(&conv.id).expect("load");
+        let span_end = rows[7].clone();
+        db.commit_compaction(
+            &conv.id,
+            &[],
+            "【上下文已压缩】summary",
+            &span_end.created_at.to_rfc3339(),
+            &span_end.timestamp,
+        )
+        .expect("commit");
+        let active = db.load_active_messages(&conv.id).expect("active");
+        let cp_id = active.checkpoint_id.expect("checkpoint");
+
+        // 每页 3 条翻到底；翻页游标 = 已收集内容中最早一条（loadEarlierHistory
+        // 是前插语义，新页到达后 first 就是下一页锚点）
+        let mut collected: Vec<StoredMessage> = Vec::new();
+        let mut anchor = cp_id;
+        let mut pages = 0;
+        loop {
+            let (page, has_more) = db
+                .load_earlier_messages(&conv.id, &anchor, 3)
+                .expect("page");
+            pages += 1;
+            assert!(page.len() <= 3, "单页不得超过 limit：{}", page.len());
+            if !page.is_empty() {
+                let mut merged: Vec<StoredMessage> = page;
+                merged.extend(collected);
+                collected = merged;
+            }
+            if !has_more {
+                break;
+            }
+            assert!(pages < 10, "翻页没有收敛：游标没有前进");
+            anchor = collected
+                .first()
+                .expect("游标必须用本页最早一条")
+                .id
+                .clone();
+        }
+
+        assert_eq!(pages, 3, "8 条归档按 3 条一页应翻 3 页");
+        assert_eq!(collected.len(), 8, "跨页不能丢消息");
+        let expected: Vec<&str> = archived.iter().map(|(_, c, _)| *c).collect();
+        let got: Vec<&str> = collected.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(got, expected, "跨页拼接应与原始顺序完全一致");
+    }
+
+    /// 翻页 SELECT 必须命中 (conversation_id, created_at) 复合索引，
+    /// 不允许全表 SCAN 或 TEMP B-TREE 排序（深归档下每次翻页都是全表排序）。
+    #[test]
+    fn earlier_messages_query_uses_the_composite_index() {
+        let db = create_test_db();
+        let conn = db.conn.lock().unwrap();
+        let plan: Vec<String> = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM messages WHERE conversation_id = 'c' AND (created_at < ?1 OR (created_at = ?1 AND rowid < ?2)) ORDER BY created_at DESC, rowid DESC LIMIT 4")
+            .expect("prepare")
+            .query_map(["2026-01-01T00:00:00Z", "1"], |r| r.get::<_, String>(3))
+            .expect("query plan")
+            .filter_map(|r| r.ok())
+            .collect();
+        let joined = plan.join(" | ");
+        assert!(
+            joined.contains("idx_messages_conv_time"),
+            "翻页查询应命中复合索引，实际计划：{joined}"
+        );
+        assert!(
+            !joined.to_uppercase().contains("SCAN"),
+            "翻页查询不允许全表扫描，实际计划：{joined}"
+        );
+        assert!(
+            !joined.to_uppercase().contains("TEMP B-TREE"),
+            "翻页查询不允许临时排序，实际计划：{joined}"
+        );
     }
 
     /// `MESSAGES_COLUMNS` 必须与**实际 schema**（建表 + 迁移跑完后的表）逐列一致、且顺序相同。
@@ -4059,8 +4182,8 @@ mod tests {
         }
         // ④ 翻页取更早（load_earlier_messages 的内联 SELECT）
         {
-            let earlier = db
-                .load_earlier_messages(&conv.id, &late.id)
+            let (earlier, _) = db
+                .load_earlier_messages(&conv.id, &late.id, 50)
                 .expect("earlier");
             let first = earlier.first().expect("应取到更早的消息");
             assert_eq!(first.id, early.id);
@@ -4146,8 +4269,8 @@ mod tests {
             None,
             "锚点在压缩卡之前 → 该切片里本就不含锚点行"
         );
-        let earlier = db
-            .load_earlier_messages(&conv.id, &later.id)
+        let (earlier, _) = db
+            .load_earlier_messages(&conv.id, &later.id, 50)
             .expect("earlier");
         assert_eq!(
             earlier.first().and_then(|m| m.turn_state.as_deref()),

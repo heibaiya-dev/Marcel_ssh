@@ -256,6 +256,13 @@ function enforceToolProtocol(output: LlmHistoryItem[]): LlmHistoryItem[] {
 /** 快速切换 SSH tab 时丢弃过期的 sync 结果 */
 let syncActiveGeneration = 0;
 
+/** 归档翻页每页条数。与 UI 的展示分页（AgentMessageList PAGE_SIZE）是两个
+ *  恰好同值的概念：这里管一次 IPC 取多少条，那边管一次多展示多少条。 */
+const EARLIER_PAGE_SIZE = 50;
+
+/** 归档翻页的在飞标记：同一会话滚动连触发时同一锚点只发一次请求。 */
+const earlierLoadsInFlight: Set<string> = new Set();
+
 /**
  * **显式**切换对话的代际令牌（历史列表点选 / 任务卡片跳转）。
  *
@@ -490,10 +497,17 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   loadEarlierHistory: async (conversationId: string) => {
     const current = get().messages[conversationId] || [];
     if (current.length === 0) return;
+    // 在飞防抖：滚动连触发时同一锚点只发一次请求，避免并发拉出重复页
+    if (earlierLoadsInFlight.has(conversationId)) return;
+    earlierLoadsInFlight.add(conversationId);
     const oldestMessageId = current[0].id;
 
     try {
-      const earlierStored = await tauri.agentLoadEarlierMessages(conversationId, oldestMessageId);
+      const { messages: earlierStored, hasMore } = await tauri.agentLoadEarlierMessages(
+        conversationId,
+        oldestMessageId,
+        EARLIER_PAGE_SIZE,
+      );
       if (earlierStored.length === 0) {
         set((state) => ({
           hasEarlierMessages: { ...state.hasEarlierMessages, [conversationId]: false },
@@ -510,12 +524,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           },
           hasEarlierMessages: {
             ...state.hasEarlierMessages,
-            [conversationId]: false, // 已经完全补齐更早历史
+            // 后端说还有就还有；翻页契约不再「一次补齐」
+            [conversationId]: hasMore,
           },
         };
       });
     } catch (err) {
       console.error('[conversationStore] loadEarlierHistory failed:', err);
+    } finally {
+      earlierLoadsInFlight.delete(conversationId);
     }
   },
 
@@ -679,13 +696,12 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   rollbackToMessage: async (conversationId: string, messageId: string) => {
     let msgs = get().messages[conversationId] || [];
     let index = msgs.findIndex((m) => m.id === messageId);
-    if (index < 0) {
-      // 目标不在当前活跃切片中：若有更早历史，先补齐历史再寻找
-      if (get().hasEarlierMessages[conversationId]) {
-        await get().loadEarlierHistory(conversationId);
-        msgs = get().messages[conversationId] || [];
-        index = msgs.findIndex((m) => m.id === messageId);
-      }
+    // 目标不在当前活跃切片中：逐页补齐更早历史再寻找（归档现在是真分页，
+    // 一次补页未必能覆盖目标所在位置）
+    while (index < 0 && get().hasEarlierMessages[conversationId]) {
+      await get().loadEarlierHistory(conversationId);
+      msgs = get().messages[conversationId] || [];
+      index = msgs.findIndex((m) => m.id === messageId);
     }
     if (index < 0) {
       throw new Error('消息不存在');
@@ -838,12 +854,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       restoreRunningTaskForConversation(conversationId);
     };
 
-    const applyActive = (conversationId: string, msgs?: AgentMessage[]) => {
+    const applyActive = (conversationId: string, msgs?: AgentMessage[], hasEarlier?: boolean) => {
       if (!stillTarget()) return false;
       set((s) => ({
         ...(msgs
           ? { messages: { ...s.messages, [conversationId]: msgs } }
           : {}),
+        ...(hasEarlier === undefined
+          ? {}
+          : { hasEarlierMessages: { ...s.hasEarlierMessages, [conversationId]: hasEarlier } }),
         activeConversationId: conversationId,
         activeConversationBySession: {
           ...s.activeConversationBySession,
@@ -873,13 +892,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         restoreActiveTaskForConversation(boundConvId);
         return;
       }
-      const [stored, storedPlans] = await Promise.all([
-        tauri.agentLoadConversation(boundConvId),
+      // 活跃窗口加载（与 switchConversation 同源）：LLM 上下文本就只取最新
+      // 压缩卡之后的内容，归档按页翻；冷路径不再隐式全量拉归档。
+      const [activeRes, storedPlans] = await Promise.all([
+        tauri.agentLoadActiveMessages(boundConvId),
         tauri.agentLoadPlansByConversation(boundConvId),
       ]);
       if (!stillTarget()) return;
-      const msgs: AgentMessage[] = clearIntermediateReasoning(stored.map(storedMessageToAgentMessage));
-      if (!applyActive(boundConvId, msgs)) return;
+      const msgs: AgentMessage[] = clearIntermediateReasoning(activeRes.messages.map(storedMessageToAgentMessage));
+      if (!applyActive(boundConvId, msgs, activeRes.hasEarlier)) return;
       useTaskStore.getState().loadPersistedPlans(boundConvId, storedPlans);
       restoreActiveTaskForConversation(boundConvId);
       return;
@@ -915,13 +936,13 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       return;
     }
 
-    const [stored, storedPlans] = await Promise.all([
-      tauri.agentLoadConversation(preferred),
+    const [activeRes, storedPlans] = await Promise.all([
+      tauri.agentLoadActiveMessages(preferred),
       tauri.agentLoadPlansByConversation(preferred),
     ]);
     if (!stillTarget()) return;
-    const msgs: AgentMessage[] = clearIntermediateReasoning(stored.map(storedMessageToAgentMessage));
-    if (!applyActive(preferred, msgs)) return;
+    const msgs: AgentMessage[] = clearIntermediateReasoning(activeRes.messages.map(storedMessageToAgentMessage));
+    if (!applyActive(preferred, msgs, activeRes.hasEarlier)) return;
     useTaskStore.getState().loadPersistedPlans(preferred, storedPlans);
     restoreActiveTaskForConversation(preferred);
   },
@@ -938,12 +959,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       restoreRunningTaskForConversation(conversationId);
     };
 
-    const applyActive = (conversationId: string, msgs?: AgentMessage[]) => {
+    const applyActive = (conversationId: string, msgs?: AgentMessage[], hasEarlier?: boolean) => {
       if (!stillTarget()) return false;
       set((s) => ({
         ...(msgs
           ? { messages: { ...s.messages, [conversationId]: msgs } }
           : {}),
+        ...(hasEarlier === undefined
+          ? {}
+          : { hasEarlierMessages: { ...s.hasEarlierMessages, [conversationId]: hasEarlier } }),
         activeConversationId: conversationId,
         activeConversationByConnection: rememberActiveForConnection(
           s.activeConversationByConnection,
@@ -1001,14 +1025,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       return;
     }
 
-    // 不走 loadConversation：它会无条件改 active，竞态下会盖掉更新的 tab
-    const [stored, storedPlans] = await Promise.all([
-      tauri.agentLoadConversation(preferred),
+    // 不走 loadConversation：它会无条件改 active，竞态下会盖掉更新的 tab。
+    // 活跃窗口加载（同 syncActiveToSession）：冷路径不再隐式全量拉归档。
+    const [activeRes, storedPlans] = await Promise.all([
+      tauri.agentLoadActiveMessages(preferred),
       tauri.agentLoadPlansByConversation(preferred),
     ]);
     if (!stillTarget()) return;
-    const msgs: AgentMessage[] = clearIntermediateReasoning(stored.map(storedMessageToAgentMessage));
-    if (!applyActive(preferred, msgs)) return;
+    const msgs: AgentMessage[] = clearIntermediateReasoning(activeRes.messages.map(storedMessageToAgentMessage));
+    if (!applyActive(preferred, msgs, activeRes.hasEarlier)) return;
     useTaskStore.getState().loadPersistedPlans(preferred, storedPlans);
     restoreActiveTaskForConversation(preferred);
   },
@@ -1054,13 +1079,19 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
             ? rememberActiveForConnection(state.activeConversationByConnection, connectionId, preferred)
             : state.activeConversationByConnection,
         }));
-        // 复用已有对话时若本地无消息，先从 DB 拉齐，避免 LLM 历史为空
+        // 复用已有对话时若本地无消息，先从 DB 拉齐活跃段（LLM 历史只取
+        // 最新压缩卡之后的内容，这里拉齐窗口即可，归档交给翻页），避免
+        // LLM 历史为空
         if (!get().messages[preferred]?.length) {
-          const stored = await tauri.agentLoadConversation(preferred);
+          const activeRes = await tauri.agentLoadActiveMessages(preferred);
           if (get().activeConversationId === preferred) {
-            const msgs = clearIntermediateReasoning(stored.map(storedMessageToAgentMessage));
+            const msgs = clearIntermediateReasoning(activeRes.messages.map(storedMessageToAgentMessage));
             set((state) => ({
               messages: { ...state.messages, [preferred]: msgs },
+              hasEarlierMessages: {
+                ...state.hasEarlierMessages,
+                [preferred]: activeRes.hasEarlier,
+              },
             }));
           }
         }

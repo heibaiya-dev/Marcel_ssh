@@ -266,18 +266,24 @@ pub async fn agent_load_active_messages(
     Ok(result)
 }
 
-/// 加载指定消息之前的更早归档历史消息（按需翻页加载）。
+/// 加载指定消息之前的更早归档历史消息（按需翻页，一页 `limit` 条）。
 #[tauri::command]
 pub async fn agent_load_earlier_messages(
     state: State<'_, AppState>,
     conversation_id: String,
     before_message_id: String,
-) -> Result<Vec<crate::agent::conversation::StoredMessage>, AppError> {
-    let messages = state
+    limit: Option<usize>,
+) -> Result<crate::agent::conversation::EarlierMessagesResult, AppError> {
+    // 页长由前端传（UI 每页展示条数）；服务端钳制防异常值。
+    let limit = limit.unwrap_or(50).clamp(1, 500);
+    let (messages, has_more) = state
         .conversation_db
-        .load_earlier_messages(&conversation_id, &before_message_id)
+        .load_earlier_messages(&conversation_id, &before_message_id, limit)
         .map_err(|e| AppError::Agent(format!("Failed to load earlier messages: {}", e)))?;
-    Ok(messages)
+    Ok(crate::agent::conversation::EarlierMessagesResult {
+        messages,
+        has_more,
+    })
 }
 
 /// Rename a conversation.

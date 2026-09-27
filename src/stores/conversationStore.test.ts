@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { useConversationStore } from '@/stores/conversationStore';
 import { useTaskStore } from '@/stores/taskStore';
 import { getStreamState, setStreamState } from './agentStreamHandlers';
-import type { AgentMessage, AgentTask } from '@/lib/types';
+import type { AgentMessage, AgentTask, AgentConversation, StoredMessage } from '@/lib/types';
 
 const {
   agentListConversationsByConnection,
@@ -61,7 +61,7 @@ describe('conversationStore', () => {
       const stored = await agentLoadConversation(convId);
       return { messages: stored ?? [], hasEarlier: false, checkpointId: null };
     });
-    agentLoadEarlierMessages.mockResolvedValue([]);
+    agentLoadEarlierMessages.mockResolvedValue({ messages: [], hasMore: false });
     useConversationStore.setState({
       conversations: {},
       messages: {},
@@ -2086,6 +2086,116 @@ describe('conversationStore', () => {
 
       expect(useConversationStore.getState().activeConversationId).toBe('conv-b');
       expect(useConversationStore.getState().messages['conv-a']).toBeUndefined();
+    });
+  });
+
+  describe('归档真分页（hasEarlier 跟随后端真值）', () => {
+    const storedMsg = (id: string, content: string): StoredMessage =>
+      ({
+        id,
+        conversation_id: 'conv-1',
+        role: 'user',
+        content,
+        timestamp: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+      }) as unknown as StoredMessage;
+
+    function seedArchivedConversation() {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        conversations: {
+          'conv-1': { id: 'conv-1', title: 'T', connectionId: 'c1', createdAt: '', updatedAt: '' } as AgentConversation,
+        },
+        messages: { 'conv-1': [makeMessage({ id: 'anchor' })] },
+        hasEarlierMessages: { 'conv-1': true },
+      });
+    }
+
+    it('loadEarlierHistory 后 hasEarlier 跟随后端 hasMore，不再一次写死 false', async () => {
+      seedArchivedConversation();
+      agentLoadEarlierMessages.mockResolvedValue({
+        messages: [storedMsg('e1', '更早 1'), storedMsg('e2', '更早 2')],
+        hasMore: true,
+      });
+
+      await useConversationStore.getState().loadEarlierHistory('conv-1');
+
+      const state = useConversationStore.getState();
+      expect(state.messages['conv-1'].map((m) => m.id)).toEqual(['e1', 'e2', 'anchor']);
+      expect(state.hasEarlierMessages['conv-1']).toBe(true);
+    });
+
+    it('后端说没有了才写 false', async () => {
+      seedArchivedConversation();
+      agentLoadEarlierMessages.mockResolvedValue({
+        messages: [storedMsg('e1', '最早一条')],
+        hasMore: false,
+      });
+
+      await useConversationStore.getState().loadEarlierHistory('conv-1');
+
+      expect(useConversationStore.getState().hasEarlierMessages['conv-1']).toBe(false);
+    });
+
+    it('在飞的同一会话翻页不重复发请求', async () => {
+      seedArchivedConversation();
+      let resolveFirst: ((value: unknown) => void) | undefined;
+      agentLoadEarlierMessages.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst ??= resolve;
+          }),
+      );
+
+      const first = useConversationStore.getState().loadEarlierHistory('conv-1');
+      const second = useConversationStore.getState().loadEarlierHistory('conv-1');
+      resolveFirst?.({ messages: [storedMsg('e1', '更早')], hasMore: true });
+      await Promise.all([first, second]);
+
+      expect(agentLoadEarlierMessages).toHaveBeenCalledTimes(1);
+      expect(agentLoadEarlierMessages).toHaveBeenCalledWith('conv-1', 'anchor', 50);
+    });
+
+    it('rollbackToMessage 逐页补齐深档消息后能撤回', async () => {
+      seedArchivedConversation();
+      // 两页归档，目标在第二页
+      agentLoadEarlierMessages
+        .mockResolvedValueOnce({
+          messages: [storedMsg('p1', '第一页')],
+          hasMore: true,
+        })
+        .mockResolvedValueOnce({
+          messages: [storedMsg('p2-target', '目标'), storedMsg('p2-b', '第二页后')],
+          hasMore: false,
+        });
+      agentTruncateConversation.mockResolvedValue({
+        deletedMessages: 2,
+        planAdjusted: false,
+        plan: null,
+        planTaskId: null,
+      });
+
+      const result = await useConversationStore
+        .getState()
+        .rollbackToMessage('conv-1', 'p2-target');
+
+      expect(agentLoadEarlierMessages).toHaveBeenCalledTimes(2);
+      expect(result.prompt).toBe('目标');
+      // 撤回后本地缓存截到目标之前（目标即最前一条 → 截成空）
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs.map((m) => m.id)).toEqual([]);
+    });
+
+    it('翻到底也找不到：报「消息不存在」', async () => {
+      seedArchivedConversation();
+      agentLoadEarlierMessages.mockResolvedValue({
+        messages: [storedMsg('e1', '更早')],
+        hasMore: false,
+      });
+
+      await expect(
+        useConversationStore.getState().rollbackToMessage('conv-1', 'ghost'),
+      ).rejects.toThrow('消息不存在');
     });
   });
 });
