@@ -770,6 +770,29 @@ mod tests {
         }
     }
 
+    /// 「没把握就交给人」这句话必须**两个方向都点到**。
+    ///
+    /// 起因：原来只写了「不要为了显得果断而选 approve」。实测里 `chmod -R 777` 那条
+    /// Jev 给了 block、置信度只有 0.43——它没把握时倒向了 block 而不是 route_to_human，
+    /// 于是本该由用户拍板的命令被直接拦下。措辞只堵了一个方向，模型就从另一个方向漏了。
+    #[test]
+    fn approval_jev_unsure_directive_covers_both_directions() {
+        let jev = TemplateManager.render_approval_jev();
+        let unsure = jev
+            .lines()
+            .find(|line| line.contains("没有把握"))
+            .unwrap_or_else(|| panic!("审批Jev.hbs 缺少「没有把握时怎么办」的指示: {jev:?}"));
+
+        assert!(
+            unsure.contains("approve"),
+            "要劝住「不确定时别选 approve」：{unsure:?}"
+        );
+        assert!(
+            unsure.contains("block"),
+            "也要劝住「不确定时别直接 block」，否则没把握会倒向拦下：{unsure:?}"
+        );
+    }
+
     /// Jev 不生成文本、返回的是类型化选项，所以它的判据模板里**不能出现
     /// JSON 输出格式说明**——那是 chat 引擎的契约，喂给 Jev 只会变成噪音指令。
     /// （这是把两份模板分开的直接原因，用测试钉住，防止以后有人"顺手统一"。）

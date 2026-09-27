@@ -411,9 +411,220 @@ fn truncate_body(body: &str) -> String {
     format!("{}…（已截断）", &body[..end])
 }
 
+/// 脚本化的假 Jev 端点，**只给测试用**。
+///
+/// 为什么值得手搓一个 HTTP 服务而不是继续加纯函数测试：本模块大部分代码
+/// （URL 拼接、鉴权头、状态码分类、`retry-after` 解析、预算递减、取消打断）
+/// 只在真的发过一次请求之后才会执行。纯函数测试触不到这些路径，于是
+/// 「401 会不会被误判成可重试」「预算到底用没用完」这类问题只能等上线才暴露，
+/// 而它暴露的代价是每条 bash 都被拦下。
+#[cfg(test)]
+pub(crate) mod mock_server {
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    use serde_json::Value;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// 一次脚本化应答。
+    #[derive(Clone)]
+    pub(crate) struct Reply {
+        status: u16,
+        retry_after: Option<String>,
+        body: String,
+    }
+
+    impl Reply {
+        /// 正常应答：JSON 原样回。
+        pub(crate) fn json(status: u16, body: Value) -> Self {
+            Self {
+                status,
+                retry_after: None,
+                body: body.to_string(),
+            }
+        }
+
+        /// 原始应答体（用来造非法 JSON 这类畸形响应）。
+        pub(crate) fn raw(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                retry_after: None,
+                body: body.to_string(),
+            }
+        }
+
+        pub(crate) fn with_retry_after(mut self, secs: &str) -> Self {
+            self.retry_after = Some(secs.to_string());
+            self
+        }
+    }
+
+    #[derive(Default)]
+    struct Received {
+        targets: Vec<String>,
+        auth: Vec<String>,
+        bodies: Vec<Value>,
+    }
+
+    /// 脚本化的 Jev 端点：`replies` 按收到的顺序逐条应答，用完后重复最后一条。
+    pub(crate) struct MockJev {
+        /// 可以直接喂给 `JevConfig::with_base_url`。
+        pub(crate) base_url: String,
+        received: Arc<Mutex<Received>>,
+    }
+
+    impl MockJev {
+        pub(crate) async fn start(replies: Vec<Reply>) -> Self {
+            assert!(!replies.is_empty(), "mock 至少要有一条应答");
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("mock 端点绑定 127.0.0.1 失败");
+            let addr = listener.local_addr().expect("读取 mock 端口失败");
+            let received = Arc::new(Mutex::new(Received::default()));
+            let sink = Arc::clone(&received);
+
+            tokio::spawn(async move {
+                let mut index = 0usize;
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok((head, body)) = read_request(&mut stream).await else {
+                        continue;
+                    };
+                    {
+                        let mut got = sink.lock().expect("mock 记录锁被毒化");
+                        got.targets.push(request_target(&head));
+                        got.auth
+                            .push(header_value(&head, "authorization").unwrap_or_default());
+                        if let Ok(value) = serde_json::from_str::<Value>(&body) {
+                            got.bodies.push(value);
+                        }
+                    }
+
+                    let reply = replies
+                        .get(index)
+                        .or_else(|| replies.last())
+                        .expect("脚本非空")
+                        .clone();
+                    index += 1;
+                    let _ = stream.write_all(render(&reply).as_bytes()).await;
+                    let _ = stream.flush().await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+
+            Self {
+                base_url: format!("http://{addr}"),
+                received,
+            }
+        }
+
+        /// 收到过几次请求——**重试预算要用它断言**，而不是「调用返回了没有」。
+        pub(crate) fn request_count(&self) -> usize {
+            self.lock().targets.len()
+        }
+
+        pub(crate) fn request_targets(&self) -> Vec<String> {
+            self.lock().targets.clone()
+        }
+
+        pub(crate) fn auth_headers(&self) -> Vec<String> {
+            self.lock().auth.clone()
+        }
+
+        pub(crate) fn request_bodies(&self) -> Vec<Value> {
+            self.lock().bodies.clone()
+        }
+
+        fn lock(&self) -> MutexGuard<'_, Received> {
+            self.received.lock().expect("mock 记录锁被毒化")
+        }
+    }
+
+    fn render(reply: &Reply) -> String {
+        let mut out = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            reply.status,
+            reason_phrase(reply.status),
+            // `String::len` 是字节数，正对 Content-Length
+            reply.body.len(),
+        );
+        if let Some(after) = &reply.retry_after {
+            out.push_str(&format!("Retry-After: {after}\r\n"));
+        }
+        out.push_str("\r\n");
+        out.push_str(&reply.body);
+        out
+    }
+
+    fn reason_phrase(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            422 => "Unprocessable Entity",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Status",
+        }
+    }
+
+    /// 读一个完整请求（含 `Content-Length` 指明的那段 body）。
+    async fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, String)> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(head_end) = find(&buf, b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                let body_start = head_end + 4;
+                let want = header_value(&head, "content-length")
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= body_start + want {
+                    let body =
+                        String::from_utf8_lossy(&buf[body_start..body_start + want]).into_owned();
+                    return Ok((head, body));
+                }
+            }
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                // 对端提前关了连接：把读到的原样交出去，别在这儿干等。
+                return Ok((String::from_utf8_lossy(&buf).into_owned(), String::new()));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// 请求行里的 path（`POST /v1/systemone HTTP/1.1` → `/v1/systemone`）。
+    fn request_target(head: &str) -> String {
+        head.lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn header_value(head: &str, name: &str) -> Option<String> {
+        head.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn resp(json: Value) -> JevResponse {
         serde_json::from_value(json).unwrap()
@@ -585,9 +796,8 @@ mod tests {
     #[test]
     fn empty_or_whitespace_base_url_keeps_official() {
         for raw in ["", "   ", "\t"] {
-            let cfg =
-                JevConfig::new("k".into(), JEV_DEFAULT_MODEL.into(), NetPolicy::default())
-                    .with_base_url(raw);
+            let cfg = JevConfig::new("k".into(), JEV_DEFAULT_MODEL.into(), NetPolicy::default())
+                .with_base_url(raw);
             assert_eq!(
                 cfg.endpoint_url(),
                 "https://api.typesafe.ai/v1/systemone",
@@ -695,5 +905,241 @@ mod tests {
         assert_eq!(mk(1), Duration::from_secs(20));
         assert_eq!(mk(90), Duration::from_secs(90));
         assert_eq!(mk(100_000), Duration::from_secs(250));
+    }
+
+    // ── 端到端：真发请求、真解析、真重试（本地 mock 端点，不需要 Key） ──────
+    //
+    // 这一组补的是「HTTP 路径从没真正执行过」这个缺口。上面那些纯函数测试证明的是
+    // 「函数算得对」，这里证明的是「这条路真的走得通」——两者缺一不可。
+
+    use super::mock_server::{MockJev, Reply};
+
+    fn ok_body(choice: &str) -> Value {
+        json!({
+            "model": JEV_DEFAULT_MODEL,
+            "answers": {
+                "decision": {"type": "choice", "choice": choice, "confidence": 0.9},
+                "deletes_data": {"type": "noul", "noul": 0.1},
+            },
+            "usage": {"input_tokens": 120, "output_tokens": 4},
+        })
+    }
+
+    fn requires_decision(resp: &JevResponse) -> Result<(), String> {
+        resp.choice("decision")
+            .map(|_| ())
+            .ok_or_else(|| "缺少 decision".to_string())
+    }
+
+    fn client_at(base_url: &str, net: NetPolicy) -> JevClient {
+        JevClient::new(
+            JevConfig::new("test-key".into(), JEV_DEFAULT_MODEL.into(), net)
+                .with_base_url(base_url),
+        )
+        .expect("客户端构造应成功")
+    }
+
+    /// 重试延迟置 0 的快速策略（测试不想真的等）——状态码配置与线上同源写法一致。
+    fn fast_net(max_retries: u32) -> NetPolicy {
+        NetPolicy {
+            max_retries,
+            retry_delay_secs: 0.0,
+            retry_http_statuses: "429, 500-599, 529".into(),
+            retry_on_timeout: false,
+            ..NetPolicy::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn request_goes_to_the_configured_endpoint_with_the_expected_shape() {
+        let mock = MockJev::start(vec![Reply::json(200, ok_body("approve"))]).await;
+        let client = client_at(&mock.base_url, fast_net(0));
+
+        let state = json!({"command": "ls", "conversation": []});
+        let questions = json!({"decision": {"type": "choice", "instructions": "判断这条命令"}});
+        let resp = client
+            .ask(&state, questions, &requires_decision, None)
+            .await
+            .expect("mock 回了正常响应，不该失败");
+
+        assert_eq!(resp.choice("decision"), Some(("approve", Some(0.9))));
+
+        // 路径来自 `endpoint_url()` 而不是写死的字符串
+        assert_eq!(mock.request_targets(), vec!["/v1/systemone".to_string()]);
+        // 鉴权头用的就是配置里的 key
+        assert_eq!(mock.auth_headers(), vec!["Bearer test-key".to_string()]);
+
+        // 请求体形状 = 官方契约：顶层只有 state / model / questions
+        let body = &mock.request_bodies()[0];
+        assert_eq!(body["state"]["command"], "ls");
+        assert_eq!(body["model"], JEV_DEFAULT_MODEL);
+        assert_eq!(body["questions"]["decision"]["type"], "choice");
+        assert!(
+            body.get("messages").is_none(),
+            "Jev 不是 chat 模型，请求体里不该出现 messages"
+        );
+        assert!(
+            body.get("stream").is_none(),
+            "Jev 非流式，请求体里不该出现 stream"
+        );
+    }
+
+    /// `retry-after` 必须真的被遵守。
+    ///
+    /// 手法：把固定延迟设成 30s、应答里给 1s。实现如果忽略了 `retry-after`，
+    /// 这个测试会真的等 30 秒——用耗时把它钉死（改坏了一定会红得很难看）。
+    #[tokio::test]
+    async fn retry_after_header_is_honoured_instead_of_the_fixed_delay() {
+        let mock = MockJev::start(vec![
+            Reply::json(429, json!({"detail": "slow down"})).with_retry_after("1"),
+            Reply::json(200, ok_body("approve")),
+        ])
+        .await;
+        let net = NetPolicy {
+            max_retries: 1,
+            retry_delay_secs: 30.0,
+            retry_http_statuses: "429, 500-599, 529".into(),
+            ..NetPolicy::default()
+        };
+        let client = client_at(&mock.base_url, net);
+
+        let started = Instant::now();
+        let resp = client
+            .ask(&json!({}), json!({}), &requires_decision, None)
+            .await
+            .expect("第二次应答是正常的，该成功");
+        let elapsed = started.elapsed();
+
+        assert_eq!(mock.request_count(), 2, "429 应触发一次重试");
+        assert_eq!(resp.choice("decision").unwrap().0, "approve");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "必须按 retry-after(1s) 等待而不是固定延迟(30s)，实际 {elapsed:?}"
+        );
+    }
+
+    /// 401 不可重试：一次就返回，后面的重试预算一点都不能动。
+    #[tokio::test]
+    async fn unauthorized_is_not_retried() {
+        let mock = MockJev::start(vec![
+            Reply::raw(401, r#"{"detail":{"message":"invalid api key"}}"#),
+            Reply::json(200, ok_body("approve")),
+        ])
+        .await;
+        let client = client_at(&mock.base_url, fast_net(3));
+
+        let err = client
+            .ask(&json!({}), json!({}), &requires_decision, None)
+            .await
+            .expect_err("401 必须失败");
+
+        assert!(
+            matches!(err, LlmError::HttpStatus { status: 401, .. }),
+            "实际 {err:?}"
+        );
+        assert_eq!(mock.request_count(), 1, "401 不该重试");
+    }
+
+    /// 5xx 可重试，且预算**恰好**是 `NetPolicy.max_retries + 1`，不多不少。
+    #[tokio::test]
+    async fn retryable_status_exhausts_exactly_the_net_policy_budget() {
+        let mock = MockJev::start(vec![Reply::json(503, json!({"detail": "overloaded"}))]).await;
+        let client = client_at(&mock.base_url, fast_net(2));
+
+        let err = client
+            .ask(&json!({}), json!({}), &requires_decision, None)
+            .await
+            .expect_err("一直 503 必须最终失败");
+
+        assert!(
+            matches!(err, LlmError::HttpStatus { status: 503, .. }),
+            "实际 {err:?}"
+        );
+        assert_eq!(mock.request_count(), 3, "max_retries=2 → 总共 3 次尝试");
+    }
+
+    /// HTTP 200 但响应不可用 = chat 路径的「模型哑火」：消费同一份重试预算，
+    /// 耗尽后 fail-closed 报错（而不是当成一次空判定放行）。
+    ///
+    /// 三种不可用形态都试一遍，因为它们在实现里走的是不同的判定分支。
+    #[tokio::test]
+    async fn unusable_200_response_consumes_the_same_budget() {
+        // ① 非法 JSON
+        let mock = MockJev::start(vec![Reply::raw(200, "这不是 JSON")]).await;
+        let client = client_at(&mock.base_url, fast_net(1));
+        let err = client
+            .ask(&json!({}), json!({}), &requires_decision, None)
+            .await
+            .expect_err("非法 JSON 必须最终失败");
+        assert!(matches!(err, LlmError::ParseError(_)), "实际 {err:?}");
+        assert_eq!(mock.request_count(), 2, "哑火要消耗重试预算");
+
+        // ② 合法 JSON 但 answers 为空
+        let mock = MockJev::start(vec![Reply::json(200, json!({"answers": {}}))]).await;
+        let client = client_at(&mock.base_url, fast_net(1));
+        let err = client
+            .ask(&json!({}), json!({}), &requires_decision, None)
+            .await
+            .expect_err("answers 为空必须最终失败");
+        assert!(matches!(err, LlmError::ParseError(_)), "实际 {err:?}");
+        assert_eq!(mock.request_count(), 2);
+
+        // ③ 合法 JSON、answers 非空，但校验器要的那个答案不在里面
+        let mock = MockJev::start(vec![Reply::json(
+            200,
+            json!({"answers": {"other": {"type": "noul", "noul": 0.4}}}),
+        )])
+        .await;
+        let client = client_at(&mock.base_url, fast_net(1));
+        let err = client
+            .ask(&json!({}), json!({}), &requires_decision, None)
+            .await
+            .expect_err("缺 decision 必须最终失败");
+        assert!(matches!(err, LlmError::ParseError(_)), "实际 {err:?}");
+        assert_eq!(mock.request_count(), 2);
+    }
+
+    /// 取消信号必须能立刻打断重试等待。
+    ///
+    /// 注意现状：`JevApprover` 目前传 `None`（与 chat 引擎一致——审批调用不响应
+    /// 停止），所以这条路径在生产上还没接上。它是 `ask` 的公开能力，一旦接上就
+    /// 必须是对的，所以在这里钉住；顺带也让「审批调用不响应停止」这个已知缺口
+    /// 在测试里留个明确的记号。
+    #[tokio::test]
+    async fn cancellation_interrupts_the_retry_wait() {
+        let mock = MockJev::start(vec![Reply::json(503, json!({"detail": "overloaded"}))]).await;
+        // 固定延迟 30s：取消若没生效，这个测试会一路等下去。
+        let net = NetPolicy {
+            max_retries: 5,
+            retry_delay_secs: 30.0,
+            retry_http_statuses: "429, 500-599, 529".into(),
+            ..NetPolicy::default()
+        };
+        let client = client_at(&mock.base_url, net);
+        let (tx, rx) = watch::channel(false);
+
+        let started = Instant::now();
+        let handle = tokio::spawn(async move {
+            let mut rx = rx;
+            let validate = requires_decision;
+            client
+                .ask(&json!({}), json!({}), &validate, Some(&mut rx))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(true).expect("取消信号应送达");
+
+        let err = handle
+            .await
+            .expect("任务不该 panic")
+            .expect_err("取消应返回错误");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(err, LlmError::Cancelled), "实际 {err:?}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "取消应立刻打断等待，实际 {elapsed:?}"
+        );
+        assert_eq!(mock.request_count(), 1, "取消后不该再发请求");
     }
 }
