@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useState } from 'react';
 import { useSettingsStore } from '@/stores/settingsStore';
 import MobileTabBar from './MobileTabBar';
 import MobileTerminalHost from './MobileTerminalHost';
@@ -102,7 +102,14 @@ export default function MobileApp() {
 
   // Android back gesture returns to the home tab before the system gets a
   // chance to finish the activity (sheets/overlays register on top of this).
-  useEffect(() => {
+  //
+  // 必须用 useLayoutEffect：backHandler 是 LIFO 栈，而同一个 commit 里
+  // **子组件的 useEffect 先于父组件的 useEffect** 执行。若这里也用 useEffect，
+  // 切回文件页的那一次提交会把本层的「切回终端页」压在该页的「回上一级」之上，
+  // 于是第一次返回跳去终端页（要再切一次才恢复正常）；文件页的 handler 反而
+  // 在文件页内导航一次后才排到上面。layout 阶段先于整棵树的 passive 阶段提交，
+  // 这样本层（兜底）永远在新出现的页面级 handler 之下。
+  useLayoutEffect(() => {
     if (activeTab === DEFAULT_MOBILE_TAB) return;
     return registerBackHandler(() => setActiveTab(DEFAULT_MOBILE_TAB));
   }, [activeTab]);
