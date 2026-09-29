@@ -230,7 +230,11 @@ async fn sftp_remove_recursive(
                 continue;
             }
             let child = format!("{}/{}", path.trim_end_matches('/'), name);
-            let child_is_dir = entry.metadata().is_dir();
+            let child_meta = entry.metadata();
+            // 目录项自身是符号链接时按文件删（删链接本身），绝不进链接目标递归：
+            // 服务端若在 READDIR 里回跟随后的属性，is_dir() 会为 true，跟着删就会
+            // 把链接目标目录里的内容一并删掉。
+            let child_is_dir = child_meta.is_dir() && !child_meta.is_symlink();
             Box::pin(sftp_remove_recursive(sftp, &child, child_is_dir)).await?;
         }
         sftp.remove_dir(path)
@@ -253,6 +257,16 @@ pub async fn sftp_remove(
 ) -> Result<(), AppError> {
     let path = validate_sftp_remote_path(&path)?;
     let sftp = state.ssh_manager.open_sftp(&session_id).await?;
+    // 顶层 is_dir 来自前端双击/多选，不受本后端控制：符号链接目录必须先降级成
+    // 「删链接本身」，否则递归会走进链接目标。用 LSTAT 判链接（STAT 会跟随）。
+    let is_dir = if is_dir {
+        match sftp.symlink_metadata(&path).await {
+            Ok(meta) if meta.is_symlink() => false,
+            _ => true,
+        }
+    } else {
+        false
+    };
     sftp_remove_recursive(&sftp, &path, is_dir).await
 }
 
@@ -269,11 +283,21 @@ pub async fn sftp_remove_via_shell(
         return Err(AppError::Ssh("快速删除仅支持目录".into()));
     }
     let command = format!("rm -rf -- {}", shell_escape(&path));
-    state
-        .command_exec
-        .exec_simple(&app, &session_id, &command, CommandSource::SystemTask)
-        .await?;
-    Ok(())
+    // 「快速删除」是长周期系统任务（几十万个小文件远超默认 120s，`ticket.rs`
+    // 明确点名它必须覆写默认超时），否则 UI 会在删除中途误报超时。
+    // 超时只关闭本机 exec 通道、不会杀远端 `rm`，所以文案必须说明服务器
+    // 可能仍在继续删除，别让用户以为失败就等于没删。
+    let ticket = CommandTicket::new(&session_id, &command, CommandSource::SystemTask)
+        .timeout(REMOTE_TASK_TIMEOUT);
+    match state.command_exec.submit(&app, ticket).await {
+        SubmitOutcome::Completed { .. } => Ok(()),
+        SubmitOutcome::TimedOut { .. } => Err(AppError::Ssh(format!(
+            "快速删除等待超时（{} 分钟）：本机已停止等待，远端删除可能仍在继续，请稍后刷新确认",
+            REMOTE_TASK_TIMEOUT.as_secs() / 60
+        ))),
+        SubmitOutcome::Cancelled { .. } => Err(AppError::Ssh("快速删除已取消（会话断开）".into())),
+        SubmitOutcome::Failed { error } => Err(error),
+    }
 }
 
 #[tauri::command]
@@ -1628,7 +1652,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{find_name_collisions, folder_upload_percent};
+    use super::{
+        cleanup_stale_download_temp_files, encode_file_content, error_text,
+        extract_failure_message, find_name_collisions, folder_upload_percent, has_utf8_bom,
+        is_system_path, progress_due, sanitize_sysopen_component, AppError, Duration, Path,
+        PROGRESS_MIN_BYTES, PROGRESS_MIN_INTERVAL,
+    };
 
     #[test]
     fn maps_folder_upload_phases_to_overall_percent() {
@@ -1680,6 +1709,129 @@ mod tests {
         assert!(find_name_collisions(&[], &[]).is_empty());
         assert!(find_name_collisions(&["a.txt".to_string()], &[]).is_empty());
         assert!(find_name_collisions(&[], &["a.txt".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn throttles_progress_until_interval_or_bytes_are_reached() {
+        // 未满 100ms 且新增不足 1MB：不推
+        assert!(!progress_due(
+            Duration::from_millis(99),
+            0,
+            PROGRESS_MIN_BYTES - 1
+        ));
+        // 新增满 1MB：推（哪怕只有 1ms）
+        assert!(progress_due(
+            Duration::from_millis(1),
+            0,
+            PROGRESS_MIN_BYTES
+        ));
+        // 距上次满 100ms：推（哪怕只新增 1 字节）
+        assert!(progress_due(PROGRESS_MIN_INTERVAL, 1024, 1025));
+        // 第二次起 written 单调递增，saturating_sub 不会溢出
+        assert!(!progress_due(
+            Duration::from_millis(0),
+            PROGRESS_MIN_BYTES,
+            PROGRESS_MIN_BYTES - 1
+        ));
+    }
+
+    #[test]
+    fn system_path_blacklist_blocks_home_roots_but_not_their_children() {
+        // 新增的精确匹配：根本身禁止整体打包
+        for path in ["/home", "/home/", "/root", "/srv", "/mnt", "/media"] {
+            assert!(is_system_path(path), "应拦截: {}", path);
+        }
+        // 子目录是用户日常压缩对象，必须放行
+        for path in [
+            "/home/user/docs",
+            "/root/backup",
+            "/srv/app/data",
+            "/mnt/disk1/photos",
+        ] {
+            assert!(!is_system_path(path), "应放行: {}", path);
+        }
+        // 原有前缀匹配保持
+        assert!(is_system_path("/etc"));
+        assert!(is_system_path("/etc/nginx"));
+        assert!(is_system_path("/opt/app"));
+        assert!(is_system_path("/"));
+        assert!(is_system_path("///"));
+    }
+
+    #[test]
+    fn extract_conflict_marker_becomes_readable_sentence() {
+        let message = extract_failure_message("CONFLICT: foo.txt\n");
+        assert_eq!(
+            message,
+            "目标目录已存在同名条目「foo.txt」，已取消解压以免覆盖"
+        );
+        // 前缀由前端统一加：后端文案里不许再出现「解压失败」
+        assert!(!message.contains("解压失败"));
+        // 其他失败原样透传（保留远端诊断），空输出给兜底
+        assert_eq!(extract_failure_message("booom\n"), "booom");
+        assert_eq!(extract_failure_message("  \n"), "解压命令未返回预期结果");
+    }
+
+    #[test]
+    fn bom_is_preserved_through_encode_and_detect() {
+        let with_bom = encode_file_content("你好", true);
+        assert!(has_utf8_bom(&with_bom));
+        assert_eq!(with_bom.len(), 3 + "你好".len());
+        let without_bom = encode_file_content("你好", false);
+        assert!(!has_utf8_bom(&without_bom));
+        assert_eq!(without_bom, "你好".as_bytes());
+    }
+
+    #[test]
+    fn drag_upload_error_text_drops_enum_prefix() {
+        assert_eq!(
+            error_text(&AppError::Ssh("文件不存在".into())),
+            "文件不存在"
+        );
+        assert_eq!(
+            error_text(&AppError::Sftp {
+                message: "权限不足".into(),
+                code: 3
+            }),
+            "权限不足"
+        );
+    }
+
+    #[test]
+    fn preview_basename_is_sanitized_for_windows_hosts() {
+        // Linux 合法的 `s:1.png` 直接 join 到 Windows 临时目录会派生数据流/越界
+        assert_eq!(sanitize_sysopen_component("s:1.png", "preview"), "s_1.png");
+        assert_eq!(
+            sanitize_sysopen_component("a|b?c*.png", "preview"),
+            "a_b_c_.png"
+        );
+        assert_eq!(sanitize_sysopen_component("..", "preview"), "preview");
+    }
+
+    #[tokio::test]
+    async fn clears_only_stale_download_temp_files_of_same_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("data.bin");
+        std::fs::write(&target, b"keep").unwrap();
+        let stale_part = format!("{}.marcel-download-old-id.part", target.display());
+        let stale_backup = format!("{}.marcel-download-old-id.backup", target.display());
+        let other = dir.path().join("other.bin.marcel-download-old-id.part");
+        std::fs::write(&stale_part, b"half").unwrap();
+        std::fs::write(&stale_backup, b"old").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+
+        cleanup_stale_download_temp_files(&target.to_string_lossy(), "new-id").await;
+
+        assert!(
+            !Path::new(&stale_part).exists(),
+            "同目标 .part 残留应被清理"
+        );
+        assert!(
+            !Path::new(&stale_backup).exists(),
+            "同目标 .backup 残留应被清理"
+        );
+        assert!(other.exists(), "别的目标的残留不属于本次清理范围");
+        assert!(target.exists(), "目标文件本身绝不能动");
     }
 }
 
@@ -2248,7 +2400,11 @@ pub async fn sftp_preview_image(
     std::fs::create_dir_all(&temp_dir)
         .map_err(|e| AppError::Ssh(format!("创建预览临时目录失败: {}", e)))?;
 
-    let local_path = temp_dir.join(&remote_basename);
+    // 远端 basename 不能直接 join 本地临时目录：Linux 合法的 `s:1.png`、`a|b.png`
+    // 在 Windows 上是非法/会被解释成 NTFS 数据流的名字，可能把文件落到目录之外。
+    // 复用 sysopen 的同一套 sanitize（保留扩展名，便于 WebView 判断类型）。
+    let safe_basename = sanitize_sysopen_component(&remote_basename, "preview");
+    let local_path = temp_dir.join(&safe_basename);
     let temp_part_path = format!("{}.part", local_path.to_string_lossy());
 
     // 流式下载到 .part 文件，完成后 rename
