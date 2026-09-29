@@ -6,6 +6,7 @@
 //! |---|---|---|---|
 //! | 角色 | `templates/agent/角色.hbs` | 无条件 | system prompt |
 //! | 子 agent 角色约束 | `templates/agent/子agent_只读.hbs`、`子agent_执行.hbs` | 仅子 agent | system prompt（经 `prompt_extra`） |
+//! | 本机子 agent 环境 | `templates/agent/本机子agent.hbs` | 仅本机子 agent（`AgentRole::LocalSub`） | system prompt（经 `prompt_extra`） |
 //! | 多机操控 | `templates/agent/多机.hbs`（`render_multi_host`） | 主 agent 且有多机上下文 | system prompt |
 //! | 先理清需求 / 沟通 / 上下文管理 / 收尾 | `templates/agent/沟通.hbs` | **仅主 agent**（`audience`） | system prompt |
 //! | 联网搜索 | `templates/agent/联网搜索.hbs` | 注册了声明 `WebSearch` 段的工具（当前是 `web_search`） | system prompt |
@@ -22,7 +23,7 @@
 //! | 审批（Plan 追加） | `templates/approval/审批规划.hbs` | 同上 + Plan 模式 | 审批专用 LLM 调用（**两个引擎共用**） |
 //! | 命令审批（Jev） | `templates/approval/审批Jev.hbs` | 启用模型审批 + 引擎选 Jev + 用户未自定义 | Jev 的 `instructions`（不走 chat） |
 //!
-//! 前 12 段由 `render_agent_prompt` 组装；其余各自在调用点用 `render_fragment`
+//! 前 13 段由 `render_agent_prompt` 组装；其余各自在调用点用 `render_fragment`
 //! 渲染（它们不是同一个 LLM 调用，或不属于 system prompt）。
 //!
 //! 不在此表的模型可见文本，各有其归属，别往这里搬：
@@ -50,6 +51,10 @@
 //!   新增工具不声明 `side` 编译不过，声明了但描述没写测试会红）
 //! - 子 agent 行为约束 → `templates/agent/子agent_只读.hbs` / `子agent_执行.hbs`
 //!   （桌面/移动的工具清单差异走 `can_transfer` 分支，不要再写 cfg 副本）
+//! - 本机子 agent 的环境交代（目标机器 / PowerShell 5.1 的 shell 事实 / 残余进程
+//!   的本机收尾手段）→ `templates/agent/本机子agent.hbs`（与子 agent 约束段同路：
+//!   经 `prompt_extra` 注入；两条一起送到本机子 agent，见
+//!   `tools/local_subagent.rs`）
 //! - 多机操控与 host 规则 → `templates/agent/多机.hbs`（工具侧只复用
 //!   `tools::HOST_MATCH_RULE` 短句）
 //! - 上下文压缩的质量 → `templates/context/压缩指令.hbs`（八段标题与
@@ -134,6 +139,12 @@ impl TemplateManager {
         let _ = reg.register_template_string(
             "子agent_执行",
             include_str!("../../templates/agent/子agent_执行.hbs"),
+        );
+        // 本机子 agent 的环境交代（目标机器 / shell 事实 / 残余进程收尾），与子
+        // agent 约束段同路：`AgentSpec.prompt_extra` 注入，不走工具提示词段。
+        let _ = reg.register_template_string(
+            "本机子agent",
+            include_str!("../../templates/agent/本机子agent.hbs"),
         );
         let _ = reg.register_template_string(
             "压缩指令",
@@ -597,6 +608,35 @@ mod tests {
         assert!(mobile.contains("bash / web_search"));
         assert!(mobile.contains("不要调用 upload_file / download_file"));
         assert!(!mobile.contains("upload_file / download_file / web_search"));
+    }
+
+    /// 本机子 agent 的环境段：它必须交代「跑在哪台机器」「Windows 的 shell 事实」
+    /// 与「残余进程怎么收尾」。
+    ///
+    /// 三条各挡一种具体的退化：不说机器 → 模型把「服务器」的措辞当真、去调不存在的
+    /// 远端工具；不说 PowerShell 5.1 没有 `&&`/`||` → 命令按 bash 习惯写、整段失败；
+    /// 不说收尾手段与「不许说已终止进程」→ 模型照抄运维套话，用户以为进程真停了
+    /// （`local_bash` 中断/超时只停止等待，见 `command_exec::local_transport`）。
+    #[test]
+    fn local_subagent_fragment_states_machine_shell_and_cleanup() {
+        let text = TemplateManager.render_fragment("本机子agent", &json!({}));
+        assert!(
+            text.contains("这台电脑") && text.contains("PowerShell"),
+            "本机子 agent 段必须交代目标机器与 Windows 的 shell：{text}"
+        );
+        assert!(text.contains("&&"), "必须点名 && / || 在 5.1 不可用");
+        assert!(
+            text.contains("Get-Process") && text.contains("Stop-Process"),
+            "必须给出残余进程的本机收尾手段：{text}"
+        );
+        assert!(
+            text.contains("已终止进程"),
+            "必须把「不许说已终止进程」的口径写出来（否则模型会照抄运维套话）"
+        );
+        assert!(
+            text.contains("local_"),
+            "必须说明它的工具是本机族（远端同名工具在它这里不存在）"
+        );
     }
 
     #[test]

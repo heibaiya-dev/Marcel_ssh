@@ -1,6 +1,9 @@
 //! File-system tools (read / write / edit / list).
 //!
-//! Uses the SFTP subsystem protocol for binary-safe file operations.
+//! 分页 / 字节预算 / 匹配替换 / 展示元数据等**纯逻辑**与「文件从哪来」无关；
+//! 真正的 IO 只有三件事（整读 / 整写 / 列目录），全部收在 [`FileBackend`] 后面。
+//! 当前实现是 [`SftpBackend`]（经 SSH 会话的 SFTP 子系统，binary-safe）；
+//! 本机文件工具实现同一个 trait 即可复用这里的全部纯逻辑。
 
 use async_trait::async_trait;
 use russh_sftp::protocol::OpenFlags;
@@ -11,46 +14,54 @@ use crate::agent::risk::Disposition;
 use crate::agent::tools::{truncate_output, AgentTool, ToolContext, ToolOutput};
 use crate::error::AppError;
 
-const MAX_READ_BYTES: usize = 16_000;
-const MAX_LIST_BYTES: usize = 8_000;
-const MAX_FILE_WRITE_BYTES: usize = 1_000_000;
-const DEFAULT_READ_MAX_LINES: usize = 200;
-const MAX_READ_MAX_LINES: usize = 2_000;
-const DEFAULT_LIST_LIMIT: usize = 200;
-const MAX_LIST_LIMIT: usize = 2_000;
+pub(crate) const MAX_READ_BYTES: usize = 16_000;
+pub(crate) const MAX_LIST_BYTES: usize = 8_000;
+pub(crate) const MAX_FILE_WRITE_BYTES: usize = 1_000_000;
+/// 单次整读的文件上限（`read_file` / `edit_file` / 审批预览共用）。
+///
+/// 依据：`SftpSession::read` 在 russh-sftp 2.3.0 里就是 `open` + `read_to_end`
+/// （src/client/session.rs），整个文件一次性进内存；人类编辑器路径
+/// （`commands::sftp::sftp_read_file`）的 `MAX_EDITOR_FILE_SIZE` 同样是 2 MiB，
+/// 这里取同值，免得同一个文件在两套路径上得到互相矛盾的结论。
+/// 超限**不截断**而是直接失败并指路 bash —— 静默截断会让模型以为读全了。
+pub(crate) const MAX_READ_FILE_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const DEFAULT_READ_MAX_LINES: usize = 200;
+pub(crate) const MAX_READ_MAX_LINES: usize = 2_000;
+pub(crate) const DEFAULT_LIST_LIMIT: usize = 200;
+pub(crate) const MAX_LIST_LIMIT: usize = 2_000;
 
-struct ReadView {
-    body: String,
-    total_lines: usize,
-    start_line: usize,
-    end_line: usize,
-    returned_lines: usize,
-    next_line: Option<usize>,
-    truncated: bool,
-    lossy_utf8: bool,
+pub(crate) struct ReadView {
+    pub(crate) body: String,
+    pub(crate) total_lines: usize,
+    pub(crate) start_line: usize,
+    pub(crate) end_line: usize,
+    pub(crate) returned_lines: usize,
+    pub(crate) next_line: Option<usize>,
+    pub(crate) truncated: bool,
+    pub(crate) lossy_utf8: bool,
 }
 
 #[derive(Clone)]
-struct DirectoryEntryView {
-    name: String,
-    kind: String,
-    size: u64,
-    permissions: u32,
-    permissions_text: String,
+pub(crate) struct DirectoryEntryView {
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) size: u64,
+    pub(crate) permissions: u32,
+    pub(crate) permissions_text: String,
 }
 
-struct DirectoryView {
-    body: String,
-    total_entries: usize,
-    returned_entries: usize,
-    offset: usize,
-    limit: usize,
-    next_offset: Option<usize>,
-    entries: Vec<DirectoryEntryView>,
+pub(crate) struct DirectoryView {
+    pub(crate) body: String,
+    pub(crate) total_entries: usize,
+    pub(crate) returned_entries: usize,
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+    pub(crate) next_offset: Option<usize>,
+    pub(crate) entries: Vec<DirectoryEntryView>,
 }
 
 #[derive(Clone, Copy)]
-enum DirectorySortBy {
+pub(crate) enum DirectorySortBy {
     Name,
     Size,
     Type,
@@ -58,56 +69,212 @@ enum DirectorySortBy {
 
 // ───────────────────── Shared SFTP helpers ─────────────────────
 
-async fn sftp_read(
-    ssh: &crate::ssh::connection::SshManager,
-    session_id: &str,
-    path: &str,
-) -> Result<Vec<u8>, String> {
-    let sftp = ssh
-        .open_sftp(session_id)
-        .await
-        .map_err(|e| format!("SFTP unavailable: {}", e))?;
-    sftp.read(path)
-        .await
-        .map_err(|e| format!("SFTP read failed: {}", e))
+fn format_size_mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
 }
 
-async fn sftp_write(
-    ssh: &crate::ssh::connection::SshManager,
-    session_id: &str,
-    path: &str,
-    bytes: &[u8],
-) -> Result<(), String> {
-    let sftp = ssh
-        .open_sftp(session_id)
-        .await
-        .map_err(|e| format!("SFTP unavailable: {}", e))?;
-    let mut file = sftp
-        .open_with_flags(
+/// 超限则返回给模型的失败文案（`None` = 可以整读）。
+pub(crate) fn read_size_limit_error(path: &str, size: u64) -> Option<String> {
+    (size > MAX_READ_FILE_BYTES).then(|| {
+        format!(
+            "{}: file is {} (limit {}); refusing to load the whole file into memory. \
+             Read it in parts with bash instead — e.g. `head -n 200 {}`, \
+             `sed -n '1000,1200p' {}`, or `grep -n` to locate the section you need.",
             path,
-            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+            format_size_mb(size),
+            format_size_mb(MAX_READ_FILE_BYTES),
+            path,
+            path
         )
-        .await
-        .map_err(|e| format!("open failed: {}", e))?;
-    file.write_all(bytes)
-        .await
-        .map_err(|e| format!("write failed: {}", e))?;
-    file.flush()
-        .await
-        .map_err(|e| format!("flush failed: {}", e))?;
-    Ok(())
+    })
+}
+
+/// sidecar 临时路径要求路径里必须有 `/`；裸相对文件名（`notes.txt`）补成 `./notes.txt`。
+/// 两者对 SFTP 服务端解析到同一位置，只是为了能算出同目录的临时文件名。
+pub(crate) fn with_dot_slash(path: &str) -> String {
+    if path.contains('/') {
+        path.to_string()
+    } else {
+        format!("./{}", path)
+    }
+}
+
+// ───────────────────── File access backend ─────────────────────
+
+/// 目录条目的原始类型（`DirectoryEntryView::kind` 由它派生）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EntryKind {
+    Dir,
+    File,
+    Symlink,
+}
+
+impl EntryKind {
+    /// 与列表渲染 / 条目元数据一致的 kind 字符串。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            EntryKind::Dir => "directory",
+            EntryKind::File => "file",
+            EntryKind::Symlink => "symlink",
+        }
+    }
+}
+
+/// 后端返回的原始目录条目（名字 / 类型 / 大小 / mode），不含任何展示加工。
+#[derive(Clone, Debug)]
+pub(crate) struct RawEntry {
+    pub(crate) name: String,
+    pub(crate) kind: EntryKind,
+    pub(crate) size: u64,
+    /// 原始 mode（后端给不出权限时为 `0`）。
+    pub(crate) mode: u32,
+}
+
+/// 文件访问后端：远端 SFTP 与本机文件系统共用的最小接口。
+///
+/// 只有这三个方法——分页 / 字节预算 / 匹配替换 / 展示元数据全在后端之上的
+/// 纯逻辑里，后端之间不得有行为分歧（错误文案即面向模型的输出）。
+#[async_trait]
+pub(crate) trait FileBackend: Send + Sync {
+    /// 读整个文件（含大小预检与错误文案）。
+    async fn read(&self, path: &str) -> Result<Vec<u8>, String>;
+    /// 原子写整个文件（临时文件 + rename；目标已存在时按后端语义处理）。
+    async fn write(&self, path: &str, bytes: &[u8]) -> Result<(), String>;
+    /// 列目录（返回原始条目：名字 / 类型 Dir|File|Symlink / 大小 / mode）。
+    async fn list(&self, path: &str) -> Result<Vec<RawEntry>, String>;
+}
+
+/// 远端后端：经 SSH 会话的 SFTP 子系统读写。
+pub(crate) struct SftpBackend<'a> {
+    ssh: &'a crate::ssh::connection::SshManager,
+    session_id: &'a str,
+}
+
+impl<'a> SftpBackend<'a> {
+    pub(crate) fn new(ssh: &'a crate::ssh::connection::SshManager, session_id: &'a str) -> Self {
+        Self { ssh, session_id }
+    }
+}
+
+#[async_trait]
+impl FileBackend for SftpBackend<'_> {
+    /// 读取远端文件全文。
+    ///
+    /// 读之前先用 `metadata` 预检大小：`SftpSession::read` 是 `open` + `read_to_end`，
+    /// 整个文件进内存，移动端拿到超大文件会被 LMK 杀掉。
+    async fn read(&self, path: &str) -> Result<Vec<u8>, String> {
+        let sftp = self
+            .ssh
+            .open_sftp(self.session_id)
+            .await
+            .map_err(|e| format!("SFTP unavailable: {}", e))?;
+        let metadata = sftp
+            .metadata(path)
+            .await
+            .map_err(|e| format!("SFTP stat failed: {}", e))?;
+        if let Some(err) = read_size_limit_error(path, metadata.len()) {
+            return Err(err);
+        }
+        let data = sftp
+            .read(path)
+            .await
+            .map_err(|e| format!("SFTP read failed: {}", e))?;
+        // 兜底：stat 与 read 之间文件可能被追加，服务端报的大小也可能失真
+        if let Some(err) = read_size_limit_error(path, data.len() as u64) {
+            return Err(err);
+        }
+        Ok(data)
+    }
+
+    /// 写入远端文件：先写同目录 sidecar，再原子提交（rename）到目标。
+    ///
+    /// 之前这里是 `CREATE | TRUNCATE | WRITE` 直开目标文件：写出错 / 超时 / 任务被取消时
+    /// 远端原文件已被截断成半成品，无法恢复。人类编辑器
+    /// （`commands::sftp::sftp_write_file`）与上传走的都是 sidecar + rename，
+    /// 这里复用同一对共享实现（`remote_sidecar_path` / `commit_remote_temp_file`）。
+    /// 取舍：目标若是符号链接，会被整体替换成普通文件（与人类编辑器路径行为一致）。
+    async fn write(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let sftp = self
+            .ssh
+            .open_sftp(self.session_id)
+            .await
+            .map_err(|e| format!("SFTP unavailable: {}", e))?;
+        let target = with_dot_slash(path);
+        let temp_path = crate::commands::sftp::remote_sidecar_path(&target, "edit")
+            .map_err(|e| format!("temp path failed: {}", e))?;
+        let mut file = sftp
+            .open_with_flags(
+                &temp_path,
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+            )
+            .await
+            .map_err(|e| format!("open failed: {}", e))?;
+        if let Err(e) = file.write_all(bytes).await {
+            drop(file);
+            let _ = sftp.remove_file(&temp_path).await;
+            return Err(format!("write failed: {}", e));
+        }
+        if let Err(e) = file.flush().await {
+            drop(file);
+            let _ = sftp.remove_file(&temp_path).await;
+            return Err(format!("flush failed: {}", e));
+        }
+        drop(file);
+        if let Err(e) =
+            crate::commands::sftp::commit_remote_temp_file(&sftp, &temp_path, &target, true).await
+        {
+            // commit 内部多数分支已清理临时文件，这里兜底（含 rename 失败那条）
+            let _ = sftp.remove_file(&temp_path).await;
+            return Err(format!("commit failed: {}", e));
+        }
+        Ok(())
+    }
+
+    async fn list(&self, path: &str) -> Result<Vec<RawEntry>, String> {
+        let sftp = self
+            .ssh
+            .open_sftp(self.session_id)
+            .await
+            .map_err(|e| format!("SFTP unavailable: {}", e))?;
+        let mut dir = sftp
+            .read_dir(path)
+            .await
+            .map_err(|e| format!("SFTP list failed: {}", e))?;
+
+        let mut entries = Vec::new();
+        while let Some(entry) = dir.next() {
+            let metadata = entry.metadata();
+            let name = entry.file_name();
+            let size = metadata.len();
+            let mode = metadata.permissions.unwrap_or(0);
+            let kind = if metadata.is_dir() {
+                EntryKind::Dir
+            } else if metadata.is_symlink() {
+                EntryKind::Symlink
+            } else {
+                EntryKind::File
+            };
+            entries.push(RawEntry {
+                name,
+                kind,
+                size,
+                mode,
+            });
+        }
+        Ok(entries)
+    }
 }
 
 // ────────────────────────────── Parse helpers ──────────────────────────────
 
-struct EditParams {
-    path: String,
-    old_content: String,
-    new_content: String,
-    replace_all: bool,
+pub(crate) struct EditParams {
+    pub(crate) path: String,
+    pub(crate) old_content: String,
+    pub(crate) new_content: String,
+    pub(crate) replace_all: bool,
 }
 
-fn parse_edit_params(params: &serde_json::Value) -> Result<EditParams, String> {
+pub(crate) fn parse_edit_params(params: &serde_json::Value) -> Result<EditParams, String> {
     let path = params
         .get("path")
         .and_then(|v| v.as_str())
@@ -139,8 +306,8 @@ fn parse_edit_params(params: &serde_json::Value) -> Result<EditParams, String> {
     })
 }
 
-const EDIT_DISPLAY_MAX_BYTES: usize = 16_000;
-const EDIT_DISPLAY_CONTEXT_LINES: usize = 30;
+pub(crate) const EDIT_DISPLAY_MAX_BYTES: usize = 16_000;
+pub(crate) const EDIT_DISPLAY_CONTEXT_LINES: usize = 30;
 
 fn line_number_at_byte(content: &str, byte_pos: usize) -> usize {
     let pos = byte_pos.min(content.len());
@@ -208,15 +375,81 @@ fn extract_display_content(
     lines[start..end].join("\n")
 }
 
-fn try_replace(
+/// 匹配失败时的统一文案。行尾差异已自动处理，剩下的只可能是内容本身不一致，
+/// 所以强调「逐字符一致（含缩进）」，不再让模型只是"重读一遍"却毫无线索。
+pub(crate) const EDIT_NOT_FOUND: &str =
+    "old_content not found in file. Read the file again to refresh, then copy the exact \
+     characters (indentation included; LF/CRLF differences are handled automatically).";
+
+/// 命中处文件实际使用的行尾（只区分 LF / CRLF，孤立的 `\r` 不参与转换）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    /// 把文本换行统一成该风格（先归一成 LF 再展开，幂等）。
+    fn normalize(self, text: &str) -> String {
+        let lf = text.replace("\r\n", "\n");
+        match self {
+            LineEnding::Lf => lf,
+            LineEnding::Crlf => lf.replace('\n', "\r\n"),
+        }
+    }
+}
+
+/// 实际落地的替换对：`old` 是命中的那份，`new` 与它行尾一致。
+pub(crate) struct ResolvedEditText {
+    pub(crate) old: String,
+    pub(crate) new: String,
+    /// 是否靠行尾互换才命中（模型给的行尾与文件不一致）。
+    pub(crate) line_ending_converted: bool,
+}
+
+/// 解析真正用于匹配/替换的 (old, new)：先按模型给的原样精确匹配，失败再试行尾互换。
+///
+/// 必须补这一步的原因：读取视图用 `str::lines()` 分行，CRLF 的 `\r` 在给模型看之前
+/// 就被吃掉了，模型照抄读到的 `old_content` 只有 LF，对 CRLF 文件**永远**匹配不上，
+/// 报错还让它 "Read the file again" —— 重读依旧是 LF，死循环。
+///
+/// 命中转换后的候选时 `new_content` 一并转换，免得写回去的文件一半 CRLF 一半 LF。
+/// 取舍：宁可跟随文件既有行尾，也不保留模型在归一化视图里写出的行尾；只有原样
+/// 匹配失败（即文件里根本不存在模型给的那串字节）才会走到这里。
+pub(crate) fn resolve_edit_text(
     current: &str,
     old_content: &str,
     new_content: &str,
+) -> Option<ResolvedEditText> {
+    if current.contains(old_content) {
+        return Some(ResolvedEditText {
+            old: old_content.to_string(),
+            new: new_content.to_string(),
+            line_ending_converted: false,
+        });
+    }
+    for eol in [LineEnding::Crlf, LineEnding::Lf] {
+        let candidate = eol.normalize(old_content);
+        if candidate != old_content && current.contains(&candidate) {
+            return Some(ResolvedEditText {
+                old: candidate,
+                new: eol.normalize(new_content),
+                line_ending_converted: true,
+            });
+        }
+    }
+    None
+}
+
+/// 在已解析好 (old, new) 的前提下执行替换（计数语义与非重叠左到右切分一致）。
+pub(crate) fn apply_edit(
+    current: &str,
+    resolved: &ResolvedEditText,
     replace_all: bool,
 ) -> Result<(String, usize), String> {
-    let occurrences = current.matches(old_content).count();
+    let occurrences = current.matches(resolved.old.as_str()).count();
     if occurrences == 0 {
-        return Err("old_content not found in file. Read the file again to refresh.".into());
+        return Err(EDIT_NOT_FOUND.into());
     }
     if occurrences > 1 && !replace_all {
         return Err(format!(
@@ -225,9 +458,9 @@ fn try_replace(
         ));
     }
     let updated = if replace_all {
-        current.replace(old_content, new_content)
+        current.replace(resolved.old.as_str(), resolved.new.as_str())
     } else {
-        current.replacen(old_content, new_content, 1)
+        current.replacen(resolved.old.as_str(), resolved.new.as_str(), 1)
     };
     if updated.len() > MAX_FILE_WRITE_BYTES {
         return Err(format!(
@@ -239,13 +472,31 @@ fn try_replace(
     Ok((updated, occurrences))
 }
 
+/// `resolve_edit_text` + `apply_edit` 的组合体，供单测直接驱动整条匹配逻辑。
+/// 生产路径要保留命中的文本对去渲染 diff 元数据，所以分两步调用，不走这里。
+#[cfg(test)]
+fn try_replace(
+    current: &str,
+    old_content: &str,
+    new_content: &str,
+    replace_all: bool,
+) -> Result<(String, usize), String> {
+    let resolved = resolve_edit_text(current, old_content, new_content)
+        .ok_or_else(|| EDIT_NOT_FOUND.to_string())?;
+    apply_edit(current, &resolved, replace_all)
+}
+
 /// Summary + message for failed edit (same strings as `EditFileTool::execute`).
-pub(crate) struct EditPreviewError {
+///
+/// `pub` 而不是 `pub(crate)`：`AgentTool` 的两个默认方法（`target_exists` /
+/// `preview_write`）是 `pub trait` 的一部分，本机工具要复用它；否则 trait 里
+/// 一出现这个名字就要挂 `#[allow(private_interfaces)]`。
+pub struct EditPreviewError {
     pub summary: String,
     pub message: String,
 }
 
-fn build_edit_display_metadata(
+pub(crate) fn build_edit_display_metadata(
     path: &str,
     current: &str,
     updated: &str,
@@ -361,36 +612,39 @@ pub(crate) async fn preview_edit_for_approval(
         message: e,
     })?;
 
-    let current_bytes =
-        sftp_read(ssh, session_id, &edit.path)
-            .await
-            .map_err(|e| EditPreviewError {
-                summary: format!("edit {}", edit.path),
-                message: e,
-            })?;
+    let current_bytes = SftpBackend::new(ssh, session_id)
+        .read(&edit.path)
+        .await
+        .map_err(|e| EditPreviewError {
+            summary: format!("edit {}", edit.path),
+            message: e,
+        })?;
 
     let current = String::from_utf8(current_bytes).map_err(|_| EditPreviewError {
         summary: format!("edit {}", edit.path),
         message: "file is not valid UTF-8; edit_file requires text files".into(),
     })?;
 
-    let (updated, occurrences) = try_replace(
-        &current,
-        &edit.old_content,
-        &edit.new_content,
-        edit.replace_all,
-    )
-    .map_err(|e| EditPreviewError {
-        summary: format!("edit {}", edit.path),
-        message: e,
-    })?;
+    let resolved =
+        resolve_edit_text(&current, &edit.old_content, &edit.new_content).ok_or_else(|| {
+            EditPreviewError {
+                summary: format!("edit {}", edit.path),
+                message: EDIT_NOT_FOUND.into(),
+            }
+        })?;
+
+    let (updated, occurrences) =
+        apply_edit(&current, &resolved, edit.replace_all).map_err(|e| EditPreviewError {
+            summary: format!("edit {}", edit.path),
+            message: e,
+        })?;
 
     Ok(build_edit_display_metadata(
         &edit.path,
         &current,
         &updated,
-        &edit.old_content,
-        &edit.new_content,
+        &resolved.old,
+        &resolved.new,
         occurrences,
     ))
 }
@@ -417,7 +671,8 @@ impl AgentTool for ReadFileTool {
     fn description(&self) -> &str {
         "Read a text file from the remote server with line numbers and pagination. \
          Use start_line and max_lines to continue through long files. Non-UTF-8 \
-         bytes are replaced and reported in metadata."
+         bytes are replaced and reported in metadata. Files over 2 MB are rejected \
+         outright — read those in parts with bash (head / sed / grep)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -464,7 +719,7 @@ impl AgentTool for ReadFileTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let bytes = match sftp_read(&ctx.ssh, &ctx.session_id, path).await {
+        let bytes = match SftpBackend::new(&ctx.ssh, &ctx.session_id).read(path).await {
             Ok(data) => data,
             Err(e) => {
                 return Ok(ToolOutput::fail(format!("read {}", path), e));
@@ -563,7 +818,10 @@ impl AgentTool for WriteFileTool {
         }
 
         let bytes = content.as_bytes();
-        match sftp_write(&ctx.ssh, &ctx.session_id, path, bytes).await {
+        match SftpBackend::new(&ctx.ssh, &ctx.session_id)
+            .write(path, bytes)
+            .await
+        {
             Ok(()) => {
                 let lines = content.lines().count();
                 Ok(ToolOutput::ok(
@@ -604,7 +862,8 @@ impl AgentTool for EditFileTool {
         "Precisely edit a file on the remote server by replacing an exact occurrence \
          of `old_content` with `new_content`. Fails if `old_content` is missing or \
          appears more than once (unless `replace_all` is true). Always read the file \
-         first to obtain `old_content` verbatim."
+         first to obtain `old_content` verbatim. LF/CRLF differences are tolerated \
+         and the file's existing line endings are preserved."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -634,7 +893,10 @@ impl AgentTool for EditFileTool {
             Err(e) => return Ok(ToolOutput::fail("edit_file", e)),
         };
 
-        let current_bytes = match sftp_read(&ctx.ssh, &ctx.session_id, &edit.path).await {
+        let current_bytes = match SftpBackend::new(&ctx.ssh, &ctx.session_id)
+            .read(&edit.path)
+            .await
+        {
             Ok(data) => data,
             Err(e) => return Ok(ToolOutput::fail(format!("edit {}", edit.path), e)),
         };
@@ -649,12 +911,17 @@ impl AgentTool for EditFileTool {
             }
         };
 
-        let (updated, occurrences) = match try_replace(
-            &current,
-            &edit.old_content,
-            &edit.new_content,
-            edit.replace_all,
-        ) {
+        let resolved = match resolve_edit_text(&current, &edit.old_content, &edit.new_content) {
+            Some(r) => r,
+            None => {
+                return Ok(ToolOutput::fail(
+                    format!("edit {}", edit.path),
+                    EDIT_NOT_FOUND,
+                ))
+            }
+        };
+
+        let (updated, occurrences) = match apply_edit(&current, &resolved, edit.replace_all) {
             Ok(result) => result,
             Err(e) => return Ok(ToolOutput::fail(format!("edit {}", edit.path), e)),
         };
@@ -663,12 +930,15 @@ impl AgentTool for EditFileTool {
             &edit.path,
             &current,
             &updated,
-            &edit.old_content,
-            &edit.new_content,
+            &resolved.old,
+            &resolved.new,
             occurrences,
         );
 
-        match sftp_write(&ctx.ssh, &ctx.session_id, &edit.path, updated.as_bytes()).await {
+        match SftpBackend::new(&ctx.ssh, &ctx.session_id)
+            .write(&edit.path, updated.as_bytes())
+            .await
+        {
             Ok(()) => Ok(ToolOutput::ok(
                 format!(
                     "edit {} ({} replacement{})",
@@ -677,11 +947,16 @@ impl AgentTool for EditFileTool {
                     if occurrences == 1 { "" } else { "s" }
                 ),
                 format!(
-                    "replaced {} occurrence(s) in {} ({} -> {} bytes)",
+                    "replaced {} occurrence(s) in {} ({} -> {} bytes){}",
                     occurrences,
                     edit.path,
                     current.len(),
-                    updated.len()
+                    updated.len(),
+                    if resolved.line_ending_converted {
+                        " [line endings normalized to the file's existing style]"
+                    } else {
+                        ""
+                    }
                 ),
             )
             .with_metadata(metadata)),
@@ -746,44 +1021,10 @@ impl AgentTool for ListDirectoryTool {
             .clamp(1, MAX_LIST_LIMIT as u64) as usize;
         let sort_by = parse_directory_sort_by(params.get("sort_by").and_then(|v| v.as_str()));
 
-        match ctx.ssh.open_sftp(&ctx.session_id).await {
-            Ok(sftp) => {
-                let mut entries = Vec::new();
-
-                match sftp.read_dir(path).await {
-                    Ok(mut dir) => {
-                        while let Some(entry) = dir.next() {
-                            let metadata = entry.metadata();
-                            let name = entry.file_name();
-                            let size = metadata.len();
-                            let permissions = metadata.permissions.unwrap_or(0);
-                            let is_dir = metadata.is_dir();
-                            let is_link = metadata.is_symlink();
-
-                            let kind = if is_dir {
-                                "directory"
-                            } else if is_link {
-                                "symlink"
-                            } else {
-                                "file"
-                            };
-                            entries.push(DirectoryEntryView {
-                                name,
-                                kind: kind.to_string(),
-                                size,
-                                permissions,
-                                permissions_text: format_permissions(permissions),
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        return Ok(ToolOutput::fail(
-                            format!("list {}", path),
-                            format!("SFTP list failed: {}", e),
-                        ))
-                    }
-                }
-
+        match SftpBackend::new(&ctx.ssh, &ctx.session_id).list(path).await {
+            Ok(entries) => {
+                let entries: Vec<DirectoryEntryView> =
+                    entries.into_iter().map(entry_view).collect();
                 let view = build_directory_view(entries, offset, limit, sort_by);
                 Ok(ToolOutput::ok(
                     format!(
@@ -802,15 +1043,23 @@ impl AgentTool for ListDirectoryTool {
                     "entries": directory_entries_metadata(&view.entries)
                 })))
             }
-            Err(e) => Ok(ToolOutput::fail(
-                format!("list {}", path),
-                format!("SFTP unavailable: {}", e),
-            )),
+            Err(e) => Ok(ToolOutput::fail(format!("list {}", path), e)),
         }
     }
 }
 
-fn format_permissions(mode: u32) -> String {
+/// 后端原始条目 → 展示条目。kind 字符串与权限文本在这里定型，两个后端共用。
+pub(crate) fn entry_view(raw: RawEntry) -> DirectoryEntryView {
+    DirectoryEntryView {
+        name: raw.name,
+        kind: raw.kind.as_str().to_string(),
+        size: raw.size,
+        permissions: raw.mode,
+        permissions_text: format_permissions(raw.mode),
+    }
+}
+
+pub(crate) fn format_permissions(mode: u32) -> String {
     let perms = [
         if mode & 0o400 != 0 { 'r' } else { '-' },
         if mode & 0o200 != 0 { 'w' } else { '-' },
@@ -827,7 +1076,13 @@ fn format_permissions(mode: u32) -> String {
     result
 }
 
-fn build_read_view(
+/// 拼装读取视图，`[next: ...]` 指针钉在**实际写出**的位置上。
+///
+/// 旧实现先按 `max_lines` 切页、再 `truncate_output` 截 body：长行文件
+/// （minified JS、宽表）16 KB 预算只装得下 ~148 行，却提示 `start_line=201 to continue`，
+/// 中间那几十行对模型**静默消失**（metadata 不进模型上下文）。
+/// 现在改成写之前卡预算：谁的预算不够就从谁开始停，指针 = 第一条没整行写出的行。
+pub(crate) fn build_read_view(
     bytes: &[u8],
     start_line: usize,
     max_lines: usize,
@@ -840,28 +1095,60 @@ fn build_read_view(
 
     let start_index = start_line.saturating_sub(1).min(total_lines);
     let end_index = start_index.saturating_add(max_lines).min(total_lines);
-    let selected = &lines[start_index..end_index];
 
     let mut body = String::new();
     if lossy_utf8 {
         body.push_str("[warning: file contains non-UTF-8 bytes; invalid bytes were replaced]\n\n");
     }
 
-    for (i, line) in selected.iter().enumerate() {
+    // 已在 body 里整段写出的行数（首行被截断时也记 1 行）。续读指针恒为
+    // `start_index + emitted + 1`，即第一条没整行写出的行 —— 翻页首尾相接、不漏行。
+    let mut emitted = 0usize;
+    let mut single_line_cut = false;
+    for (i, line) in lines[start_index..end_index].iter().enumerate() {
         let line_no = start_index + i + 1;
-        if show_line_numbers {
-            body.push_str(&format!("{:>6}: {}\n", line_no, line));
+        let rendered = if show_line_numbers {
+            format!("{:>6}: {}\n", line_no, line)
         } else {
-            body.push_str(line);
-            body.push('\n');
+            format!("{}\n", line)
+        };
+        if body.len() + rendered.len() <= MAX_READ_BYTES {
+            body.push_str(&rendered);
+            emitted += 1;
+            continue;
+        }
+        if emitted == 0 {
+            // 首行自己就吃掉整个预算（minified bundle）：给出前缀并**明说该行被切断**。
+            // 按行翻页取不回同一行的后半段，只能靠 bash，所以不能只留个截断标记。
+            let budget = MAX_READ_BYTES.saturating_sub(body.len());
+            body.push_str(&truncate_output(rendered, budget));
+            body.push_str(&format!(
+                "\n[line {} is {} bytes; only its first {} bytes are shown — read the rest \
+                 of this line with bash (sed / cut)]\n",
+                line_no,
+                line.len(),
+                budget
+            ));
+            emitted = 1;
+            single_line_cut = true;
+        }
+        break;
+    }
+
+    if emitted == 0 {
+        // 空体必须给一句解释，否则模型会把「没输出」当成「文件是空的」
+        if total_lines == 0 {
+            body.push_str("[file is empty]\n");
+        } else {
+            body.push_str(&format!(
+                "[start_line {} is past the end of the file ({} lines)]\n",
+                start_line, total_lines
+            ));
         }
     }
 
-    let returned_lines = selected.len();
-    let next_line = (end_index < total_lines).then_some(end_index + 1);
-    let mut body = truncate_output(body, MAX_READ_BYTES);
-    let truncated = next_line.is_some() || body.contains("[truncated to ");
-
+    let next_line = (start_index + emitted < total_lines).then_some(start_index + emitted + 1);
+    let truncated = single_line_cut || next_line.is_some();
     if let Some(next) = next_line {
         body.push_str(&format!(
             "\n[next: call read_file with start_line={} to continue]",
@@ -873,15 +1160,15 @@ fn build_read_view(
         body,
         total_lines,
         start_line,
-        end_line: end_index,
-        returned_lines,
+        end_line: start_index + emitted,
+        returned_lines: emitted,
         next_line,
         truncated,
         lossy_utf8,
     }
 }
 
-fn parse_directory_sort_by(sort_by: Option<&str>) -> DirectorySortBy {
+pub(crate) fn parse_directory_sort_by(sort_by: Option<&str>) -> DirectorySortBy {
     match sort_by
         .map(str::trim)
         .map(str::to_ascii_lowercase)
@@ -893,7 +1180,7 @@ fn parse_directory_sort_by(sort_by: Option<&str>) -> DirectorySortBy {
     }
 }
 
-fn build_directory_view(
+pub(crate) fn build_directory_view(
     mut entries: Vec<DirectoryEntryView>,
     offset: usize,
     limit: usize,
@@ -924,16 +1211,45 @@ fn build_directory_view(
     let total_entries = entries.len();
     let start = offset.min(total_entries);
     let end = start.saturating_add(limit).min(total_entries);
-    let page_entries = entries[start..end].to_vec();
-    let next_offset = (end < total_entries).then_some(end);
 
+    // 与 read_file 同理：先在 8 KB 预算内挑出真正写得出的行，`next_offset` 只推进到那里。
+    // 旧实现无条件按 limit 算下一页（如 offset=200），而预算只装得下前 ~120 行，
+    // 中间那批条目对模型**静默消失**。
     let mut body = String::new();
     body.push_str("TYPE       PERMISSIONS     SIZE NAME\n");
-    for entry in &page_entries {
-        body.push_str(&format!(
+    let mut emitted = 0usize;
+    for entry in &entries[start..end] {
+        let line = format!(
             "{:<10} {} {:>8} {}\n",
             entry.kind, entry.permissions_text, entry.size, entry.name
-        ));
+        );
+        if body.len() + line.len() > MAX_LIST_BYTES {
+            if emitted == 0 {
+                // 单行就超预算（异常长的文件名）：至少截一段出去，保证 offset 能前进
+                body.push_str(&truncate_output(
+                    line,
+                    MAX_LIST_BYTES.saturating_sub(body.len()),
+                ));
+                emitted = 1;
+            }
+            break;
+        }
+        body.push_str(&line);
+        emitted += 1;
+    }
+
+    let page_entries = entries[start..start + emitted].to_vec();
+    let next_offset = (start + emitted < total_entries).then_some(start + emitted);
+    if emitted == 0 {
+        // 空目录 / offset 越界：body 只剩表头，得说一句，别让模型去猜是哪种
+        if total_entries == 0 {
+            body.push_str("[directory is empty]\n");
+        } else {
+            body.push_str(&format!(
+                "[offset {} is past the end of the listing ({} entries)]\n",
+                start, total_entries
+            ));
+        }
     }
     if let Some(next) = next_offset {
         body.push_str(&format!(
@@ -943,7 +1259,7 @@ fn build_directory_view(
     }
 
     DirectoryView {
-        body: truncate_output(body, MAX_LIST_BYTES),
+        body,
         total_entries,
         returned_entries: page_entries.len(),
         offset: start,
@@ -962,7 +1278,7 @@ fn directory_kind_rank(kind: &str) -> u8 {
     }
 }
 
-fn directory_entries_metadata(entries: &[DirectoryEntryView]) -> Vec<serde_json::Value> {
+pub(crate) fn directory_entries_metadata(entries: &[DirectoryEntryView]) -> Vec<serde_json::Value> {
     entries
         .iter()
         .map(|entry| {
@@ -1211,5 +1527,248 @@ mod tests {
         assert_eq!(metadata[0]["kind"], "file");
         assert_eq!(metadata[0]["size"], 42);
         assert_eq!(metadata[0]["permissions_text"], "rw-r--r--");
+    }
+
+    // ── 读取上限预检 ──
+
+    #[test]
+    fn read_size_limit_error_accepts_small_and_rejects_large() {
+        assert!(read_size_limit_error("/var/log/app.log", 0).is_none());
+        assert!(read_size_limit_error("/var/log/app.log", MAX_READ_FILE_BYTES).is_none());
+
+        let err = read_size_limit_error("/var/log/app.log", MAX_READ_FILE_BYTES + 1).unwrap();
+        assert!(err.contains("/var/log/app.log"), "{}", err);
+        assert!(err.contains("bash"), "{}", err);
+        assert!(err.contains("head -n 200"), "{}", err);
+    }
+
+    // ── sidecar 路径 ──
+
+    #[test]
+    fn sidecar_path_stays_next_to_target() {
+        // 与人类编辑器同款：临时文件与目标同目录，rename 才是同文件系统的原子替换
+        let sidecar = crate::commands::sftp::remote_sidecar_path("./notes.txt", "edit").unwrap();
+        assert!(
+            sidecar.starts_with("./.notes.txt.marcel-edit-"),
+            "{}",
+            sidecar
+        );
+
+        let abs =
+            crate::commands::sftp::remote_sidecar_path("/etc/ssh/sshd_config", "edit").unwrap();
+        assert!(
+            abs.starts_with("/etc/ssh/.sshd_config.marcel-edit-"),
+            "{}",
+            abs
+        );
+
+        // 裸相对名（无 '/'）算不出 sidecar → 调用点先用 with_dot_slash 补上
+        assert!(crate::commands::sftp::remote_sidecar_path("notes.txt", "edit").is_err());
+        assert!(
+            crate::commands::sftp::remote_sidecar_path(&with_dot_slash("notes.txt"), "edit")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn with_dot_slash_normalizes_relative_names() {
+        assert_eq!(with_dot_slash("notes.txt"), "./notes.txt");
+        assert_eq!(with_dot_slash("./notes.txt"), "./notes.txt");
+        assert_eq!(with_dot_slash("/etc/foo"), "/etc/foo");
+        assert_eq!(with_dot_slash("sub/foo.txt"), "sub/foo.txt");
+    }
+
+    // ── CRLF / LF 匹配 ──
+
+    #[test]
+    fn resolve_edit_text_prefers_exact_match() {
+        // 模型给的 old 本身就是 CRLF → 原样匹配，不做任何转换
+        let current = "a\r\nfoo\r\nb\r\n";
+        let r = resolve_edit_text(current, "foo\r\n", "bar\r\n").unwrap();
+        assert_eq!(r.old, "foo\r\n");
+        assert_eq!(r.new, "bar\r\n");
+        assert!(!r.line_ending_converted);
+    }
+
+    #[test]
+    fn resolve_edit_text_falls_back_to_crlf_for_lf_old() {
+        // read_file 用 str::lines() 分行，CRLF 的 \r 在给模型看之前就没了：
+        // 模型照抄的 old_content 只有 LF，必须能命中 CRLF 文件
+        let current = "a\r\nfoo\r\nb\r\n";
+        let r = resolve_edit_text(current, "a\nfoo\n", "x\n").unwrap();
+        assert!(r.line_ending_converted);
+        assert_eq!(r.old, "a\r\nfoo\r\n");
+        // new_content 一并转换，写回去不会一半 CRLF 一半 LF
+        assert_eq!(r.new, "x\r\n");
+
+        let (updated, n) = try_replace(current, "a\nfoo\n", "x\n", false).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(updated, "x\r\nb\r\n");
+    }
+
+    #[test]
+    fn try_replace_matches_crlf_old_in_lf_file() {
+        let current = "a\nfoo\nb\n";
+        let (updated, n) = try_replace(current, "a\r\nfoo\r\n", "x\r\ny\r\n", false).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(updated, "x\ny\nb\n");
+    }
+
+    #[test]
+    fn try_replace_all_after_eol_conversion_counts_all() {
+        let current = "foo\r\nmid\r\nfoo\r\n";
+        let (updated, n) = try_replace(current, "foo\n", "bar\n", true).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(updated, "bar\r\nmid\r\nbar\r\n");
+
+        // 多处匹配仍按转换后的候选计数并拒绝
+        let err = try_replace(current, "foo\n", "bar\n", false).unwrap_err();
+        assert!(err.contains("matches 2 times"), "{}", err);
+    }
+
+    #[test]
+    fn try_replace_still_reports_missing_content() {
+        let err = try_replace("hello\nworld\n", "world\n\n", "x\n", false).unwrap_err();
+        assert!(err.contains("not found"), "{}", err);
+        // 无换行的 old 不受行尾转换影响
+        assert!(try_replace("hello", "HELLO", "x", false).is_err());
+    }
+
+    // ── 字节预算下的续读指针 ──
+
+    #[test]
+    fn build_read_view_retargets_next_line_when_byte_budget_cuts_page() {
+        // 300 行 × ~100 字节 ≈ 30 KB，一页 200 行远超 16 KB 输出预算
+        let mut src = String::new();
+        for i in 1..=300 {
+            src.push_str(&format!("line{}-{}\n", i, "x".repeat(90)));
+        }
+
+        let view = build_read_view(src.as_bytes(), 1, 200, true);
+
+        assert!(
+            view.returned_lines > 0 && view.returned_lines < 200,
+            "returned {}",
+            view.returned_lines
+        );
+        assert_eq!(view.end_line, view.returned_lines);
+        // 指针必须指向第一条没整行写出的行，而不是请求页的末尾（否则中间的行静默丢失）
+        assert_eq!(view.next_line, Some(view.returned_lines + 1));
+        assert!(view.truncated);
+        assert!(view.body.contains(&format!(
+            "{:>6}: line{}",
+            view.returned_lines, view.returned_lines
+        )));
+        assert!(!view.body.contains(&format!(
+            "{:>6}: line{}",
+            view.returned_lines + 1,
+            view.returned_lines + 1
+        )));
+
+        // 从指针处续读，第一条就是紧接着的下一行（首尾相接，不跳段）
+        let next = view.next_line.unwrap();
+        let cont = build_read_view(src.as_bytes(), next, 3, true);
+        assert_eq!(cont.start_line, next);
+        assert!(
+            cont.body.contains(&format!("line{}", next)),
+            "{}",
+            cont.body
+        );
+    }
+
+    #[test]
+    fn build_read_view_marks_cut_single_long_line_and_advances() {
+        let mut src = "a".repeat(30_000);
+        src.push_str("\nsecond\n");
+
+        let view = build_read_view(src.as_bytes(), 1, 10, true);
+
+        assert_eq!(view.total_lines, 2);
+        assert_eq!(view.returned_lines, 1);
+        assert_eq!(view.end_line, 1);
+        // 长行被切在预算处，并且**明说**后半段要用 bash 取
+        assert!(view.body.contains("only its first"), "{}", view.body);
+        assert!(view.body.contains("30000 bytes"), "{}", view.body);
+        assert!(view.truncated);
+        // 指针绕过这一行，避免"再读一次还是同一行"的死循环
+        assert_eq!(view.next_line, Some(2));
+        assert!(
+            view.body.len() < MAX_READ_BYTES + 300,
+            "{}",
+            view.body.len()
+        );
+
+        let cont = build_read_view(src.as_bytes(), 2, 10, true);
+        assert!(cont.body.contains("second"), "{}", cont.body);
+    }
+
+    #[test]
+    fn build_read_view_explains_empty_and_past_eof() {
+        let empty = build_read_view(b"", 1, 10, true);
+        assert_eq!(empty.total_lines, 0);
+        assert_eq!(empty.returned_lines, 0);
+        assert_eq!(empty.next_line, None);
+        assert!(!empty.truncated);
+        assert!(empty.body.contains("file is empty"), "{}", empty.body);
+
+        // 起点越界：不能只给一段空体让模型以为文件是空的
+        let past = build_read_view(b"a\nb\nc\n", 99, 10, true);
+        assert_eq!(past.total_lines, 3);
+        assert_eq!(past.returned_lines, 0);
+        assert_eq!(past.end_line, 3);
+        assert_eq!(past.next_line, None);
+        assert!(
+            past.body.contains("past the end of the file"),
+            "{}",
+            past.body
+        );
+        assert!(past.body.contains("99"), "{}", past.body);
+    }
+
+    fn dir_entries(count: usize, name_len: usize) -> Vec<DirectoryEntryView> {
+        (0..count)
+            .map(|i| DirectoryEntryView {
+                name: format!("file-{:04}-{}", i, "n".repeat(name_len)),
+                kind: "file".to_string(),
+                size: 1,
+                permissions: 0o100644,
+                permissions_text: format_permissions(0o100644),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_directory_view_retargets_next_offset_when_byte_budget_cuts_page() {
+        let view = build_directory_view(dir_entries(300, 40), 0, 200, DirectorySortBy::Name);
+
+        assert!(
+            view.returned_entries > 0 && view.returned_entries < 200,
+            "returned {}",
+            view.returned_entries
+        );
+        assert_eq!(view.entries.len(), view.returned_entries);
+        // 指针只推进到真正写出的条目数，而不是请求页的末尾
+        assert_eq!(view.next_offset, Some(view.returned_entries));
+        assert!(view
+            .body
+            .contains(&format!("offset={}", view.returned_entries)));
+        let last = view.entries.last().unwrap();
+        assert!(view.body.contains(&last.name), "{}", view.body);
+        assert!(!view
+            .body
+            .contains(&format!("file-{:04}-", view.returned_entries)));
+
+        // 续读页的第一条正好是没写出的那一条（不跳段）
+        let next = build_directory_view(
+            dir_entries(300, 40),
+            view.next_offset.unwrap(),
+            5,
+            DirectorySortBy::Name,
+        );
+        assert_eq!(next.offset, view.returned_entries);
+        assert_eq!(
+            next.entries[0].name,
+            format!("file-{:04}-{}", view.returned_entries, "n".repeat(40))
+        );
     }
 }

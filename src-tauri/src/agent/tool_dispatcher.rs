@@ -459,6 +459,8 @@ impl ToolDispatcher {
         // 流程（不值得让用户为一次注定失败的调用点确认）。强度由声明决定：
         //   Edit      —— 改写既有文件，目标必须已读过；
         //   Overwrite —— 覆盖已存在的目标前要求已读过，新建放行。
+        // 「目标存不存在」这一问是**机器相关**的：先问工具（本机写工具会用本机
+        // stat 回答），工具不回答（动态工具 / 远端工具）才回落到 SFTP stat。
         match path_write {
             PathWrite::Edit => {
                 if let Some(path) = path {
@@ -475,16 +477,22 @@ impl ToolDispatcher {
             }
             PathWrite::Overwrite => {
                 if let Some(path) = path {
-                    if !path_was_read(&self.read_files.read(), path)
-                        && remote_file_exists(&ctx.ssh, &ctx.session_id, path).await
-                    {
-                        return DispatchResult::from_tool_output(
-                            ToolOutput::fail(
-                                format!("write {}", path),
-                                read_before_write_error(path),
-                            ),
-                            effective_disposition,
-                        );
+                    // 已读判定单独一句：parking_lot 的读 guard 不能带过下面的 `.await`。
+                    let already_read = path_was_read(&self.read_files.read(), path);
+                    if !already_read {
+                        let exists = match tool.target_exists(ctx, &tc.arguments).await {
+                            Some(exists) => exists,
+                            None => remote_file_exists(&ctx.ssh, &ctx.session_id, path).await,
+                        };
+                        if exists {
+                            return DispatchResult::from_tool_output(
+                                ToolOutput::fail(
+                                    format!("write {}", path),
+                                    read_before_write_error(path),
+                                ),
+                                effective_disposition,
+                            );
+                        }
                     }
                 }
             }
@@ -634,19 +642,29 @@ impl ToolDispatcher {
         if final_needs_confirm {
             let mut approval_metadata: Option<serde_json::Value> = None;
 
-            // 需要预演的工具（`edit_file`）先做一次预读 + 校验再问用户：
-            // 会让 execute() 失败的调用不该打开审批对话框。
+            // 需要预演的工具（`edit_file` / 本机 `local_edit_file`）先做一次预读 +
+            // 校验再问用户：会让 execute() 失败的调用不该打开审批对话框。
+            //
+            // 预演是**机器相关**的：先问工具（本机编辑工具读的是用户自己电脑上那个
+            // 文件），工具不回答（动态工具）才回落到远端实现（读 SFTP 上的同名路径）。
+            // 失败走同一分支：这与远端现状一致 —— 预演失败 = 这次调用注定失败，
+            // 直接把原因回给模型，不弹一个注定失败的审批。
             if semantics
                 .map(|s| s.preview_before_approval)
                 .unwrap_or(false)
             {
-                match crate::agent::tools::file_ops::preview_edit_for_approval(
-                    &ctx.ssh,
-                    &ctx.session_id,
-                    &tc.arguments,
-                )
-                .await
-                {
+                let preview = match tool.preview_write(ctx, &tc.arguments).await {
+                    Some(result) => result,
+                    None => {
+                        crate::agent::tools::file_ops::preview_edit_for_approval(
+                            &ctx.ssh,
+                            &ctx.session_id,
+                            &tc.arguments,
+                        )
+                        .await
+                    }
+                };
+                match preview {
                     Ok(meta) => approval_metadata = Some(meta),
                     Err(e) => {
                         return DispatchResult {

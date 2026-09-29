@@ -33,7 +33,20 @@ pub mod file_ops;
 pub mod history;
 pub mod http_get;
 pub mod job_ops;
+// 本机（用户自己这台电脑）执行与文件工具：只有桌面侧存在（本机子 agent 是桌面
+// 专属能力；Android 走 SAF，没有本机路径 / 子进程语义）。
+#[cfg(desktop)]
+pub mod local_bash;
+#[cfg(desktop)]
+pub mod local_file_ops;
+// 本机文件系统原语（整读 / 原子整写 / 列目录）+ 路径安全：只有桌面侧会用到
+// （upload_file / download_file 同为桌面专属；Android 走 SAF，没有本机路径语义）。
+#[cfg(desktop)]
+pub mod local_fs;
 pub mod local_handlers;
+// 本机子 agent 的派发工具：只有桌面侧存在（本机子 agent 本身是桌面专属能力）。
+#[cfg(desktop)]
+pub mod local_subagent;
 pub mod mcp;
 pub mod open_cloud_page;
 pub mod plan;
@@ -498,6 +511,8 @@ pub struct ExecTicketOutcome {
 }
 
 /// Trait implemented by every agent tool.
+///
+/// `private_interfaces` 豁免：`preview_write` 的 Err 载荷是
 #[async_trait]
 pub trait AgentTool: Send + Sync {
     /// Unique name used by the LLM to reference this tool.
@@ -527,6 +542,39 @@ pub trait AgentTool: Send + Sync {
         _params: &serde_json::Value,
         _ctx: &ToolContext,
     ) -> Option<String> {
+        None
+    }
+
+    /// **本机侧问题**：这个工具的目标（`semantics.path_arg` 指的那个路径）现在存在吗？
+    ///
+    /// 默认 `None` = 「不由本机回答」，dispatcher 回落到远端实现
+    /// （`remote_file_exists`，SFTP stat）。它的唯一用途是 `PathWrite::Overwrite`
+    /// 的写前检查：**「覆盖已存在文件前必须先读过」这一半与机器无关**，但「目标在
+    /// 不在」必须问对机器 —— 拿本机路径去 stat 服务器，结论毫无意义（本机没有的
+    /// 文件在服务器上可能有，反之亦然）。
+    ///
+    /// 实现者注意：只回答存在性，不做校验、不报错。任何查询失败都按远端口径算
+    /// 「不存在」（新建放行），真正的失败由写自己报。
+    async fn target_exists(&self, _ctx: &ToolContext, _params: &serde_json::Value) -> Option<bool> {
+        None
+    }
+
+    /// **本机侧问题**：审批前预演（`ToolSemantics::preview_before_approval`）。
+    ///
+    /// dispatcher 在弹审批之前调它，把返回的 metadata 交给审批面板（`edit_file`
+    /// 借此展示完整上下文 diff）；预演本身失败（目标读不到、`old_content` 不匹配）
+    /// 说明这次调用注定失败，dispatcher 走**与远端同一条**降级分支：直接失败并
+    /// 把原因回给模型，不打开审批对话框。
+    ///
+    /// 默认 `None` = 「不由本机回答」，dispatcher 回落到远端实现
+    /// （`file_ops::preview_edit_for_approval`，读 SFTP 上的同名路径）。本机工具
+    /// **必须**回答：`None` 会让审批面板展示服务器上那个同名文件的 diff —— 比
+    /// 没有预览更糟。
+    async fn preview_write(
+        &self,
+        _ctx: &ToolContext,
+        _params: &serde_json::Value,
+    ) -> Option<Result<serde_json::Value, file_ops::EditPreviewError>> {
         None
     }
 
@@ -656,15 +704,37 @@ pub enum ToolAudience {
     /// 子 agent：单任务执行者，不编排。这条收敛规则写在声明里，
     /// 不再「先注册全套、再回头按名字删掉」。
     Sub,
+    /// **本机子 agent**：在用户自己这台电脑上执行任务的子 agent（桌面专属）。
+    ///
+    /// 与 `Sub` 的差别不是"更小的子集"，而是**目标机器**：它的 ctx 挂本机命令
+    /// 执行器（`AppState.local_command_exec`）且 `local_side = true`。本机专属
+    /// 工具只对它放行（见 [`ToolRoles::LocalSubOnly`]）。
+    LocalSub,
 }
 
 /// 工具对「角色」的限制。
+///
+/// 这里表达的是**谁能拿到**，不是**在哪台机器上执行**（后者由工具的 `side` 与
+/// ctx 决定）。两条边界：
+///
+/// 1. **远端子 agent / 主 agent 拿不到本机工具**：`local_bash` 与本机四个文件
+///    工具声明为 `LocalSubOnly`，只在 `audience == LocalSub` 时放行 —— 本机能力
+///    只经本机子 agent 暴露给模型。
+/// 2. **本机子 agent 不拿远端语义的工具**：这条不在 `roles` 里强制，因为它没法
+///    在这里表达 —— `Both` 的工具里既有远端语义的（`bash` / `read_file`），也有
+///    本机子 agent 确实需要的（`read_history` / `ask_user` / `job_output` 等；
+///    `job_*` 读的是 `ctx.command_exec`，本机 ctx 上挂的就是本机管理器，是
+///    `local_bash` 后台模式的唯一出口）。所以本机子 agent 的 registry 由组装处
+///    收敛（按名字 `remove` 掉远端语义工具，清单见 [`LOCAL_SUB_EXCLUDED_TOOLS`]），
+///    `roles` 这一维不为它特判。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRoles {
     /// 主任务与子 agent 都能拿到。
     Both,
     /// 只有主任务能拿到（编排类工具）。
     MainOnly,
+    /// 只有**本机子 agent**能拿到（`local_bash` 与本机文件工具）。
+    LocalSubOnly,
 }
 
 impl ToolRoles {
@@ -672,9 +742,62 @@ impl ToolRoles {
         match self {
             Self::Both => true,
             Self::MainOnly => matches!(audience, ToolAudience::Main),
+            Self::LocalSubOnly => matches!(audience, ToolAudience::LocalSub),
         }
     }
 }
+
+/// 本机子 agent（`ToolAudience::LocalSub`）的工具集必须**剔除**的工具。
+///
+/// 为什么这一维不在 [`ToolRoles`] 里表达：见上面的说明 —— `Both` 里既有远端语义的
+/// （`bash` / `read_file`），也有本机子 agent 确实要用的（`read_history` / `ask_user`
+/// / `job_*`），`roles` 表达不了这个差集。收窄由组装处按这份清单 `remove`
+/// （`AgentManager` 的 `build_role_registry`），清单是**唯一来源**：
+/// `local_sub_exclusions_cover_every_machine_facing_tool` 会拦下「新增了面向机器的
+/// 工具却忘了收窄」——判据是 `side` 为 `Remote` / `Both` **或**声明了
+/// `path_arg` / `command_arg`（`Local` 侧整体豁免，那是本机能力本体）。
+///
+/// **必须保留**的（不在清单里）：5 个 `local_*`（本机能力本体）、
+/// `job_output` / `job_kill` / `job_list`（读的正是 `ctx.command_exec`，本机 ctx 上
+/// 挂的就是本机管理器 —— 它们是 `local_bash` 后台作业的唯一出口）、`read_history`
+/// （回读父会话派发它时的上下文）、`ask_user` 与 `web_search` / `http_get` /
+/// `render_html` / `open_cloud_page`（本机侧 / 应用内，与目标机器无关）。
+pub(crate) const LOCAL_SUB_EXCLUDED_TOOLS: &[&str] = &[
+    // ── 远端命令 / 文件 / 系统信息 ──
+    "bash",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_directory",
+    "search_files",
+    "system_info",
+    // 查的是当前 SSH 会话（本机子 agent 的 ctx.session_id 是哨兵 "local"，
+    // 调它只会报「当前会话不存在」—— 别给它一条注定失败的工具）。
+    "connection_info",
+    // ── 本机 ↔ 远端文件搬运：远端语义的另一半 ──
+    "upload_file",
+    "download_file",
+    // ── 编排：`MainOnly` 已经挡掉一部分，这里是纵深防御（禁止嵌套与计划编排）──
+    "subagent",
+    "local_subagent",
+    "create_plan",
+    "update_plan_item",
+    "edit_plan",
+];
+
+/// 声明为远端侧、但**本机子 agent 必须保留**的工具（收窄清单的豁免）。
+///
+/// `job_output` / `job_kill` / `job_list` 面上的 `side` 是 `Remote`（它们最早只服务
+/// 远端 `bash` 的后台作业），可它们实际读的是 `ctx.command_exec` —— 本机子 agent 的
+/// ctx 上挂的是 `AppState.local_command_exec`，所以它们对本机作业同样成立，是
+/// `local_bash(run_in_background)` 的唯一出口。
+///
+/// 生产路径用不到它（豁免名单里的名字本来就**不在** [`LOCAL_SUB_EXCLUDED_TOOLS`] 里）；
+/// 它是给 `local_sub_exclusions_cover_every_machine_facing_tool` 当输入的：那份测试
+/// 据此自动发现「新增了面向机器的工具却忘了收窄」。
+#[cfg(test)]
+pub(crate) const LOCAL_SUB_REMOTE_SIDE_EXCEPTIONS: &[&str] =
+    &["job_output", "job_kill", "job_list"];
 
 /// `ExperimentalSettings` 里控制工具可见性的开关。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -853,7 +976,8 @@ struct BuiltinToolSpec {
     side: ToolSide,
     modes: ToolModes,
     roles: ToolRoles,
-    /// 需要在「设置 → 实验性功能」里打开的开关；`None` = 无条件可用。
+    /// 需要在设置里打开的开关（在「设置 → 工具能力」里，用户看到的中文名见
+    /// [`ToolSwitch::label`]）；`None` = 无条件可用。
     switch: Option<ToolSwitch>,
     semantics: ToolSemantics,
     /// 注册时要在系统提示词里追加的段。
@@ -1149,6 +1273,99 @@ static BUILTIN_TOOLS_DESKTOP: &[BuiltinToolSpec] = &[
         semantics: ToolSemantics::NONE,
         prompt_section: None,
         build: || Arc::new(sftp_transfer::DownloadFileTool::new()),
+    },
+    // ── 本机（用户自己这台电脑）执行与文件：只给本机子 agent ──
+    //
+    // `roles: LocalSubOnly` 是刻意的：本机工具在别处出现只会读错/写错机器
+    // （外层主 agent 与远端子 agent 的 ctx 都指向远端会话），本机能力统一经
+    // 本机子 agent 暴露。
+    //
+    // 参数语义（`semantics`）接进**与远端同一套** dispatcher 机制，不另写一份判定。
+    // 逐项归属：
+    // - 「写前必须已读」（`PathWrite`）与机器无关，照常生效：`local_read_file`
+    //   声明 `reads_path`（成功即按 `normalize_path` 记账），`local_write_file` /
+    //   `local_edit_file` 分别声明 `overwrites_path` / `edits_path`。不声明读取的
+    //   话本机编辑永远过不了写前检查（模型读了也记不上账）；
+    // - 「目标存在吗」（`PathWrite::Overwrite` 的存在性检查）必须问对机器：两个本机
+    //   写工具实现 [`AgentTool::target_exists`]（本机 stat），dispatcher 拿到
+    //   `Some` 就不再调 `remote_file_exists`（SFTP stat）；
+    // - 「审批前预演」：`local_edit_file` 声明 `preview_before_approval` 并实现
+    //   [`AgentTool::preview_write`]（`local_fs::read` + `file_ops` 的纯逻辑），
+    //   产出与远端 `edit_file` 逐字同形的 diff metadata；
+    // - 受保护路径提权（`policy.is_protected_path`）是**唯一**仍按远端 POSIX 表算的
+    //   一项：它只升不降，对本机 Unix 系统目录给出保守的强制审批，对本机 Windows
+    //   盘符路径不命中（无副作用）；本机路径的合法性由 `local_fs` 的
+    //   `LocalPathPolicy` 全权把关（详见 `tools/local_file_ops.rs` 的模块注释）。
+    //
+    // 「已读」表按**任务**隔离（dispatcher 每任务一个、同一张表），而本机工具只经
+    // 本机子 agent 暴露、那个 registry 里没有任何远端文件工具 —— 一张表里不会同时
+    // 出现本机与远端路径，共用一个集合是安全的。
+    // `local_list_directory` 保持 `NONE`：列目录不构成「读过这个文件」。
+    BuiltinToolSpec {
+        name: "local_bash",
+        side: ToolSide::Local,
+        modes: ToolModes::ALL,
+        roles: ToolRoles::LocalSubOnly,
+        switch: None,
+        semantics: ToolSemantics::command("command"),
+        prompt_section: None,
+        build: || Arc::new(local_bash::LocalBashTool::new()),
+    },
+    BuiltinToolSpec {
+        name: "local_read_file",
+        side: ToolSide::Local,
+        modes: ToolModes::ALL,
+        roles: ToolRoles::LocalSubOnly,
+        switch: None,
+        semantics: ToolSemantics::reads_path("path"),
+        prompt_section: None,
+        build: || Arc::new(local_file_ops::LocalReadFileTool::new()),
+    },
+    BuiltinToolSpec {
+        name: "local_list_directory",
+        side: ToolSide::Local,
+        modes: ToolModes::ALL,
+        roles: ToolRoles::LocalSubOnly,
+        switch: None,
+        semantics: ToolSemantics::NONE,
+        prompt_section: None,
+        build: || Arc::new(local_file_ops::LocalListDirectoryTool::new()),
+    },
+    BuiltinToolSpec {
+        name: "local_write_file",
+        side: ToolSide::Local,
+        modes: ToolModes::EXECUTE,
+        roles: ToolRoles::LocalSubOnly,
+        switch: None,
+        semantics: ToolSemantics::overwrites_path("path"),
+        prompt_section: None,
+        build: || Arc::new(local_file_ops::LocalWriteFileTool::new()),
+    },
+    BuiltinToolSpec {
+        name: "local_edit_file",
+        side: ToolSide::Local,
+        modes: ToolModes::EXECUTE,
+        roles: ToolRoles::LocalSubOnly,
+        switch: None,
+        semantics: ToolSemantics::edits_path("path"),
+        prompt_section: None,
+        build: || Arc::new(local_file_ops::LocalEditFileTool::new()),
+    },
+    // ── 本机子 agent 的派发入口：只有主任务拿得到 ──
+    //
+    // `roles: MainOnly`（与 `subagent` 相同）：远端子 agent 与**本机子 agent 自己**
+    // 都拿不到它，嵌套在工具集层面即不可能；`modes: ALL` 是刻意的 —— Plan 父任务
+    // 也能派发**只读**的本机子 agent（`mode="agent"` 由工具在 `execute` 里硬拦），
+    // 派发那一次的审批见 `tools/local_subagent.rs` 的模块注释。
+    BuiltinToolSpec {
+        name: "local_subagent",
+        side: ToolSide::Local,
+        modes: ToolModes::ALL,
+        roles: ToolRoles::MainOnly,
+        switch: None,
+        semantics: ToolSemantics::NONE,
+        prompt_section: None,
+        build: || Arc::new(local_subagent::LocalSubagentTool::new()),
     },
 ];
 
@@ -1449,8 +1666,9 @@ mod tests {
             }
             checked += 1;
         }
-        // 桌面构建下应为 10 Remote + 3 Local + 2 Both。这个下限只防"声明表没读全
-        // 导致测试空转"。
+        // 桌面构建下应为 10 Remote + 8 Local + 2 Both。这个下限只防"声明表没读全
+        // 导致测试空转"（移动端构建少了桌面专属的 5 个本机工具与 2 个传输工具，
+        // 所以下限取 10 而不是桌面端的实际总数）。
         assert!(
             checked >= 10,
             "只核对到 {} 个作用于机器的工具，声明表可能没读全",
@@ -1496,7 +1714,11 @@ mod tests {
             );
         }
         for mode in [RegistryMode::Plan, RegistryMode::Execute] {
-            for audience in [ToolAudience::Main, ToolAudience::Sub] {
+            for audience in [
+                ToolAudience::Main,
+                ToolAudience::Sub,
+                ToolAudience::LocalSub,
+            ] {
                 let mut seen = std::collections::BTreeSet::new();
                 for spec in builtin_tool_specs() {
                     if !spec.modes.matches(mode) || !spec.roles.allows(audience) {
@@ -1714,8 +1936,8 @@ mod tests {
                 .semantics
         };
 
-        // 命令类：目前只有 bash 执行 shell 命令，因而只有它按命令文本算风险、
-        // 走命令名单与模型审批、用 `$ cmd` 作拒绝摘要。
+        // 命令类：`bash`（远端）与 `local_bash`（本机，桌面专属）执行 shell
+        // 命令，因而按命令文本算风险、走命令名单与模型审批、用 `$ cmd` 作拒绝摘要。
         let command_tools: Vec<&str> = builtin_tool_specs()
             .iter()
             .filter(|s| s.semantics.command_arg.is_some())
@@ -1723,7 +1945,12 @@ mod tests {
             .collect();
         assert_eq!(
             command_tools,
-            vec!["bash"],
+            if cfg!(desktop) {
+                // 声明表顺序：COMMON 在前，本机工具在桌面表里。
+                vec!["bash", "local_bash"]
+            } else {
+                vec!["bash"]
+            },
             "命令类工具的归属变了：请确认是新增了执行命令的工具，而不是漏改声明"
         );
 
@@ -1737,6 +1964,33 @@ mod tests {
         assert_eq!(sem("edit_file").path_write, PathWrite::Edit);
         assert_eq!(sem("write_file").path_write, PathWrite::Overwrite);
 
+        // 本机族（桌面专属）接进同一套：本机读工具也必须声明 `path_arg`，否则
+        // 「读过了」记不上账，本机编辑永远过不了写前检查；写 / 编辑与远端同名工具
+        // 逐项同档（差别只在 dispatcher 越过 `target_exists` / `preview_write`
+        // 问工具的「本机侧问题」）。
+        #[cfg(desktop)]
+        {
+            assert_eq!(sem("local_read_file").path_arg, Some("path"));
+            assert_eq!(sem("local_read_file").path_write, PathWrite::None);
+            assert_eq!(sem("local_write_file").path_arg, Some("path"));
+            assert_eq!(sem("local_write_file").path_write, PathWrite::Overwrite);
+            assert_eq!(sem("local_edit_file").path_arg, Some("path"));
+            assert_eq!(sem("local_edit_file").path_write, PathWrite::Edit);
+            assert_eq!(
+                sem("local_edit_file").approval_switch,
+                Some(ApprovalSwitch::EditFile),
+                "本机编辑与远端编辑同受 confirm_edit_file 约束"
+            );
+            assert!(
+                sem("local_edit_file").preview_before_approval,
+                "本机编辑的审批面板要展示与远端同形的 diff（preview_write 产出）"
+            );
+            assert!(
+                sem("local_list_directory").path_arg.is_none(),
+                "列目录不构成「读过这个文件」，不参与写前检查"
+            );
+        }
+
         // 编辑类工具受 confirm_edit_file 约束，且弹审批前先预演。
         assert_eq!(
             sem("edit_file").approval_switch,
@@ -1749,7 +2003,11 @@ mod tests {
             .collect();
         assert_eq!(
             previewing,
-            vec!["edit_file"],
+            if cfg!(desktop) {
+                vec!["edit_file", "local_edit_file"]
+            } else {
+                vec!["edit_file"]
+            },
             "dispatcher 只实现了编辑预览；多出别的预演工具说明这里没跟上"
         );
 
@@ -1766,7 +2024,20 @@ mod tests {
             .collect();
         assert_eq!(
             with_semantics,
-            vec!["bash", "read_file", "write_file", "edit_file"]
+            if cfg!(desktop) {
+                vec![
+                    "bash",
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "local_bash",
+                    "local_read_file",
+                    "local_write_file",
+                    "local_edit_file",
+                ]
+            } else {
+                vec!["bash", "read_file", "write_file", "edit_file"]
+            }
         );
     }
 
@@ -1814,11 +2085,202 @@ mod tests {
     #[test]
     fn desktop_only_tools_are_platform_gated() {
         let r = ToolRegistry::build_mut_for_mode(ToolAudience::Main, &[], &all_switches_on());
-        for name in ["render_html", "upload_file", "download_file"] {
+        for name in [
+            "render_html",
+            "upload_file",
+            "download_file",
+            // 本机执行与文件工具：主 agent 拿不到（要本机子 agent 才拿得到），
+            // 这里只核对「平台门控」——移动端连声明的条目都没有。
+            "local_bash",
+            "local_read_file",
+            "local_write_file",
+            "local_edit_file",
+            "local_list_directory",
+            // 本机子 agent 的**派发入口**是主 agent 的工具（`MainOnly`），与本机
+            // 工具族其余成员相反：桌面上它必须在，移动端没有这个能力。
+            "local_subagent",
+        ] {
             #[cfg(desktop)]
-            assert!(r.get(name).is_some(), "桌面应注册 {}", name);
+            {
+                if name == "local_subagent" {
+                    assert!(
+                        r.get(name).is_some(),
+                        "本机子agent 派发入口应出现在主 agent 的 registry 里"
+                    );
+                } else if name.starts_with("local_") {
+                    assert!(
+                        r.get(name).is_none(),
+                        "本机工具 {} 不该出现在主 agent 的 registry 里",
+                        name
+                    );
+                } else {
+                    assert!(r.get(name).is_some(), "桌面应注册 {}", name);
+                }
+            }
             #[cfg(not(desktop))]
             assert!(r.get(name).is_none(), "移动端不应注册 {}", name);
+        }
+    }
+
+    /// `local_subagent` 的可达性契约：**只有主任务**拿得到 —— 远端子 agent 与本机
+    /// 子 agent 都没有它（嵌套在工具集层面即不可能），移动端连声明都没有。
+    #[test]
+    fn local_subagent_is_main_only() {
+        let on = all_switches_on();
+        let build = |mode: RegistryMode, audience: ToolAudience| match mode {
+            RegistryMode::Plan => ToolRegistry::build_for_plan_mode(audience, &[], &on),
+            RegistryMode::Execute => ToolRegistry::build_mut_for_mode(audience, &[], &on),
+        };
+        for audience in [ToolAudience::Sub, ToolAudience::LocalSub] {
+            for mode in [RegistryMode::Plan, RegistryMode::Execute] {
+                assert!(
+                    build(mode, audience).get("local_subagent").is_none(),
+                    "{:?}/{:?} 不该有 local_subagent（禁止嵌套）",
+                    mode,
+                    audience
+                );
+            }
+        }
+        #[cfg(desktop)]
+        for mode in [RegistryMode::Plan, RegistryMode::Execute] {
+            assert!(
+                build(mode, ToolAudience::Main)
+                    .get("local_subagent")
+                    .is_some(),
+                "桌面主 agent 的 {:?} 工具集应有 local_subagent（Plan 也能派发只读本机子 agent）",
+                mode
+            );
+        }
+        #[cfg(not(desktop))]
+        assert!(
+            build(RegistryMode::Execute, ToolAudience::Main)
+                .get("local_subagent")
+                .is_none(),
+            "移动端没有本机子 agent 派发能力"
+        );
+    }
+
+    /// 本机子 agent 的收窄清单必须**覆盖全部面向机器的工具**（除豁免名单
+    /// `job_*`）：新增一个远端/双向工具、或新增一个声明了 `path_arg` / `command_arg`
+    /// 的工具却忘了加进 [`LOCAL_SUB_EXCLUDED_TOOLS`]，它就会悄悄出现在本机子 agent
+    /// 的工具集里 —— 在本机 ctx 上它要么注定失败（`connection_info` 查的是 SSH 会话，
+    /// 而本机 ctx 的 `session_id` 是哨兵 `"local"`），要么把「路径/命令」解释到错的机器上。
+    ///
+    /// 判据：`side == Remote | Both`（**都**面向机器 —— 只查 `Remote` 会漏掉 `Both`
+    /// 的 `upload_file` / `download_file`），**或**声明了参数语义
+    /// （`path_arg` / `command_arg` 非空，参数指向的是某台机器的路径/命令）。
+    /// `side == Local` 整体豁免：本机族（`local_*`）是这一侧的能力本体，它们声明的
+    /// `command_arg` / `path_arg` 指的就是这台电脑，必须保留。
+    ///
+    /// **残余（静态判据看不出来的那一类）**：`ToolSide::App`、也没声明参数语义、却
+    /// 需要真实 SSH 会话的工具 —— 目前唯一一个是 `connection_info`，靠清单里那条
+    /// 手写条目挡住（见 [`LOCAL_SUB_EXCLUDED_TOOLS`] 里它的注释）。它骗得过声明表
+    /// 是因为 `side` 只声明「作用在哪台机器」，表达不了「要拿现成会话去查」。
+    #[test]
+    fn local_sub_exclusions_cover_every_machine_facing_tool() {
+        for spec in builtin_tool_specs() {
+            // 本机族：这一侧的能力本体，语义里的路径/命令指的就是这台电脑。
+            if spec.side == ToolSide::Local {
+                continue;
+            }
+            // job_*：读的是 ctx.command_exec —— 本机 ctx 上挂的正是本机管理器。
+            if LOCAL_SUB_REMOTE_SIDE_EXCEPTIONS.contains(&spec.name) {
+                continue;
+            }
+            let machine_facing = matches!(spec.side, ToolSide::Remote | ToolSide::Both)
+                || spec.semantics.command_arg.is_some()
+                || spec.semantics.path_arg.is_some();
+            if machine_facing {
+                assert!(
+                    LOCAL_SUB_EXCLUDED_TOOLS.contains(&spec.name),
+                    "{} 面向机器（side={:?}, command_arg={:?}, path_arg={:?}），\
+                     却没有被本机子 agent 的收窄清单剔除；\
+                     新增这类工具时要同步 tools/mod.rs 的 LOCAL_SUB_EXCLUDED_TOOLS",
+                    spec.name,
+                    spec.side,
+                    spec.semantics.command_arg,
+                    spec.semantics.path_arg
+                );
+            }
+        }
+        // 清单里的每个名字都必须是真实存在的工具（防改名/删除后留下死条目，
+        // 那会让收窄静默失效）。桌面构建才有本机族与传输工具这些声明。
+        #[cfg(desktop)]
+        for name in LOCAL_SUB_EXCLUDED_TOOLS {
+            assert!(
+                builtin_tool_specs().iter().any(|s| s.name == *name),
+                "收窄清单里的 {} 不在声明表里（改名了？）",
+                name
+            );
+        }
+        // 豁免名单只允许放真正读 ctx 执行器的作业工具。
+        for name in LOCAL_SUB_REMOTE_SIDE_EXCEPTIONS {
+            assert!(
+                name.starts_with("job_"),
+                "{} 不在 job_ 作业工具之列，豁免它需要先想清楚本机子 agent 为什么需要它",
+                name
+            );
+        }
+    }
+
+    /// 本机工具的可达性契约：只有本机子 agent 拿得到，主 agent 与远端子 agent
+    /// 都拿不到；只读的两个在 Plan 模式也在，写 / 编辑只在 Execute。
+    #[test]
+    fn local_tools_are_reachable_only_by_the_local_subagent() {
+        let on = all_switches_on();
+        let local_names = [
+            "local_bash",
+            "local_read_file",
+            "local_write_file",
+            "local_edit_file",
+            "local_list_directory",
+        ];
+        // 主 agent 与远端子 agent 一律没有：本机能力只经本机子 agent 暴露。
+        for audience in [ToolAudience::Main, ToolAudience::Sub] {
+            for mode in [RegistryMode::Plan, RegistryMode::Execute] {
+                let r = ToolRegistry::build_from_specs(mode, audience, &[], &on);
+                for name in local_names {
+                    assert!(
+                        r.get(name).is_none(),
+                        "本机工具 {} 不该出现在 {:?}/{:?} 的 registry 里",
+                        name,
+                        mode,
+                        audience
+                    );
+                }
+            }
+        }
+
+        #[cfg(desktop)]
+        {
+            let exec = ToolRegistry::build_mut_for_mode(ToolAudience::LocalSub, &[], &on);
+            for name in local_names {
+                assert!(exec.get(name).is_some(), "本机子 agent 应含 {}", name);
+            }
+            // 本机命令工具的预检与远端一致：缺 description 在弹审批之前就被拦下。
+            assert!(
+                exec.get("local_bash")
+                    .expect("local_bash 已注册")
+                    .validate_arguments(&serde_json::json!({"command": "ls"}))
+                    .is_err(),
+                "local_bash 应声明预检"
+            );
+
+            let plan = ToolRegistry::build_for_plan_mode(ToolAudience::LocalSub, &[], &on);
+            for name in ["local_bash", "local_read_file", "local_list_directory"] {
+                assert!(
+                    plan.get(name).is_some(),
+                    "Plan 模式应含只读的 {}（local_bash 也可能只用来读，声明为 ALL）",
+                    name
+                );
+            }
+            for name in ["local_write_file", "local_edit_file"] {
+                assert!(
+                    plan.get(name).is_none(),
+                    "Plan 模式不应含 {}（写工具，声明为 EXECUTE）",
+                    name
+                );
+            }
         }
     }
 

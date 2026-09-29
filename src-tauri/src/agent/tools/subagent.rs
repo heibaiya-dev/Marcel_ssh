@@ -60,6 +60,14 @@ pub(crate) struct SubTaskStartEvent {
     /// 子 agent 运行模式的展示提示："plan"（只读调研）| "agent"（读写执行）。
     #[serde(default = "default_sub_mode")]
     pub mode: String,
+    /// 子 agent 在哪台机器上干活：`"local"` = 运行 Marcel SSH 的**这台电脑**
+    /// （`local_subagent`，没有 SSH 会话）。
+    ///
+    /// 远端派发不写这个字段（`None` → 序列化时整个键不出现），保持既有事件形状
+    /// 不变；前端以 `sessionId` 的哨兵值判定之外，`side` 是**权威标记**
+    /// （见 `src/lib/types.ts` 的 `SubTaskStartPayload.side`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
 }
 
 fn default_sub_mode() -> String {
@@ -80,7 +88,9 @@ impl Default for SubagentTool {
     }
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
+/// 按字符（不是字节）截断，超出时补省略号。`local_subagent` 复用同一份
+/// （两处各写一份必然在「多字节安全」这类细节上分叉）。
+pub(super) fn truncate_chars(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     if s.chars().count() > max {
         out.push('…');
@@ -99,7 +109,7 @@ fn is_plan_parent_write_subagent_blocked(
 
 /// 子 agent 的产出该如何回给父 agent。
 #[derive(Debug, Clone, PartialEq)]
-enum SubagentOutcome {
+pub(super) enum SubagentOutcome {
     /// 有实际结论文本 → 成功结果。
     Report(String),
     /// 跑完了但一个字的结论都没有（空 / 纯空白）：不是「调研结论」，
@@ -118,7 +128,10 @@ enum SubagentOutcome {
 /// 「子agent完成：…」却什么结论都没有——比明确报失败更糟（父 agent 会拿它去
 /// 编结论）。终态里的 `status` 只用来区分「取消」与「失败」（取消是用户动作，
 /// 不是失败）。
-fn classify_subagent_result(result: Option<String>, status: &AgentStatus) -> SubagentOutcome {
+pub(super) fn classify_subagent_result(
+    result: Option<String>,
+    status: &AgentStatus,
+) -> SubagentOutcome {
     match result {
         Some(text) if !text.trim().is_empty() => SubagentOutcome::Report(text),
         Some(_) => SubagentOutcome::Empty,
@@ -398,6 +411,8 @@ impl AgentTool for SubagentTool {
                     } else {
                         "plan".to_string()
                     },
+                    // 远端派发：不写 side（与既有事件形状一致）。
+                    side: None,
                 },
             );
         }
@@ -649,6 +664,7 @@ mod tests {
             connection_id: "conn-b".into(),
             session_id: "sess-b".into(),
             mode: "plan".into(),
+            side: None,
         };
         let json = serde_json::to_value(ev).unwrap();
         assert_eq!(json["type"], "subTaskStart");
@@ -659,5 +675,8 @@ mod tests {
         assert_eq!(json["connectionId"], "conn-b");
         assert_eq!(json["sessionId"], "sess-b");
         assert_eq!(json["mode"], "plan");
+        // 远端派发不写 `side`：新增字段不能改动既有事件形状（前端按
+        // `sessionId` 哨兵判定，`side` 只在本机派发时出现）。
+        assert!(json.get("side").is_none());
     }
 }

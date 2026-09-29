@@ -293,7 +293,7 @@ pub(crate) fn validate_file_name(name: &str) -> Result<(), AppError> {
 /// Resolve an absolute, not-yet-existing path by canonicalizing the nearest
 /// existing ancestor and re-appending the remaining path segments. This
 /// defeats `..` traversal and symlink-based escapes for the existing portion.
-fn resolve_against_ancestors(p: &Path) -> Result<PathBuf, AppError> {
+pub(crate) fn resolve_against_ancestors(p: &Path) -> Result<PathBuf, AppError> {
     if !p.is_absolute() {
         return Err(AppError::Agent("local path must be absolute".into()));
     }
@@ -365,8 +365,13 @@ fn resolve_against_ancestors(p: &Path) -> Result<PathBuf, AppError> {
 }
 
 /// True if `p` equals or falls under any blacklisted prefix.
-fn blacklisted(p: &Path, blacklist: &[PathBuf]) -> bool {
-    blacklist.iter().any(|bad| p.starts_with(bad))
+///
+/// 两侧一律经 [`path_key`] 归一后再比：Windows 上黑名单条目与待检路径可能
+/// 一个是 canonical（`\\?\`）形态、一个是原样形态，大小写也可能不同，
+/// 直接 `starts_with` 会让黑名单静默失效。
+pub(crate) fn blacklisted(p: &Path, blacklist: &[PathBuf]) -> bool {
+    let key = path_key(p);
+    blacklist.iter().any(|bad| key.starts_with(path_key(bad)))
 }
 
 /// Validate a download target. Returns the canonical-ish resolved path.
@@ -476,7 +481,7 @@ async fn validate_local_upload_path(p: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn local_file_size(p: &Path) -> Result<u64, AppError> {
+pub(crate) async fn local_file_size(p: &Path) -> Result<u64, AppError> {
     let meta = fs::metadata(p)
         .await
         .map_err(|e| AppError::Agent(format!("local file inaccessible: {}", e)))?;
@@ -1083,7 +1088,10 @@ impl Default for DownloadFileTool {
 
 /// Ensure the target's parent directories exist, auto-creating them as
 /// needed. Rejects parents that fall under a protected system location.
-async fn ensure_parent_creatable(resolved: &Path, policy: &LocalPathPolicy) -> Result<(), String> {
+pub(crate) async fn ensure_parent_creatable(
+    resolved: &Path,
+    policy: &LocalPathPolicy,
+) -> Result<(), String> {
     let Some(parent) = resolved.parent() else {
         return Ok(());
     };

@@ -52,18 +52,36 @@ pub enum AgentRole {
     Main,
     /// 子任务：由 `subagent` 工具派发的调研子 agent。
     Sub { parent_task_id: String },
+    /// **本机子 agent**：由 `local_subagent` 工具派发、在**用户自己这台电脑**上
+    /// 干活的子 agent（桌面专属）。
+    ///
+    /// 与 `Sub` 的差别只有执行侧（工具集、ctx、目标机器），见 [`audience_of`] 与
+    /// `agent_loop` 的本机 ctx 分支；生命周期、级联取消、`read_history(scope=parent)`
+    /// 的窗口冻结与 `Sub` 完全一致 —— 它同样有 `parent_task_id`。
+    LocalSub { parent_task_id: String },
 }
 
 impl AgentRole {
+    /// 是不是子 agent（`Sub` 与 `LocalSub` 都是：跳过完成通知、不进对话列表的
+    /// 「主任务」语义、插件 / MCP / 多机一律不加载）。
     fn is_subtask(&self) -> bool {
-        matches!(self, AgentRole::Sub { .. })
+        matches!(self, AgentRole::Sub { .. } | AgentRole::LocalSub { .. })
     }
 
     fn parent_task_id(&self) -> Option<&str> {
         match self {
-            AgentRole::Sub { parent_task_id } => Some(parent_task_id),
+            AgentRole::Sub { parent_task_id } | AgentRole::LocalSub { parent_task_id } => {
+                Some(parent_task_id)
+            }
             AgentRole::Main => None,
         }
+    }
+
+    /// 这个角色的 ctx 是否指向**用户自己这台电脑**（而不是 SSH 会话那台服务器）。
+    /// 由 `spawn` 写进 [`LoopContext::local_side`]，agent loop 据此把 ctx 挂上
+    /// `AppState.local_command_exec` 并置 `local_side = true`。
+    fn is_local_side(&self) -> bool {
+        matches!(self, AgentRole::LocalSub { .. })
     }
 }
 
@@ -594,6 +612,9 @@ impl AgentManager {
             cancel_rx: cancel_registration.receiver(),
             config_dir: self.state.config_dir.clone(),
             is_subtask: spec.role.is_subtask(),
+            // 本机子 agent：目标机器是用户自己这台电脑 —— agent loop 据此把
+            // `ToolContext` 挂上 `AppState.local_command_exec` 并置 `local_side`。
+            local_side: spec.role.is_local_side(),
             prompt_origin: spec.prompt_origin,
         };
 
@@ -644,6 +665,9 @@ impl AgentManager {
     }
 
     /// 按模式派生工具集（含插件/MCP 注册）。
+    ///
+    /// 「谁能拿到哪些内置工具」的收敛发生在 [`build_role_registry`]（角色 × 模式 +
+    /// 本机收窄）；这里只负责**主任务的生态**：插件工具与 MCP 工具。
     async fn build_registry(
         &self,
         role: &AgentRole,
@@ -653,54 +677,42 @@ impl AgentManager {
         experimental_settings: &ExperimentalSettings,
         plugin_registry: &PluginRegistry,
     ) -> Arc<ToolRegistry> {
-        match mode {
-            AgentMode::Plan => Arc::new(build_plan_registry(
-                role,
-                enabled_skills,
-                experimental_settings,
-            )),
-            AgentMode::Agent | AgentMode::Auto => {
-                let mut registry = ToolRegistry::build_mut_for_mode(
-                    audience_of(role),
-                    enabled_skills,
-                    experimental_settings,
-                );
-                // 子 agent 只携带核心读写工具，不加载插件生态，也不去刷新 MCP
-                // server（省一次无谓连接）—— 与只读 Plan 子 agent 一致，提示词里
-                // 的工具列表不会说谎。主任务（role=Main）插件/MCP 全套保留。
-                //
-                // 「子 agent 没有 subagent / plan 三件套」这一条不在本处删减：
-                // 它由工具声明表的 `ToolRoles::MainOnly` 表达，见
-                // `tools/mod.rs` 的 `BUILTIN_TOOLS_COMMON`。
-                if !role.is_subtask() {
-                    let manifests = plugin_registry.enabled_manifests();
-                    for m in &manifests {
-                        register_plugin_tools(&mut registry, &m.id, &m.agent_tools);
+        let mut registry = build_role_registry(role, mode, enabled_skills, experimental_settings);
+        // 子 agent 只携带核心读写工具，不加载插件生态，也不去刷新 MCP
+        // server（省一次无谓连接）—— 与只读 Plan 子 agent 一致，提示词里
+        // 的工具列表不会说谎。主任务（role=Main）插件/MCP 全套保留。
+        //
+        // 本机子 agent 是 `is_subtask()`：这条门控天然把它挡在外面（它拿不到插件
+        // 与 MCP 工具，也就没有任何绕过本机工具集的路径）。
+        //
+        // 「子 agent 没有 subagent / plan 三件套」这一条不在本处删减：
+        // 它由工具声明表的 `ToolRoles::MainOnly` 表达，见
+        // `tools/mod.rs` 的 `BUILTIN_TOOLS_COMMON`。
+        if !role.is_subtask() {
+            let manifests = plugin_registry.enabled_manifests();
+            for m in &manifests {
+                register_plugin_tools(&mut registry, &m.id, &m.agent_tools);
+            }
+            let mut set = tokio::task::JoinSet::new();
+            for server in enabled_mcp_servers {
+                let mgr = self.state.mcp_manager.clone();
+                let server = server.clone();
+                set.spawn(async move {
+                    let result = mgr.refresh_tools(&server).await;
+                    (server, result)
+                });
+            }
+            while let Some(result) = set.join_next().await {
+                match result {
+                    Ok((server, Ok(tools))) => register_mcp_tools(&mut registry, &server, tools),
+                    Ok((server, Err(err))) => {
+                        log::warn!("刷新 MCP tools 失败 [{}]: {}", server.name, err)
                     }
-                    let mut set = tokio::task::JoinSet::new();
-                    for server in enabled_mcp_servers {
-                        let mgr = self.state.mcp_manager.clone();
-                        let server = server.clone();
-                        set.spawn(async move {
-                            let result = mgr.refresh_tools(&server).await;
-                            (server, result)
-                        });
-                    }
-                    while let Some(result) = set.join_next().await {
-                        match result {
-                            Ok((server, Ok(tools))) => {
-                                register_mcp_tools(&mut registry, &server, tools)
-                            }
-                            Ok((server, Err(err))) => {
-                                log::warn!("刷新 MCP tools 失败 [{}]: {}", server.name, err)
-                            }
-                            Err(join_err) => log::warn!("MCP 刷新任务 panic: {}", join_err),
-                        }
-                    }
+                    Err(join_err) => log::warn!("MCP 刷新任务 panic: {}", join_err),
                 }
-                Arc::new(registry)
             }
         }
+        Arc::new(registry)
     }
 
     /// 主任务：从 SQLite 恢复该 conversation 最近一条 plan 挂到新 task。
@@ -764,12 +776,50 @@ fn build_plan_registry(
 }
 
 /// `AgentRole` → 工具层可见性角色。
+///
+/// 穷尽 `match` 是刻意的：新增角色时这里必须显式回答「它的工具集面向谁」，
+/// 不会被 `_ =>` 悄悄继承成 Main。
 fn audience_of(role: &AgentRole) -> crate::agent::tools::ToolAudience {
-    if role.is_subtask() {
-        crate::agent::tools::ToolAudience::Sub
-    } else {
-        crate::agent::tools::ToolAudience::Main
+    match role {
+        AgentRole::Main => crate::agent::tools::ToolAudience::Main,
+        AgentRole::Sub { .. } => crate::agent::tools::ToolAudience::Sub,
+        AgentRole::LocalSub { .. } => crate::agent::tools::ToolAudience::LocalSub,
     }
+}
+
+/// 按「角色 × 模式」派生 registry（含本机子 agent 的收窄）。
+///
+/// 抽成自由函数便于单测：`build_registry` 还要注册插件 / MCP 工具，那种依赖整个
+/// `AppState` 与真实的 PluginRegistry，测不了；而「本机子 agent 的工具集必须没有
+/// 远端语义工具」正是最需要钉住的那条。
+///
+/// 收窄只对本机角色发生：`ToolRegistry::remove` 按名字剔（清单与理由见
+/// [`crate::agent::tools::LOCAL_SUB_EXCLUDED_TOOLS`]）——`roles` 这一维表达不了
+/// 「`Both` 里哪些是远端语义」，`side` 声明也没法在这里按角色过滤。
+///
+/// **Plan 模式同样收窄**：Plan 的 `build_for_plan_mode` 会放进 `read_file` /
+/// `list_directory` / `search_files` / `system_info` 这些远端只读工具，对本机子
+/// agent 全是错的机器。
+fn build_role_registry(
+    role: &AgentRole,
+    mode: &AgentMode,
+    enabled_skills: &[crate::skills::store::Skill],
+    experimental_settings: &ExperimentalSettings,
+) -> ToolRegistry {
+    let mut registry = match mode {
+        AgentMode::Plan => build_plan_registry(role, enabled_skills, experimental_settings),
+        AgentMode::Agent | AgentMode::Auto => ToolRegistry::build_mut_for_mode(
+            audience_of(role),
+            enabled_skills,
+            experimental_settings,
+        ),
+    };
+    if role.is_local_side() {
+        for name in crate::agent::tools::LOCAL_SUB_EXCLUDED_TOOLS {
+            registry.remove(name);
+        }
+    }
+    registry
 }
 
 fn build_definitions(registry: &Arc<ToolRegistry>, mode: &AgentMode) -> Vec<ToolDefinition> {
@@ -1345,6 +1395,143 @@ mod tests {
             registry.get("subagent").is_none(),
             "子agent（Plan 只读）不应注册 subagent 工具，保证子agent 不派发子agent"
         );
+    }
+
+    /// 角色 → 工具层可见性角色的映射（新增角色必须显式回答「面向谁」）。
+    #[test]
+    fn audience_maps_every_role() {
+        use crate::agent::tools::ToolAudience;
+        assert_eq!(audience_of(&AgentRole::Main), ToolAudience::Main);
+        assert_eq!(
+            audience_of(&AgentRole::Sub {
+                parent_task_id: "p".into()
+            }),
+            ToolAudience::Sub
+        );
+        assert_eq!(
+            audience_of(&AgentRole::LocalSub {
+                parent_task_id: "p".into()
+            }),
+            ToolAudience::LocalSub
+        );
+    }
+
+    /// 子 agent 语义（看护站：完成通知 / 插件 / MCP / 多机一律按「子」处理）。
+    #[test]
+    fn local_sub_is_a_subtask_with_a_parent() {
+        let role = AgentRole::LocalSub {
+            parent_task_id: "parent-1".to_string(),
+        };
+        assert!(role.is_subtask(), "本机子 agent 同样是子 agent");
+        assert_eq!(role.parent_task_id(), Some("parent-1"));
+        assert!(role.is_local_side(), "本机子 agent 的 ctx 指向这台电脑");
+        assert!(!AgentRole::Main.is_local_side());
+        assert!(!AgentRole::Sub {
+            parent_task_id: "p".into()
+        }
+        .is_local_side());
+    }
+
+    /// 本机子 agent 的 registry 收窄（Plan 与 Execute 两条模式都要收）：
+    /// 远端语义工具与一切编排工具都不许出现；本机族、作业出口、回读历史、
+    /// 提问必须留下。
+    ///
+    /// 桌面专属：本机族工具（`local_*`）与传输工具在移动端连声明都没有，
+    /// 本机子 agent 本身也是桌面能力。
+    #[cfg(desktop)]
+    #[test]
+    fn local_sub_registry_is_narrowed_to_local_semantics() {
+        let parent = AgentRole::LocalSub {
+            parent_task_id: "parent-1".to_string(),
+        };
+        let mut narrowed = vec![];
+        for mode in [AgentMode::Plan, AgentMode::Agent, AgentMode::Auto] {
+            narrowed.push(build_role_registry(&parent, &mode, &[], &exp()));
+        }
+        for registry in &narrowed {
+            for absent in [
+                // 远端命令 / 文件 / 系统信息
+                "bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "list_directory",
+                "search_files",
+                "system_info",
+                "connection_info",
+                // 本机 ↔ 远端搬运
+                "upload_file",
+                "download_file",
+                // 编排（含本机派发入口自己：禁止嵌套）
+                "subagent",
+                "local_subagent",
+                "create_plan",
+                "update_plan_item",
+                "edit_plan",
+            ] {
+                assert!(
+                    registry.get(absent).is_none(),
+                    "本机子 agent 不该拿到 {}",
+                    absent
+                );
+            }
+            for present in [
+                // 本机能力本体（Plan 模式下写 / 编辑本来就不在，逐模式另测）
+                "local_bash",
+                "local_read_file",
+                "local_list_directory",
+                // 作业出口：读的就是 ctx.command_exec（本机 ctx 上即本机管理器），
+                // `local_bash` 后台作业的唯一出口
+                "job_output",
+                "job_kill",
+                "job_list",
+                // 回读父会话派发它时的上下文 / 向用户提问
+                "read_history",
+                "ask_user",
+            ] {
+                assert!(
+                    registry.get(present).is_some(),
+                    "本机子 agent 应保留 {}",
+                    present
+                );
+            }
+        }
+        // 写 / 编辑：只在 Execute 侧出现（声明为 EXECUTE），与远端口径一致。
+        let exec = build_role_registry(&parent, &AgentMode::Agent, &[], &exp());
+        for name in ["local_write_file", "local_edit_file"] {
+            assert!(exec.get(name).is_some(), "读写本机子 agent 应含 {}", name);
+        }
+        let plan = build_role_registry(&parent, &AgentMode::Plan, &[], &exp());
+        for name in ["local_write_file", "local_edit_file"] {
+            assert!(plan.get(name).is_none(), "只读本机子 agent 不该有 {}", name);
+        }
+    }
+
+    /// 收窄**只**发生在本机角色上：远端主 / 子 agent 的工具集一个都不能少
+    /// （这条防的是「收窄顺手写成了对所有角色生效」）。
+    #[test]
+    fn narrowing_does_not_touch_remote_roles() {
+        for (role, mode) in [
+            (AgentRole::Main, AgentMode::Agent),
+            (
+                AgentRole::Sub {
+                    parent_task_id: "p".into(),
+                },
+                AgentMode::Agent,
+            ),
+            (AgentRole::Main, AgentMode::Plan),
+        ] {
+            let registry = build_role_registry(&role, &mode, &[], &exp());
+            for name in ["bash", "read_file"] {
+                assert!(
+                    registry.get(name).is_some(),
+                    "{:?}/{:?} 应保留 {}",
+                    role,
+                    mode,
+                    name
+                );
+            }
+        }
     }
 
     #[test]

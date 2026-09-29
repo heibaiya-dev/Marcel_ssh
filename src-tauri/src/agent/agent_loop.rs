@@ -241,6 +241,13 @@ pub(crate) struct LoopContext {
     /// 子agent（subagent 工具派发的调研任务）标记：跳过系统通知，
     /// 避免子agent完成/失败与主任务的通知叠加打扰用户。
     pub is_subtask: bool,
+    /// **本机侧标记**：这个任务的目标机器是用户自己这台电脑（本机子 agent，
+    /// 由 `AgentRole::LocalSub` 在 manager 里置位）。
+    ///
+    /// 只用在本工具 ctx 的构造分支上（见 `execute_single_tool`）：置位时 ctx 挂
+    /// `AppState.local_command_exec` 且 `local_side = true`，于是 `local_bash` 与
+    /// 本机文件工具打的是这台电脑；不置位时一行行为都不变。
+    pub local_side: bool,
     /// 本轮 prompt 的来源（用户输入 / 作业结算告知）。决定它落库的身份，
     /// 以及这一轮是不是「唤醒轮」（唤醒轮不触发计划收尾提醒——那个标记按
     /// 任务算，唤醒一次就重来一遍，会把模型念烦）。
@@ -284,6 +291,7 @@ pub(crate) async fn run_agent_loop(
         mut cancel_rx,
         config_dir,
         is_subtask,
+        local_side,
         prompt_origin,
     } = ctx;
 
@@ -373,6 +381,12 @@ pub(crate) async fn run_agent_loop(
         jev_cfg,
     );
 
+    // 设置快照的共享句柄：dispatcher 的审批判定用的是上面那份 `agent_settings.clone()`
+    // （任务启动时读的一次），工具 ctx 也拿同一份 —— `local_subagent` 要在自己内部
+    // 重算一遍「dispatcher 问不问」（补问面恰好是它不问的组合），两处输入必须是同一个
+    // 值，否则任务中途改设置会让两边错位（重复问 / 谁都不问）。
+    let agent_settings_snapshot = std::sync::Arc::new(agent_settings.clone());
+
     'round: for round in 0..max_rounds {
         log::info!("Agent {} round {}", task_id, round);
 
@@ -453,8 +467,9 @@ pub(crate) async fn run_agent_loop(
         let evn = event_name.clone();
         // 本轮 provider 是否报了用量（以及报了什么）：流结束时据此决定
         // 「精确值」还是「本地估算」，见下面的 ContextUsage。
-        let round_usage: std::sync::Arc<std::sync::Mutex<Option<crate::llm::provider::TokenUsage>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let round_usage: std::sync::Arc<
+            std::sync::Mutex<Option<crate::llm::provider::TokenUsage>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
         let round_usage_fwd = round_usage.clone();
         let forwarder = tokio::spawn(async move {
             // 跨片状态必须活到整条流结束（标签字面量会被分片切开，见
@@ -887,10 +902,13 @@ pub(crate) async fn run_agent_loop(
                     let cdir = &config_dir;
                     let reg = &registry;
                     let msgs = &messages;
+                    let local = local_side;
+                    let asnap = &agent_settings_snapshot;
                     futures.push(async move {
                         let _permit = sem.acquire().await.ok();
                         execute_single_tool(
                             idx, tc, disp, s_ssh, sid, tid, cid, evn, a, st, cdir, reg, msgs,
+                            local, asnap,
                         )
                         .await
                     });
@@ -918,6 +936,8 @@ pub(crate) async fn run_agent_loop(
                         &config_dir,
                         &registry,
                         &messages,
+                        local_side,
+                        &agent_settings_snapshot,
                     )
                     .await;
                     if res.was_cancelled_or_aborted {
@@ -1084,28 +1104,41 @@ async fn execute_single_tool(
     config_dir: &std::path::Path,
     registry: &ToolRegistry,
     messages: &[LlmMessage],
+    local_side: bool,
+    agent_settings: &std::sync::Arc<AgentModeSettings>,
 ) -> SingleToolExecution {
     let tool_ctx = {
         let settings = state.settings.read().await;
-        let policy =
-            std::sync::Arc::new(crate::agent::risk::SecurityPolicy::from_user_settings(
-                &settings.custom_protected_paths,
-                settings.command_timeout_secs,
-            ));
-        ToolContext::new(
+        let policy = std::sync::Arc::new(crate::agent::risk::SecurityPolicy::from_user_settings(
+            &settings.custom_protected_paths,
+            settings.command_timeout_secs,
+        ));
+        let ctx = ToolContext::new(
             ssh.clone(),
             session_id.to_string(),
             conversation_id,
             app.clone(),
         )
-            .with_policy(policy)
-            .with_owner_conversation(owner_conversation_for(state, task_id, conversation_id))
-            .with_task_id(task_id)
-            .with_tool_call_id(&tc.id)
-            .with_event_name(event_name)
-            .with_config_dir(config_dir.to_path_buf())
-            .with_local_handlers(registry.local_handlers_arc())
-            .with_command_exec(state.command_exec.clone())
+        .with_policy(policy)
+        .with_owner_conversation(owner_conversation_for(state, task_id, conversation_id))
+        .with_task_id(task_id)
+        .with_tool_call_id(&tc.id)
+        .with_event_name(event_name)
+        .with_config_dir(config_dir.to_path_buf())
+        .with_local_handlers(registry.local_handlers_arc())
+        .with_agent_mode_settings(agent_settings.clone());
+        // 命令执行管理器按**任务的目标机器**分流：本机子 agent 挂本机管理器并置
+        // `local_side`（`local_bash` 的最后一道闸门，见 `ToolContext::with_local_side`），
+        // 其余任务一字不变地挂远端管理器。
+        //
+        // 只在这里分流（而不是让工具自己判断）是刻意的：拿错 ctx 会把「本机命令」
+        // 顺着 SSH 打到服务器上，路由依据必须是组装处的事实，不能是模型给的参数。
+        if local_side {
+            ctx.with_command_exec(state.local_command_exec.clone())
+                .with_local_side(true)
+        } else {
+            ctx.with_command_exec(state.command_exec.clone())
+        }
     };
 
     if is_task_cancelled(state, task_id) {
