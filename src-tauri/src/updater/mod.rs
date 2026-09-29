@@ -286,6 +286,10 @@ async fn tick(app: &AppHandle) {
         }
     }
 
+    // 安装包可能已被系统清理（缓存目录由系统回收）：状态与磁盘不一致时收回 Idle，
+    // 别让前端一直挂着一个点了没反应的「已就绪」。
+    reset_stale_ready(app);
+
     // 自动下载的三个前提：模式是「自动更新」、平台支持后台下载、当前网络允许。
     // Android 只在非计量网络下自动下载（移动数据上静默消耗几十 MB 是用户
     // 无法预料的代价）；手动触发（start_update_download）不受这些限制。
@@ -486,13 +490,74 @@ pub fn on_update_mode_changed(app: &AppHandle, previous: UpdateMode, next: Updat
     });
 }
 
+/// 待装安装包是否还在磁盘上。
+///
+/// `Ready` 状态与 `pending` 都只是内存里的一份记录，安装包本体在缓存目录里 ——
+/// 那个目录会被系统回收（Android 的 cacheDir 在存储紧张时由系统清理，桌面上
+/// 各种磁盘清理工具也会清掉应用缓存）。文件没了之后 `Ready` 就是过期状态。
+fn pending_installer_available(pending: Option<&PendingInstall>) -> bool {
+    pending.map(|p| p.installer_path.is_file()).unwrap_or(false)
+}
+
+/// `Ready` 是否已经过期（安装包不在磁盘上）。
+///
+/// 过期之后两条路都会坏掉：拉安装器只会静默失败（Android 报「安装包不存在」，
+/// Windows 更糟 —— 直接退出应用却什么都没装），而「后台下载」又把它当成「已就绪」
+/// 的幂等 no-op 吞掉（前端还当成功）。用户唯一的出路是重启应用。
+fn ready_is_stale(state: &UpdateState, pending: Option<&PendingInstall>) -> bool {
+    matches!(state, UpdateState::Ready { .. }) && !pending_installer_available(pending)
+}
+
+/// 把过期的 `Ready` 收回 `Idle`（清掉 pending）；状态没过期时什么都不做，返回
+/// `false`。状态与磁盘的一致性由这一处保证，调用方只管在动作之前调它。
+///
+/// 只收状态、**不抢跑下载**：接下来照常走既有的检查/下载路径（自动行为交给下一个
+/// `tick`，手动行为交给用户点的那次「后台下载」）。
+fn reset_stale_ready(app: &AppHandle) -> bool {
+    let mut reset = false;
+    apply_state(app, |inner| {
+        // 双检：apply_state 的闭包在锁内执行，因此这里的判定与写入是原子的
+        // （另一条线程刚下好新包并落 Ready 时不会被误收）。
+        if !ready_is_stale(&inner.state, inner.pending.as_ref()) {
+            return None;
+        }
+        if let Some(p) = &inner.pending {
+            log::warn!(
+                "已就绪的安装包已不在磁盘上（可能被系统清理），收回就绪状态: {}",
+                p.installer_path.display()
+            );
+        }
+        inner.pending = None;
+        reset = true;
+        Some(UpdateState::Idle)
+    });
+    reset
+}
+
+/// 已就绪的包是否覆盖得上这次检查到的最新版本（同版本或更新 = 无需重下）。
+///
+/// 版本号解析不了时按「覆盖」处理：宁可维持原有的幂等 no-op，也不要凭一句解析
+/// 不了就重下几十 MB。
+fn ready_covers_offer(ready_version: &str, offer_version: &str) -> bool {
+    match (
+        semver::Version::parse(ready_version),
+        semver::Version::parse(offer_version),
+    ) {
+        (Ok(ready), Ok(offer)) => ready >= offer,
+        _ => true,
+    }
+}
+
 /// 手动触发下载（设置页「检查更新」有结果后的「后台下载」按钮；手机端
 /// 也用于用户明确要求在移动数据下下载）。
 /// 重新检查一次 latest.json 以取得直链等字段，避免跨 command 传大状态。
 /// 注意：**不受更新方式限制** —— 这是用户当面点的动作，更新方式管的是
 /// 「自动行为」（是否自动检查、自动下载、退出自动安装）。
 pub async fn start_update_download_impl(app: &AppHandle) -> Result<(), AppError> {
-    {
+    // 安装包被系统清理时，Ready 只是过期记录：先收回 Idle，否则后面无论检查
+    // 成不成功都不会真的下载（Ready 分支直接 return Ok）。
+    reset_stale_ready(app);
+    let ready_version: Option<String> = {
         let state = app.state::<UpdaterState>();
         let inner = state
             .0
@@ -501,10 +566,11 @@ pub async fn start_update_download_impl(app: &AppHandle) -> Result<(), AppError>
         if inner.downloading {
             return Ok(()); // 幂等：已在下载
         }
-        if matches!(inner.state, UpdateState::Ready { .. }) {
-            return Ok(()); // 已就绪待装，无需重复下载
+        match &inner.state {
+            UpdateState::Ready { version } => Some(version.clone()),
+            _ => None,
         }
-    }
+    };
 
     if crate::commands::update::install_kind() == crate::commands::update::InstallKind::None {
         return Err(AppError::Other(
@@ -514,6 +580,19 @@ pub async fn start_update_download_impl(app: &AppHandle) -> Result<(), AppError>
 
     let current_version = app.package_info().version.to_string();
     let offer = check_for_update().await?;
+    // 已就绪的包不比最新版旧 → 幂等 no-op（原语义：无需重复下载）。但已就绪的
+    // 版本**低于**最新版时必须继续往下走去下载新版本 —— 不能被一句「已就绪」
+    // 静默吞掉：设置页发现更新版本时给的正是「后台下载」。
+    if let Some(ready) = ready_version {
+        if ready_covers_offer(&ready, &offer.version) {
+            return Ok(());
+        }
+        log::info!(
+            "已就绪的版本 {} 低于最新版本 {}，重新下载",
+            ready,
+            offer.version
+        );
+    }
     let lat = semver::Version::parse(&offer.version).ok();
     let cur = semver::Version::parse(&current_version).ok();
     let has_update = matches!((cur, lat), (Some(c), Some(l)) if l > c);
@@ -544,6 +623,15 @@ pub async fn get_update_state_impl(app: &AppHandle) -> Result<UpdateState, AppEr
 /// - Windows：退出应用，退出钩子静默安装并自动重启到新版本；
 /// - Android：拉起系统安装器，由用户在系统界面确认。
 pub async fn install_update_now_impl(app: &AppHandle) -> Result<(), AppError> {
+    // 安装包可能已被系统清理（见 `reset_stale_ready`）：先收回过期的就绪状态再
+    // 往下走，否则会拿着一个不存在的路径去拉安装器 —— Android 报「安装包不存在」，
+    // Windows 更糟（`launch_now` 直接 exit(0)，安装器没起来、应用却已经关了）。
+    // 收回后前端会收到 Idle，「后台下载」按钮随之回来，用户当场就能重下。
+    if reset_stale_ready(app) {
+        return Err(AppError::Other(
+            "安装包已不在磁盘上（可能被系统清理），请重新下载更新".into(),
+        ));
+    }
     let pending = {
         let state = app.state::<UpdaterState>();
         let inner = state
@@ -603,49 +691,72 @@ fn start_download(app: &AppHandle, offer: LatestRelease) -> bool {
 
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let version_for_state = offer.version.clone();
-        match run_download(&handle, &offer).await {
-            Ok(DownloadOutcome::Done(path)) => {
-                log::info!("更新包就绪: {}", path.display());
-                let version = version_for_state;
-                apply_state(&handle, |inner| {
-                    inner.pending = Some(PendingInstall {
-                        version: version.clone(),
-                        installer_path: path.clone(),
-                    });
-                    // 清掉可能刚落下的取消请求：包已经完整下好并校验通过，
-                    // 留着会把下一次下载掐死在第一个 chunk。
-                    inner.cancel_requested = false;
-                    Some(UpdateState::Ready { version })
-                });
-            }
-            Ok(DownloadOutcome::Cancelled) => {
-                // 用户把更新方式切成了「关闭」：run_download 已删掉 .part，
-                // 状态也已由 retract_for_off 收回 Idle —— 这里只复位下载标志，
-                // **不写 Failed**（没出错，别拿红色提示吓人）。
-                log::info!("更新下载已按用户要求停止（更新方式切为关闭）");
-                reset_downloading(&handle);
-                return;
-            }
-            Err(msg) => {
-                log::warn!("自动更新下载失败: {}", msg);
-                // 清掉残留 .part，目录回到只剩可用文件的状态
-                if let Ok(dir) = update_dir(&handle) {
-                    let part = format!("{}.part", installer_file_name(&offer.version));
-                    let _ = std::fs::remove_file(dir.join(part));
-                }
-                apply_state(&handle, |inner| {
-                    inner.downloading = false;
-                    inner.cancel_requested = false;
-                    Some(UpdateState::Failed { message: msg })
-                });
-                return;
-            }
+        // 下载任务里的任何 panic 都必须在这里兜住：`downloading` 槽位是「有没有
+        // 下载在跑」的唯一依据，被 panic 带走就永远是 true —— `tick` 每个周期都
+        // 在早退、设置页的「后台下载」也把它当幂等 no-op 静默吞掉，更新器在主进程
+        // 生命周期内静默停摆（连失败提示都不会有）。与 `tick` 的 catch_unwind 同
+        // 一个理由。捕获后按「下载失败」落状态：槽位复位，下个周期自动重试。
+        let result = std::panic::AssertUnwindSafe(run_download_task(&handle, &offer))
+            .catch_unwind()
+            .await;
+        if result.is_err() {
+            log::error!("更新下载任务异常（已捕获），复位下载槽位");
+            apply_state(&handle, |inner| {
+                inner.downloading = false;
+                inner.cancel_requested = false;
+                Some(UpdateState::Failed {
+                    message: "更新下载异常中断，将在下次检查时自动重试".into(),
+                })
+            });
         }
-        // 成功路径的 downloading 复位
-        reset_downloading(&handle);
     });
     true
+}
+
+/// 下载任务主体（`start_download` 真正 spawn 的那段）。任何**正常**退出路径都
+/// 复位下载槽位；panic 由外层的 catch_unwind 兜住。
+async fn run_download_task(app: &AppHandle, offer: &LatestRelease) {
+    let version_for_state = offer.version.clone();
+    match run_download(app, offer).await {
+        Ok(DownloadOutcome::Done(path)) => {
+            log::info!("更新包就绪: {}", path.display());
+            let version = version_for_state;
+            apply_state(app, |inner| {
+                inner.pending = Some(PendingInstall {
+                    version: version.clone(),
+                    installer_path: path.clone(),
+                });
+                // 清掉可能刚落下的取消请求：包已经完整下好并校验通过，
+                // 留着会把下一次下载掐死在第一个 chunk。
+                inner.cancel_requested = false;
+                Some(UpdateState::Ready { version })
+            });
+        }
+        Ok(DownloadOutcome::Cancelled) => {
+            // 用户把更新方式切成了「关闭」：run_download 已删掉 .part，
+            // 状态也已由 retract_for_off 收回 Idle —— 这里只复位下载标志，
+            // **不写 Failed**（没出错，别拿红色提示吓人）。
+            log::info!("更新下载已按用户要求停止（更新方式切为关闭）");
+            reset_downloading(app);
+            return;
+        }
+        Err(msg) => {
+            log::warn!("自动更新下载失败: {}", msg);
+            // 清掉残留 .part，目录回到只剩可用文件的状态
+            if let Ok(dir) = update_dir(app) {
+                let part = format!("{}.part", installer_file_name(&offer.version));
+                let _ = std::fs::remove_file(dir.join(part));
+            }
+            apply_state(app, |inner| {
+                inner.downloading = false;
+                inner.cancel_requested = false;
+                Some(UpdateState::Failed { message: msg })
+            });
+            return;
+        }
+    }
+    // 成功路径的 downloading 复位
+    reset_downloading(app);
 }
 
 /// 复位下载标志（不动状态）。
@@ -1526,5 +1637,80 @@ mod tests {
             !inner.try_reserve_download(),
             "进度更新不得放第二个任务进来"
         );
+    }
+
+    // ── 就绪态与磁盘上安装包的一致性 ──
+    //
+    // 缓存目录会被系统回收（Android 的 cacheDir / 桌面的磁盘清理工具），而
+    // `Ready` + `pending` 只是内存里的一份记录：文件没了之后「立即安装」只会
+    // 静默失败、「后台下载」又被当成幂等 no-op 吞掉，用户唯一的出路是重启应用。
+
+    #[test]
+    fn stale_ready_is_detected_when_installer_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Marcel-SSH_1.5.0_x64-setup.exe");
+        let ready = UpdateState::Ready {
+            version: "1.5.0".into(),
+        };
+        let install = PendingInstall {
+            version: "1.5.0".into(),
+            installer_path: path.clone(),
+        };
+
+        // 文件不在 → 就绪态过期
+        assert!(ready_is_stale(&ready, Some(&install)));
+        // 文件在 → 就绪态有效
+        write_file(&path, b"installer");
+        assert!(!ready_is_stale(&ready, Some(&install)));
+    }
+
+    /// 只有「Ready + 文件不在」才算过期：别的状态与别的组合一律不得被动过
+    /// （禁止把兼容实现成「没事就清空」）。
+    #[test]
+    fn stale_ready_never_touches_other_states() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("x.exe");
+        let install = PendingInstall {
+            version: "1.5.0".into(),
+            installer_path: path,
+        };
+        assert!(!ready_is_stale(&UpdateState::Idle, None));
+        assert!(!ready_is_stale(&UpdateState::Idle, Some(&install)));
+        assert!(!ready_is_stale(
+            &UpdateState::Available {
+                version: "1.5.0".into(),
+                release_url: "https://example.com".into(),
+            },
+            Some(&install),
+        ));
+        assert!(!ready_is_stale(
+            &UpdateState::Downloading {
+                version: "1.5.0".into(),
+                downloaded: 1,
+                total: 2,
+            },
+            None,
+        ));
+        assert!(!ready_is_stale(
+            &UpdateState::Failed {
+                message: "x".into()
+            },
+            None,
+        ));
+        // 文件在时，Ready + 无 pending 也不算过期（留给下载/清理路径处理）
+        assert!(!pending_installer_available(None));
+    }
+
+    /// 已就绪的包只在「不比最新版旧」时才算无需重下：更旧的必须放行去重下，
+    /// 否则设置页在发现新版本后给的「后台下载」是个静默 no-op。
+    #[test]
+    fn ready_covers_offer_only_when_not_older() {
+        assert!(ready_covers_offer("1.5.0", "1.5.0"));
+        assert!(ready_covers_offer("1.6.0", "1.5.0"));
+        assert!(!ready_covers_offer("1.5.0", "1.6.0"));
+        assert!(!ready_covers_offer("1.4.9", "1.5.0"));
+        // 解析不了 → 维持旧的幂等行为（不重下几十 MB）
+        assert!(ready_covers_offer("not-a-version", "1.6.0"));
+        assert!(ready_covers_offer("1.5.0", "not-a-version"));
     }
 }

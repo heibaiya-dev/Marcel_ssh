@@ -6,6 +6,7 @@ import type { UpdateCheckResult } from '@/lib/types';
 import { getErrorMessage } from '@/lib/errors';
 import { openExternalLink, SUPPORT_URL } from '@/lib/externalLinks';
 import { updatePercent } from '@/lib/updateProgress';
+import { compareVersions } from '@/lib/semver';
 import { APP_LOGO, APP_NAME } from '@/lib/constants';
 import {
   availableUpdateModes,
@@ -48,6 +49,15 @@ export function MobileAboutSection() {
   // 再点「后台下载」会「什么都没发生」）
   const updateState = useUpdateStore((s) => s.state);
   const [installing, setInstalling] = useState(false);
+
+  // 已就绪的包可能是**旧**版本（上次下好 1.5.0，这次检查到 1.6.0）：「立即安装」
+  // 必须说清装的是哪个版本，发现更新的版本时优先给「下载」—— 否则用户会以为装
+  // 的是同一屏里写着的那个新版本（与桌面 AboutSection 同一口径）。
+  const readyVersion = updateState.status === 'ready' ? updateState.version : null;
+  const readyIsLatest =
+    !readyVersion || !result
+      ? true
+      : (compareVersions(readyVersion, result.latestVersion) ?? 1) >= 0;
 
   useEffect(() => {
     getVersion()
@@ -162,28 +172,63 @@ export function MobileAboutSection() {
                 </span>
               </p>
             ) : updateState.status === 'ready' ? (
-              <>
-                <button
-                  type="button"
-                  disabled={installing}
-                  onClick={() => void handleInstallNow()}
-                  className="flex w-full items-center justify-center gap-2 rounded-lg bg-indigo-600 px-3 py-2.5 text-sm font-medium text-white active:bg-indigo-500 disabled:opacity-50"
-                >
-                  {installing ? (
-                    <Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" />
-                  ) : (
-                    <DownloadCloud className="h-4 w-4" />
-                  )}
-                  立即安装
-                </button>
-                <p className="text-center text-[11px] leading-relaxed text-zinc-500">
-                  {capabilities?.installKind === 'apk'
-                    ? '安装包已下载完成，点击后在系统安装界面确认即可。'
-                    : updateMode === 'off'
-                      ? '安装包已下载完成。当前更新方式是「关闭」，不会自动安装 —— 点「立即安装」才会装上。'
-                      : '安装包已下载完成；不点也会在你退出应用时自动安装。'}
-                </p>
-              </>
+              readyIsLatest ||
+              !supportsSilentDownload ||
+              updateMode === 'off' ||
+              !result.installerUrl ? (
+                <>
+                  <button
+                    type="button"
+                    disabled={installing}
+                    onClick={() => void handleInstallNow()}
+                    className="flex w-full items-center justify-center gap-2 rounded-lg bg-indigo-600 px-3 py-2.5 text-sm font-medium text-white active:bg-indigo-500 disabled:opacity-50"
+                  >
+                    {installing ? (
+                      <Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" />
+                    ) : (
+                      <DownloadCloud className="h-4 w-4" />
+                    )}
+                    立即安装 {updateState.version}
+                  </button>
+                  <p className="text-center text-[11px] leading-relaxed text-zinc-500">
+                    {capabilities?.installKind === 'apk'
+                      ? '安装包已下载完成，点击后在系统安装界面确认即可。'
+                      : updateMode === 'off'
+                        ? '安装包已下载完成。当前更新方式是「关闭」，不会自动安装 —— 点「立即安装」才会装上。'
+                        : '安装包已下载完成；不点也会在你退出应用时自动安装。'}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={downloading}
+                      onClick={() => void handleBackgroundDownload()}
+                      className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-indigo-600 px-3 py-2.5 text-sm font-medium text-white active:bg-indigo-500 disabled:opacity-50"
+                    >
+                      {downloading ? (
+                        <Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" />
+                      ) : (
+                        <DownloadCloud className="h-4 w-4" />
+                      )}
+                      后台下载 {result.latestVersion}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={installing}
+                      onClick={() => void handleInstallNow()}
+                      className="flex items-center justify-center gap-2 rounded-lg bg-zinc-800 px-3 py-2.5 text-sm text-zinc-200 active:bg-zinc-700 disabled:opacity-50"
+                    >
+                      先装 {updateState.version}
+                    </button>
+                  </div>
+                  <p className="text-center text-[11px] leading-relaxed text-zinc-500">
+                    已就绪的是旧版本 {updateState.version}；下载 {result.latestVersion}{' '}
+                    完成后再安装才是最新版。
+                  </p>
+                </>
+              )
             ) : supportsSilentDownload && updateMode !== 'off' && result.installerUrl ? (
               <>
                 <button

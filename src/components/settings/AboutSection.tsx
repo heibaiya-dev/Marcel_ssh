@@ -5,6 +5,7 @@ import type { UpdateCheckResult } from '@/lib/types';
 import { getErrorMessage } from '@/lib/errors';
 import { openExternalLink, SUPPORT_URL } from '@/lib/externalLinks';
 import { updatePercent } from '@/lib/updateProgress';
+import { compareVersions } from '@/lib/semver';
 import { APP_NAME, APP_LOGO } from '@/lib/constants';
 import Button from '@/components/ui/Button';
 import SegmentedControl from '@/components/ui/SegmentedControl';
@@ -110,6 +111,15 @@ export default function AboutSection() {
     }
   }, [update]);
 
+  // 已就绪的包可能是**旧**版本（上次下好 1.5.0，这次检查到 1.6.0）：
+  // 「立即安装」必须说清装的是哪个版本，发现更新的版本时优先给「下载」——
+  // 否则用户会以为装的是同一屏里写着的那个新版本。
+  const readyVersion = updateState.status === 'ready' ? updateState.version : null;
+  const readyIsLatest =
+    !readyVersion || !result
+      ? true
+      : (compareVersions(readyVersion, result.latestVersion) ?? 1) >= 0;
+
   return (
     <>
       <div className="flex justify-center mb-6">
@@ -159,22 +169,50 @@ export default function AboutSection() {
                   </span>
                 </p>
               ) : updateState.status === 'ready' ? (
-                <>
-                  <Button
-                    variant="primary"
-                    loading={installing}
-                    onClick={handleInstallNow}
-                  >
-                    立即安装
-                  </Button>
-                  <p className="text-xs text-zinc-500">
-                    {capabilities?.installKind === 'apk'
-                      ? '安装包已下载完成，点击后在系统安装界面确认即可。'
-                      : updateMode === 'off'
-                        ? '安装包已下载完成。当前更新方式是「关闭」，不会自动安装 —— 点「立即安装」才会装上。'
-                        : '安装包已下载完成；不点也会在你退出应用时自动安装。'}
-                  </p>
-                </>
+                readyIsLatest ||
+                !supportsSilentDownload ||
+                updateMode === 'off' ||
+                !result.installerUrl ? (
+                  <>
+                    <Button
+                      variant="primary"
+                      loading={installing}
+                      onClick={handleInstallNow}
+                    >
+                      立即安装 {updateState.version}
+                    </Button>
+                    <p className="text-xs text-zinc-500">
+                      {capabilities?.installKind === 'apk'
+                        ? '安装包已下载完成，点击后在系统安装界面确认即可。'
+                        : updateMode === 'off'
+                          ? '安装包已下载完成。当前更新方式是「关闭」，不会自动安装 —— 点「立即安装」才会装上。'
+                          : '安装包已下载完成；不点也会在你退出应用时自动安装。'}
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        variant="primary"
+                        loading={downloading}
+                        onClick={handleSilentDownload}
+                      >
+                        后台下载 {result.latestVersion}
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        loading={installing}
+                        onClick={handleInstallNow}
+                      >
+                        先装 {updateState.version}
+                      </Button>
+                    </div>
+                    <p className="text-xs text-zinc-500">
+                      已就绪的是旧版本 {updateState.version}；
+                      {result.latestVersion} 下载完成后会替换它，也可以先装旧版本。
+                    </p>
+                  </>
+                )
               ) : supportsSilentDownload && updateMode !== 'off' && result.installerUrl ? (
                 <>
                   <Button

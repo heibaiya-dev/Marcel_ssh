@@ -66,6 +66,15 @@ pub(super) fn install_on_exit(app: &AppHandle) {
         restart,
         pending.installer_path.display()
     );
+    if !pending.installer_path.is_file() {
+        // 安装包已被系统清理（见 `mod.rs` 的 `reset_stale_ready`）：拉安装器只会
+        // 静默失败，干脆不拉；过期的 pending.json 由下次启动的清理逻辑删掉。
+        log::warn!(
+            "待装安装包已不在磁盘上，跳过退出安装: {}",
+            pending.installer_path.display()
+        );
+        return;
+    }
     spawn_installer(&pending.installer_path, restart);
 }
 
@@ -165,15 +174,19 @@ fn spawn_installer(installer_path: &Path, restart_after_install: bool) {
     // /R 仅在用户主动点「立即安装」时带上：装完自动启动应用。
     // 自然退出不带 —— 安装完窗口自己弹出来反而打扰。
     let restart_flag = if restart_after_install { " /R" } else { "" };
+    // 安装包路径**不拼进命令文本**：cmd 在双引号内照样做 `%VAR%` 展开，路径里
+    // 带 `%` 形态时（例如缓存目录恰好被包进 %USERPROFILE% 之类的字面包裹，或
+    // 用户名/目录名本身就含 %NAME%）会被静默换成别的路径。改成经环境变量传递：
+    // 展开只发生一次，变量值里的 `%` 不会再被解释。
     let script = format!(
-        "ping -n 3 127.0.0.1 >nul & \"{}\" /S{} /UPDATE",
-        installer_path.display(),
+        "ping -n 3 127.0.0.1 >nul & \"%MARCEL_UPDATE_INSTALLER%\" /S{} /UPDATE",
         restart_flag
     );
     // 必须用 raw_arg：arg() 会把内部引号转义成 \"，而 cmd 不认反斜杠转义，
     // 会把 \"C:\...exe\" 整段当作命令名（真机实测踩过：静默失败无任何提示）。
     let result = Command::new("cmd")
         .arg("/C")
+        .env("MARCEL_UPDATE_INSTALLER", installer_path.as_os_str())
         .raw_arg(&script)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
