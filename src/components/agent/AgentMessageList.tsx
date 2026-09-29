@@ -267,6 +267,9 @@ function AgentMessageList({
   // 尾回合「任务在跑」：本对话下是否有 running task（主 agent 或子 agent）。
   // 正在跑的任务回合永不折叠 —— 模型可能在 tool 间继续输出，现在收起就是
   // “干一半收起”。响应式：任务状态变化触发重算。
+  // `!!t.sessionId` 排除的是重启恢复的占位 task（空串）：本机子任务的哨兵值
+  // **照常算「在跑」**（它确实在跑，哨兵值恰恰为此非空），所以本机调研进行中的
+  // 回合不会被收起来 —— 别把哨兵值当占位过滤掉。
   const tailActive = useTaskStore(
     (s) => listConversationId !== ""
       && Object.values(s.tasks).some(

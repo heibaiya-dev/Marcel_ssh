@@ -17,12 +17,13 @@
  * 图标、标题行没预览、不进探索分组），而且不会报错。
  *
  * 现在是一张表：**给内置工具改图标 / 显示名 / 标题行预览 / 折叠分组 / 参数形态 /
- * 中断文案，只改这里**。它管不到的三件事：插件工具与 MCP 工具（名字是动态的，
- * 永远不进表）；要整块接管渲染的工具（还要进 `components/agent/toolViews.ts`，
- * `render_html` 现在就是两个文件各一份）；新增 `payload: 'file-change'` 的工具
- * （还要扩 `FileChangeToolName` 与 `FileChangeView` 的分支）。历史上改过名的工具
- * （`execute_command` → `bash`、`task` → `subagent`）用 `aliases` 挂回同一行，
- * 不再各抄一份图标路径 —— 旧会话回放与新会话走同一条解析路径。
+ * 审批呈现 / 中断文案 / 本机登记，只改这里**。它管不到的三件事：插件工具与 MCP
+ * 工具（名字是动态的，永远不进表）；要整块接管渲染的工具（还要进
+ * `components/agent/toolViews.ts`，`render_html` 现在就是两个文件各一份）；新增
+ * `payload: 'file-change'` 的工具（还要扩 `FileChangeToolName` 与
+ * `FileChangeView` 的分支）。历史上改过名的工具（`execute_command` → `bash`、
+ * `task` → `subagent`）用 `aliases` 挂回同一行，不再各抄一份图标路径 —— 旧会话
+ * 回放与新会话走同一条解析路径。
  *
  * 与 `components/agent/toolViews.ts` 的分工：那边是「整块接管某个工具的渲染」的
  * 组件注册表（要 import React 组件），这边是不含 JSX 的**元数据**表。两者都是
@@ -32,6 +33,11 @@
  * Rust 侧 `agent/tools/mod.rs` 的 `BUILTIN_TOOLS_*` 表为准。前端不复制一份，
  * 复制出来的那份必然与后端漂移（本仓库已经因为这类复制吃过亏）。
  */
+
+/**
+ * 用户中断时卡片追加哪套说明（`ToolPresentation.interruptNotice` 的取值）。
+ */
+export type InterruptNoticeKind = 'remote-stream' | 'local' | 'generic';
 
 /** 折叠分组：同组的工具调用会被折成一条「已探索 N 次读取」/「计划 N 次」。 */
 export type ToolGroup = 'exploration' | 'plan';
@@ -72,30 +78,77 @@ export interface ToolPresentation {
   /**
    * 审批面板的参数区呈现方式。缺省 = 原始 JSON。
    *
-   * 只有 `edit_file` 是 `'diff'`（审批面板加宽 + 渲 `FileChangeView`）。`write_file`
-   * 同样能被审批命中（高风险时），但它的审批面板照旧显示原始 JSON —— 这是
-   * `6d785a6`「edit_file 默认需审批并预检，审批弹窗展示完整上下文 diff」留下的
-   * 既有行为，本轮只是把它声明出来，**没有改**。
+   * `'diff'`：`edit_file` 与 `local_edit_file`（审批面板加宽 + 渲
+   * `FileChangeView`）。两者在后端是**同一份实现**：参数键同为 `path` /
+   * `old_content` / `new_content` / `replace_all`，展示 metadata 也同形
+   * （`build_edit_display_metadata`，远端与本机共用）。diff 的**数据**来自审批
+   * 事件里的 `metadata` 而不是 arguments —— 参数里只有被替换的那两段，
+   * 看不出改动落在全文的哪个位置；metadata 来自审批前的一次预演读盘
+   * （后端 `ToolSemantics::preview_before_approval`）。
    *
-   * 注意：`FileChangeView` 靠工具名选分支（`write_file` 列内容 / `edit_file` 出
-   * diff），而审批面板目前写死了 `toolName="edit_file"`。所以给 `write_file` 也加
-   * `approvalView: 'diff'` 时，必须同时把审批面板那处的工具名改成传入的
-   * `toolCall.name`，否则会拿 write_file 的参数去算 diff。
+   * `write_file` 同样能被审批命中（高风险时），但它的审批面板照旧显示原始 JSON ——
+   * 这是 `6d785a6`「edit_file 默认需审批并预检，审批弹窗展示完整上下文 diff」
+   * 留下的既有行为，**没有改**。
+   *
+   * 审批面板交给 `FileChangeView` 的工具名必须由当前调用解析出来
+   * （`fileChangeToolName(toolCall.name)`，两个弹窗都是），**不能写死**：该组件
+   * 靠工具名选分支（`write_file` 列内容 / edit 形状出 diff），写死会让别的工具
+   * 拿自己的 metadata 渲染成「edit_file 的改动」。
+   *
+   * `'prompt'` = 派发出去的长文本指令（`local_subagent` 的 `arguments.prompt`），
+   * 审批面板把它当**正文**整段渲染（`whitespace-pre-wrap`、可滚动），而不是塞进
+   * JSON 里。这不是美观问题：被派发的那段 prompt 可能整段来自远端返回的内容
+   * （网页、文件、命令输出、被注入的上下文），用户只有在批准前能读全文，才有
+   * 可能发现「这条指令其实是在让子 agent 干别的事」。截断 / 折叠 / 只给摘要的
+   * 呈现会把这唯一的检查点抹掉，所以这里是长文本块 + 可滚动，不做任何截断。
    */
-  readonly approvalView?: 'diff';
+  readonly approvalView?: 'diff' | 'prompt';
+  /**
+   * 该工具在**运行 Marcel SSH 的这台电脑**上干活（本机工具族 `local_*`）。
+   *
+   * 判据刻意是工具名（这张表按名索引），**不是参数**：参数由模型生成，可以
+   * 伪造 —— 用一个 `host` 之类的参数来判断「是不是本机」等于问执行者自己。
+   *
+   * 消费方：审批面板据此加「本机」横幅（`local_subagent` 的文案更重：子 agent
+   * 只在这台电脑上工作）。不在这里把「本机」当图标/显示名差异：同类动作共用
+   * 同一个图标（见 `write_file` / `edit_file` 的铅笔），本机族靠 `local_` 名字
+   * 前缀 + 审批横幅区分，不给同一类动作两套长相。
+   */
+  readonly localExecution?: boolean;
   /**
    * 输出通过 `toolOutput` 事件流式到达前端（后端 `command_exec` ticket 上的
-   * `.streaming(...)`）。用户中断时两套文案的区别就在这：流式工具能说「已停止
-   * 等待输出并关闭 SSH 通道」，非流式工具只能说「可能已执行完成」。
+   * `.streaming(...)`）。
    *
    * ⚠️ 这是**后端事实的前端镜像**，没有任何跨语言护栏：真值在
-   * `src-tauri/src/agent/tools/bash.rs` 的 `ticket.streaming(...)` 调用点
-   * （目前 agent 工具里只有 bash 接了；`tools/mod.rs` 的 `exec_streamed` 是零
-   * 调用方的死 helper）。**给别的工具接上 streaming 时，要回来给那一行加
-   * `streamsOutput: true`**，否则用户中断后会看到与实际不符的「工具可能已执行
-   * 完成」。
+   * `src-tauri/src/agent/tools/bash.rs` 与 `local_bash.rs` 的
+   * `ticket.streaming(...)` 调用点。**给别的工具接上 streaming 时，要回来给那一
+   * 行加 `streamsOutput: true`**。
+   *
+   * 它**只描述传输事实，不决定用户中断时的文案** —— 那是
+   * `interruptNotice` 的活（见该字段与 `interruptNoticeKind`）。
+   * 曾经两者是一件事（按流式与否二选一），于是 `local_bash` 一旦接了 streaming
+   * 就只剩两条错路：说「已关闭 SSH 通道」（本机没有 SSH 通道）或者说「工具可能
+   * 已执行完成」（与「本机进程可能还在跑」的真相相反）。
    */
   readonly streamsOutput?: boolean;
+  /**
+   * 用户中断时卡片该追加哪段说明。三种，缺省 `'generic'`。
+   *
+   * - `'remote-stream'`：远端流式命令（`bash`）——「已停止等待输出并关闭 SSH
+   *   通道，但远端进程不保证已终止…」。**这套说辞是远端专属**：本机没有 SSH
+   *   通道，本机进程也不在服务器上。
+   * - `'local'`：本机命令（`local_bash`）——「已停止等待本机命令…本机进程不保证
+   *   已结束」，并指路本机自己的收尾手段（`Get-Process` / `Stop-Process -Id`、
+   *   `ps` / `pgrep` + `kill`）：本机没有 sshd 替用户回收进程。
+   * - `'generic'`：其余工具（非流式）——「已停止等待结果；工具可能已执行完成」。
+   *
+   * 为什么与 `streamsOutput` 分开：前者是传输事实，这里说的是「用户按下停止那
+   * 一刻，那条命令 / 进程实际处于什么状态」。两者对 `local_bash` 就不同：
+   * 输出确实是流式的，但能说的只有本机那套话。所以这里**每行显式声明**，不从
+   * `streamsOutput` 推导 —— 推导就是把两个集合绑死，`toolCatalog.test.ts` 里有
+   * 一条断言盯着「声明了 streamsOutput 的行必须同时声明 interruptNotice」。
+   */
+  readonly interruptNotice?: InterruptNoticeKind;
   /** 流式期间提前提取参数做预览的字段（工具参数长、等完整 JSON 太久时用）。 */
   readonly partialPreview?: PartialPreviewSpec;
   /** 标题行预览；缺省（或返回空串）不占版面。 */
@@ -331,6 +384,84 @@ export const TOOL_CATALOG: readonly ToolPresentation[] = [
     // 参数里是整页 HTML，等完整 JSON 太久 —— 流式期间就把正文先拿出来渲染。
     partialPreview: { primary: 'fragment', companions: ['title', 'mode'] },
   },
+  // ── 本机工具族（`local_*`）：在运行 Marcel SSH 的这台电脑上干活，与远端同名
+  //    工具一一对应。图标 / 预览 / 折叠分组一律照远端那一行（同类动作共用一副
+  //    长相），另加两条真正不同的声明：`localExecution`（审批面板的本机横幅）与
+  //    `subagent`（本机子 agent 同样要能「查看调研过程」）。
+  //
+  //    **本机编辑（`local_edit_file`）与远端 `edit_file` 走同一个 diff 视图**：
+  //    两者在后端共用同一份实现 —— 参数键（`old_content` / `new_content` /
+  //    `replace_all`）与展示 metadata（`build_edit_display_metadata`）都同形，
+  //    所以 `payload` 与 `approvalView` 照远端那一行标，`FileChangeView` 也认这个
+  //    名字（审批前那次预演读的是用户自己电脑上的真实文件）。
+  //
+  //    `local_write_file` **仍然不标** `payload: 'file-change'`：远端 `write_file`
+  //    的审批面板本来就显示原始 JSON（见 `approvalView` 的说明），本机侧没有审批
+  //    前预演，也没有理由比远端多一个视图。等后端给出预览、并确认要改这个行为时
+  //    再标。
+  {
+    name: 'local_bash',
+    iconPaths: ICON_TERMINAL,
+    payload: 'command',
+    localExecution: true,
+    // 后端 local_bash 与远端 bash 同构：前台执行挂了 `ticket.streaming(...)`
+    // （`src-tauri/src/agent/tools/local_bash.rs`），输出逐块到达前端 —— 这是
+    // 传输事实，照实声明。
+    streamsOutput: true,
+    // 但中断文案**不能**跟着这条事实走：本机没有 SSH 通道，进程也不在服务器上，
+    // 「已停止等待输出并关闭 SSH 通道 / 继续在服务器上运行」全是假的；而
+    // 「工具可能已执行完成」又与本机「只停止等待、进程可能仍在跑」相反。本机
+    // 命令有自己那套说辞（见 `conversationStore` 的中断文案）。
+    interruptNotice: 'local',
+    preview: (args) => {
+      const cmd = asArgString(args.command);
+      return cmd ? `$ ${clip(cmd)}` : '';
+    },
+  },
+  {
+    name: 'local_read_file',
+    iconPaths: ICON_DOCUMENT,
+    group: 'exploration',
+    localExecution: true,
+    preview: pathPreview,
+  },
+  {
+    name: 'local_write_file',
+    iconPaths: ICON_PENCIL,
+    localExecution: true,
+    preview: pathPreview,
+  },
+  {
+    // 与远端 edit_file 同一副长相、同一个 diff 视图：参数键与展示 metadata 都
+    // 同形（后端 `local_file_ops.rs` 直接调远端那套 `resolve_edit_text` /
+    // `apply_edit` / `build_edit_display_metadata`），本机与远端只差「盘在哪」。
+    name: 'local_edit_file',
+    iconPaths: ICON_PENCIL,
+    payload: 'file-change',
+    approvalView: 'diff',
+    localExecution: true,
+    preview: pathPreview,
+  },
+  {
+    name: 'local_list_directory',
+    iconPaths: ICON_FOLDER,
+    group: 'exploration',
+    localExecution: true,
+    // 与 `list_directory` 同一条回退规则（`||` 不是 `??`，空串也回退根目录）
+    preview: (args) => asArgString(args.path) || '/',
+  },
+  {
+    name: 'local_subagent',
+    // 有 label（远端 `subagent` 也有）：这里**不能**照抄 '子agent' —— 那会让本机
+    // 子 agent 的卡片与远端子 agent 长得一模一样，而「这条指令是在自己电脑上跑」
+    // 恰恰是用户必须先看见的事。
+    label: '本机子agent',
+    iconPaths: ICON_SUBAGENT,
+    subagent: true,
+    localExecution: true,
+    approvalView: 'prompt',
+    preview: (args) => clip(asArgString(args.description) || asArgString(args.prompt) || ''),
+  },
   // ── plan 工具：卡片位置渲染成一行状态文字（计划本体在 PlanList 里） ──
   {
     name: 'create_plan',
@@ -388,16 +519,52 @@ export function isSkillTool(toolName: string): boolean {
 }
 
 /**
+ * 该工具是否在**本机**（运行 Marcel SSH 的这台电脑）上干活。
+ *
+ * 读的是表里 `localExecution` 的声明 —— 按**工具名**判定，不看参数：参数由模型
+ * 生成、可以伪造，用参数判断「跑在哪台机器上」等于让执行者自己申报。
+ */
+export function isLocalExecutionTool(toolName: string): boolean {
+  return toolSpec(toolName)?.localExecution === true;
+}
+
+/**
+ * 本机子任务的 `sessionId` **哨兵值**（后端 `local_subagent` 的
+ * `SubTaskStartEvent.sessionId` 必须原样传这个串）。
+ *
+ * 为什么要有它：本机子 agent 没有 SSH 会话，而任务的既有契约用「`sessionId`
+ * 是不是空串」区分「真任务 / 重启恢复的占位 task」（见 `taskStore` 的占位
+ * 分支），所以本机子任务需要一个**非空、且不是真会话**的值。前端据此分两类：
+ *
+ * - 当「真任务」用（哨兵非空即可）：状态聚合、对话占用/忙碌、回合不折叠 ——
+ *   本机子任务正在跑就必须照样算在跑，不能因为「没有 SSH 会话」被当成占位。
+ * - 当「SSH 会话」用：一律不认。切终端 tab、查会话连接状态、唤醒后台作业这些
+ *   动作拿哨兵去查会指向一个不存在的会话 —— 该跳转的不跳、该显示「本机」的
+ *   显示「本机」，别让它冒充一台机器。
+ *
+ * 真会话 id 两侧都是 UUID（前端 `crypto.randomUUID`、后端 `Uuid::new_v4`），
+ * 所以这个串不会与任何真会话撞。
+ */
+export const LOCAL_SESSION_SENTINEL = 'local';
+
+/** `sessionId` 是不是本机子任务的哨兵值（即「没有 SSH 会话」）。 */
+export function isLocalSessionId(sessionId: string | null | undefined): boolean {
+  return sessionId === LOCAL_SESSION_SENTINEL;
+}
+
+/**
  * `FileChangeView` 认得（并能正确分支）的工具名 —— 那个组件的 props 类型就是
  * 这份契约。
  *
  * 往表里加 `payload: 'file-change'` 的新工具时，必须同时扩展这里**和**
  * `FileChangeView` 的分支逻辑。真正拦住漏做的是 **`tsc`**：`FileChangeView` 的
- * props 是写死的二值 union，不在其中的名字在 `ToolCallCard` 里传不进去。
+ * props 是写死的字面量 union（不从本文件 import），不在其中的名字在
+ * `ToolCallCard` 里传不进去；`FileChangeView` 内部还有一层穷尽检查 —— 新名字
+ * 落进它的 union 却没登记分支时，编译不过（防止被默默当成 edit 渲染）。
  * `toolCatalog.test.ts` 那一侧只保证「声明了 `payload: 'file-change'` 的行恰好
  * 等于这份清单」（挡住反向遗漏），不是它守住了类型。
  */
-export const FILE_CHANGE_TOOL_NAMES = ['write_file', 'edit_file'] as const;
+export const FILE_CHANGE_TOOL_NAMES = ['write_file', 'edit_file', 'local_edit_file'] as const;
 
 export type FileChangeToolName = (typeof FILE_CHANGE_TOOL_NAMES)[number];
 

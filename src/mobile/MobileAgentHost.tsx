@@ -19,6 +19,7 @@ import {
 import { sessionConversationBindingManager } from "@/stores/sessionConversationBindingManager";
 import { groupConversationsWithPinned } from "@/lib/dateGrouping";
 import { getErrorMessage } from "@/lib/errors";
+import { isLocalSessionId } from "@/lib/toolCatalog";
 import { AGENT_MODES } from "@/lib/constants";
 import { currentVision } from "@/lib/llmRegistry";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -193,14 +194,30 @@ export default function MobileAgentHost({
   const unreadCompletedConversations = useTaskStore(
     (s) => s.unreadCompletedConversations,
   );
-  /** 子 agent 运行模式（plan 只读调研 / agent 读写执行）：驱动输入区文案。 */
-  const subAgentMode = useMemo(() => {
-    if (!activeConversationId) return "plan" as const;
-    const subTask = Object.values(tasks).find(
-      (t) => t.conversationId === activeConversationId && t.parentTaskId,
-    );
-    return (subTask?.mode === "agent" ? "agent" : "plan") as "plan" | "agent";
+  /**
+   * 当前子对话的派发信息：
+   * - `mode`（plan 只读调研 / agent 读写执行）驱动输入区文案；
+   * - `isLocal` 判定它是不是**本机**子任务（`local_subagent`）——本机子任务的
+   *   `sessionId` 是哨兵值（`isLocalSessionId`，见 toolCatalog 的
+   *   `LOCAL_SESSION_SENTINEL`），没有 SSH 会话。横条据此标「本机」，否则用户
+   *   会以为这条子对话跑在某台服务器上。
+   *
+   * 判定只走哨兵值（与桌面 `AgentTasksDrawer` 同一口径），不查 sessionStore、
+   * 也不读子任务事件上的 `side`：`side` 缺省（旧数据 / 远端子任务）不命中哨兵，
+   * 行为与从前完全一致。
+   */
+  const subAgentDispatch = useMemo(() => {
+    const subTask = activeConversationId
+      ? Object.values(tasks).find(
+          (t) => t.conversationId === activeConversationId && t.parentTaskId,
+        )
+      : undefined;
+    return {
+      mode: (subTask?.mode === "agent" ? "agent" : "plan") as "plan" | "agent",
+      isLocal: isLocalSessionId(subTask?.sessionId),
+    };
   }, [activeConversationId, tasks]);
+  const { mode: subAgentMode, isLocal: subAgentIsLocal } = subAgentDispatch;
   // 后台作业（跨会话）：header 胶囊与任务/作业中心的显示入口依赖它——
   // 「有需要用户知道结局的作业」（重启恢复出来的 interrupted）同样要给入口：
   // 那种状态下没有任何 running，只看 running 的话抽屉就永远打不开。
@@ -1132,9 +1149,19 @@ export default function MobileAgentHost({
               返回主对话
             </button>
             <div className="min-w-0 flex-1 border-l border-zinc-700/50 pl-3">
-              <div className="truncate text-xs text-zinc-400">
-                {subAgentMode === "agent" ? "子agent执行" : "子agent调研"} ·{" "}
-                {activeConversation?.title ?? "子agent对话"}
+              <div className="flex min-w-0 items-center gap-1.5 text-xs text-zinc-400">
+                {/* 本机子任务（local_subagent）：这条子对话在用户这台电脑上跑，
+                    没有 SSH 会话。不标的话用户会以为它跑在某台服务器上。
+                    措辞与桌面一致（任务/作业中心的 `本机`、本机工具审批横幅）。 */}
+                {subAgentIsLocal && (
+                  <span className="flex-shrink-0 rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-sky-300">
+                    本机
+                  </span>
+                )}
+                <span className="min-w-0 truncate">
+                  {subAgentMode === "agent" ? "子agent执行" : "子agent调研"} ·{" "}
+                  {activeConversation?.title ?? "子agent对话"}
+                </span>
               </div>
               <div className="mt-0.5 text-[11px] text-zinc-600">
                 {subAgentMode === "agent"

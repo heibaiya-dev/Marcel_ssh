@@ -24,11 +24,17 @@
  * - 某轮结束（Done / Cancelled / Failed）后 —— 关掉「作业恰好在回合收尾那一刻
  *   结算、两边都没接住」的竞态窗口；
  * - 移动端切回前台 —— 后台时 WebView 的 JS 会被冻结，事件在恢复后才补上。
+ *
+ * **本机作业同样适用**（`local_bash(run_in_background: true)`，id 形如
+ * `local_job_N`，`sessionId` 是哨兵值）：后端两台 manager 的待播报结局是合并
+ * 的，前端这一格也必须按**作业归属对话的真实绑定会话**唤醒，否则整条路在本机
+ * 作业上静默断掉（见 `resolveWakeSessionId`）。
  */
 
 import * as tauri from '@/lib/tauri';
 import { subscribeTauriEvent, type Unsubscribe } from '@/lib/tauriEvent';
 import type { JobInfo } from '@/lib/types';
+import { isLocalSessionId } from '@/lib/toolCatalog';
 import {
   conversationIsBusy,
   useConversationStore,
@@ -65,8 +71,42 @@ async function sessionIsConnected(sessionId: string): Promise<{
 }
 
 /**
+ * 唤醒要挂在哪条 SSH 会话上。
+ *
+ * 远端作业 / 远端任务给的 `sessionId` 就是真会话，原样用。本机作业
+ * （`local_bash(run_in_background: true)`）与本机子任务的 `sessionId` 是哨兵
+ * 值（`LOCAL_SESSION_SENTINEL`）：它们**没有** SSH 会话，但「活得比回合久」这
+ * 件事与远端作业完全一样（后端两台 manager 的待播报结局已合并，见
+ * `commands/job.rs`），所以不能拿哨兵去查连接状态了事 —— 那是必然的
+ * `connected: false`，整条自动继续会在这里静默断掉。
+ *
+ * 正确口径是**按作业归属的对话**取它此刻绑定的 SSH 会话
+ * （`findOccupyingSession`：正在跑那条对话的会话，或该会话上当前打开的对话）。
+ * 取不到就不唤醒：结局留在后台，用户下次在那条对话里开口时模型会知道 ——
+ * 绝不伪造一条会话，那只会让这一轮挂在一个不存在的 sessionId 上。
+ *
+ * `findOccupyingSession` 的会话要求 `connected` / `connecting`，而下面
+ * `sessionIsConnected` 只认 `connected` —— 两道闸门是递进的（前者回答「哪条
+ * 会话属于这条对话」，后者回答「这条会话此刻能不能开轮」），不重复。
+ */
+async function resolveWakeSessionId(
+  conversationId: string,
+  sessionId: string,
+): Promise<string | null> {
+  if (!isLocalSessionId(sessionId)) return sessionId;
+  // 惰性 import 的理由同 `sessionIsConnected`（绑定管理器静态引 sessionStore）。
+  const { sessionConversationBindingManager } = await import(
+    './sessionConversationBindingManager'
+  );
+  return sessionConversationBindingManager.findOccupyingSession(conversationId)?.sessionId ?? null;
+}
+
+/**
  * 尝试为一条会话自动继续一轮。找不到可交付的结局、或上述四条规矩有任一条
  * 不满足时**啥也不做**（结局留在后台，等用户下次开口）。
+ *
+ * `sessionId` 允许是本机作业 / 本机子任务的哨兵值：这种情况按**作业归属对话**
+ * 的真实绑定会话唤醒（见 `resolveWakeSessionId`），解析不出真会话就放弃。
  */
 export async function maybeContinueForConversation(
   conversationId: string,
@@ -88,7 +128,12 @@ export async function maybeContinueForConversation(
   // 用户下次进这条会话时再交给它。
   if (!conversationStore.conversations[conversationId] || messages.length === 0) return;
 
-  const session = await sessionIsConnected(sessionId);
+  // 本机作业 / 本机子任务在这里落回「它归属的那条对话绑定的真会话」；解析不出
+  // 来就直接不唤醒（不伪造会话）。
+  const wakeSessionId = await resolveWakeSessionId(conversationId, sessionId);
+  if (!wakeSessionId) return;
+
+  const session = await sessionIsConnected(wakeSessionId);
   if (!session.connected) return;
 
   let notice: tauri.JobNotice | null = null;
@@ -103,7 +148,7 @@ export async function maybeContinueForConversation(
   waking.add(conversationId);
   try {
     await useTaskStore.getState().startTask(
-      sessionId,
+      wakeSessionId,
       notice.text,
       session.connectionId ?? '', 
       undefined,
@@ -132,6 +177,10 @@ export async function maybeContinueForConversation(
  *
  * 收的是**已归一化**的 JobInfo（camelCase）：事件路径在订阅处过
  * `jobStore.mapJob`，前台补扫那条路径直接拿 store 里的值。
+ *
+ * 本机作业的 `sessionId` 是哨兵值，但**唤醒资格由作业归属对话决定**，不由作业
+ * 的 session 决定（作业的 session 是哨兵，对话的会话是真的）—— 所以哨兵原样往
+ * 下传，由 `resolveWakeSessionId` 按对话解析。
  */
 function handleJobEvent(job: JobInfo): void {
   if (!isSettled(job)) return;
@@ -145,6 +194,12 @@ function handleJobEvent(job: JobInfo): void {
  *
  * 「作业恰好在回合收尾那一刻结算、结算通知与 Done 各自错过」的窗口就是靠它
  * 关掉的：这里再看一眼有没有待播报的结局，有就开一轮。
+ *
+ * **不按哨兵早退**：本机子任务（`local_subagent`）的 `sessionId` 是哨兵值，但它
+ * 的**归属对话**（作业记在父对话名下）可能绑着一条真的 SSH 会话，那条会话上的
+ * 后台作业同样活得比回合久 —— 这正是要补上的那一格。判断口径交给
+ * `resolveWakeSessionId`：哨兵 → 按对话解析，解析不出真会话它自己会放弃
+ * （本机子任务自己的子对话就解析不出会话，于是照旧不开轮，不抛错）。
  */
 export function onTurnFinished(conversationId: string, taskId: string): void {
   const task = useTaskStore.getState().tasks[taskId];

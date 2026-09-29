@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import MobileSheet from './ui/MobileSheet';
-import type { AgentTask, JobInfo } from '@/lib/types';
+import type { AgentTask } from '@/lib/types';
 import { useTaskStore } from '@/stores/taskStore';
 import { useJobStore } from '@/stores/jobStore';
 import { useSessionStore } from '@/stores/sessionStore';
@@ -8,6 +8,7 @@ import { useConnectionStore } from '@/stores/connectionStore';
 import { useConversationStore } from '@/stores/conversationStore';
 import { getTaskVisualStatus, getActiveRunningTasks } from '@/stores/agentStatusSelectors';
 import { AgentStatusIndicator } from '@/components/agent/AgentStatusIndicator';
+import { isLocalSessionId } from '@/lib/toolCatalog';
 import { ChevronRight } from 'lucide-react';
 
 interface MobileActiveAgentsSheetProps {
@@ -46,7 +47,12 @@ export default function MobileActiveAgentsSheet({
   const jobList = Object.values(jobs).sort((a, b) => b.startedAtMillis - a.startedAtMillis);
   const runningJobs = jobList.filter((j) => j.status === 'running');
 
-  const getSessionLabel = (sessionId: string) => {
+  const getSessionLabel = (task: AgentTask) => {
+    // 本机子任务（local_subagent）：sessionId 是哨兵值，没有 SSH 会话可查 ——
+    // 不查了，直接说清它在本机跑（查下去只会反查成「自动连接的目标机」）。
+    // 与桌面 AgentTasksDrawer 同一口径、同一措辞。
+    if (isLocalSessionId(task.sessionId)) return '本机';
+    const { sessionId } = task;
     const session = sessions[sessionId];
     if (!session) {
       // 多机自动拉起的「幽灵会话」不在前端 sessionStore：用对话归属的
@@ -72,6 +78,12 @@ export default function MobileActiveAgentsSheet({
   // 作业专用会话标签：会话已关闭（前端 sessions 已删除，但后端作业仍保留）
   // 时，显示会话 ID + 关闭提示，不冒充未知会话。
   const getJobSessionLabel = (sessionId: string) => {
+    // 本机作业（`local_bash(run_in_background: true)`，id 形如 `local_job_N`）：
+    // `sessionId` 是哨兵值，本来就没有会话可查 —— 与上面 `getSessionLabel` 同一
+    // 口径、同一措辞（桌面 AgentTasksDrawer 同）。漏了这行会落成
+    // 「local（该任务对应会话已关闭）」：把一条**正在跑**的本机作业说成「会话已
+    // 关闭」，用户会以为它废了。
+    if (isLocalSessionId(sessionId)) return '本机';
     const session = sessions[sessionId];
     if (!session) return `${sessionId}（该任务对应会话已关闭）`;
     const conn = session.configId
@@ -92,8 +104,11 @@ export default function MobileActiveAgentsSheet({
 
   const handleJumpToTask = async (task: AgentTask) => {
     // 幽灵会话（多机自动拉起）不在 sessionStore：只切对话，不切终端会话，
-    // 避免 setActiveSession 指向不存在的 id。
+    // 避免 setActiveSession 指向不存在的 id。本机子任务（哨兵 sessionId）同理
+    // ——它根本没有终端标签可切，只切到它的子对话（过程一样看得到，「本机」
+    // 字样在卡片上，见 getSessionLabel）。与桌面 AgentTasksDrawer 同一口径。
     if (
+      !isLocalSessionId(task.sessionId) &&
       task.sessionId &&
       task.sessionId !== activeSessionId &&
       sessions[task.sessionId]
@@ -153,7 +168,7 @@ export default function MobileActiveAgentsSheet({
           ) : (
             runningTasks.map((task) => {
               const isSubTask = Boolean(task.parentTaskId);
-              const sessionLabel = getSessionLabel(task.sessionId);
+              const sessionLabel = getSessionLabel(task);
               const convTitle = getConversationTitle(task);
               const isCurrent = task.conversationId === activeConversationId;
               const visualStatus = getTaskVisualStatus(task);

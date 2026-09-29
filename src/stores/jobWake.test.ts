@@ -12,11 +12,12 @@ const { listenMock, agentStartTask, jobPendingNotice, jobAckNotice } = vi.hoiste
 vi.mock('@tauri-apps/api/event', () => ({ listen: listenMock }));
 vi.mock('@/lib/tauri', () => ({ agentStartTask, jobPendingNotice, jobAckNotice }));
 
-import { initJobWake, maybeContinueForConversation } from '@/stores/jobWake';
+import { initJobWake, maybeContinueForConversation, onTurnFinished } from '@/stores/jobWake';
 import { useConversationStore } from '@/stores/conversationStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useTaskStore } from '@/stores/taskStore';
 import { MAX_AUTO_CONTINUES, __resetAllAutoContinues } from '@/stores/wakeBudget';
+import { LOCAL_SESSION_SENTINEL } from '@/lib/toolCatalog';
 import type { AgentMessage, AgentTask } from '@/lib/types';
 
 /**
@@ -86,6 +87,37 @@ function seedBusyTask() {
 }
 
 /**
+ * 把某条对话绑定到一条在线会话上 —— 本机作业要唤醒靠的就是这份绑定
+ * （`sessionConversationBindingManager.findOccupyingSession` 的第 2 步）。
+ */
+function bindConversationToSession(sessionId = SESSION, conversationId = CONV) {
+  useConversationStore.setState((s) => ({
+    activeConversationBySession: { ...s.activeConversationBySession, [sessionId]: conversationId },
+  }));
+}
+
+/**
+ * 一条已收尾的本机子任务（`sessionId` 是哨兵，归属对话由参数给）。
+ *
+ * 默认 `completed`：`onTurnFinished` 是在 `handleDone` 把任务收敛成终态**之后**
+ * 才调的，终态才不会把「对话有任务在跑」这条挡住。
+ */
+function seedLocalSubTask(conversationId = CONV, id = 'sub-local'): AgentTask {
+  const task: AgentTask = {
+    id,
+    sessionId: LOCAL_SESSION_SENTINEL,
+    conversationId,
+    prompt: '本机调研',
+    mode: 'plan',
+    status: 'completed',
+    createdAt: new Date().toISOString(),
+    parentTaskId: 'task-parent',
+  };
+  useTaskStore.setState((s) => ({ tasks: { ...s.tasks, [task.id]: task } }));
+  return task;
+}
+
+/**
  * 把一条 `job://updated` 按**后端真实载荷**投递给 jobWake 的监听器。
  *
  * 载荷形状照抄后端 `JobInfo` 的 serde 输出（snake_case，无 camelCase 别名）——
@@ -108,7 +140,11 @@ describe('jobWake（作业跑完自动继续）', () => {
       jobIds: ['job_1'],
     });
     useTaskStore.setState({ tasks: {}, activeTaskId: null, compacting: {} });
-    useConversationStore.setState({ conversations: {}, messages: {} });
+    useConversationStore.setState({
+      conversations: {},
+      messages: {},
+      activeConversationBySession: {},
+    });
     useSessionStore.setState({ sessions: {}, activeSessionId: null });
     seedConversationLoaded();
     seedSession();
@@ -258,5 +294,147 @@ describe('jobWake（作业跑完自动继续）', () => {
     jobPendingNotice.mockResolvedValue(null);
     await maybeContinueForConversation(CONV, SESSION);
     expect(agentStartTask).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 本机作业（`local_bash(run_in_background: true)`，id 形如 `local_job_N`）：
+   * `sessionId` 是哨兵值，没有 SSH 会话可查。后端两台 manager 的待播报结局是
+   * 合并的（本机作业照样「活得比回合久」），前端这一格过去拿哨兵去
+   * `sessionIsConnected` 查连接 → 必然 `connected: false` → 静默早退，整条自动
+   * 继续在本机作业上端到端断掉（没有告知卡、结局也交不回模型）。
+   */
+  describe('本机作业（sessionId 是哨兵）', () => {
+    it('对话绑着活跃会话 → 按那条真会话唤醒（不是拿哨兵去开轮）', async () => {
+      bindConversationToSession();
+
+      await maybeContinueForConversation(CONV, LOCAL_SESSION_SENTINEL);
+
+      expect(agentStartTask).toHaveBeenCalledTimes(1);
+      const call = agentStartTask.mock.calls[0];
+      expect(call[0], '开轮必须挂在真会话上，不能是哨兵').toBe(SESSION);
+      expect(call[3]).toBe(CONV);
+      expect(call[7]).toBe('job_notice');
+      expect(jobAckNotice).toHaveBeenCalledWith(['job_1']);
+    });
+
+    it('事件路径（后端载荷 session_id="local"）同样唤醒', async () => {
+      // 事件路径是本机作业的常规入口：handleJobEvent 把哨兵原样往下传，
+      // 由 resolveWakeSessionId 按归属对话解析，不能在这里被吞掉。
+      bindConversationToSession();
+      const unsub = initJobWake();
+      try {
+        emitJobUpdated({
+          job_id: 'local_job_1',
+          session_id: LOCAL_SESSION_SENTINEL,
+          owner_conversation_id: CONV,
+          description: '本机构建',
+          command: 'pnpm build',
+          status: 'completed',
+          started_at_millis: 1000,
+          finished_at_millis: 2000,
+          total_output_bytes: 42,
+        });
+
+        await vi.waitFor(() => expect(agentStartTask).toHaveBeenCalledTimes(1));
+        expect(agentStartTask.mock.calls[0][0]).toBe(SESSION);
+      } finally {
+        unsub();
+      }
+    });
+
+    it('那条对话没绑定任何活跃会话 → 不唤醒，也不抛错（不伪造会话）', async () => {
+      // 用户没在任何标签里看那条对话（或会话已断）：没有「哪条会话属于它」的
+      // 事实可用，宁可不开轮 —— 结局留在后台等用户下次开口。
+      await expect(
+        maybeContinueForConversation(CONV, LOCAL_SESSION_SENTINEL),
+      ).resolves.toBeUndefined();
+
+      expect(agentStartTask).not.toHaveBeenCalled();
+      expect(jobPendingNotice).not.toHaveBeenCalled();
+    });
+
+    it('绑定会话已断开 → 不唤醒（拿到会话也不等于能开轮）', async () => {
+      bindConversationToSession();
+      seedSession('disconnected');
+
+      await maybeContinueForConversation(CONV, LOCAL_SESSION_SENTINEL);
+
+      expect(agentStartTask).not.toHaveBeenCalled();
+      expect(jobPendingNotice).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('onTurnFinished 的哨兵 guard 按「归属对话」而不是「作业 session」判定', () => {
+    it('本机子任务收尾、其归属对话绑着活跃会话 → 照样唤醒', async () => {
+      // 作业的 session 是哨兵，对话的会话是真的：唤醒资格属于后者。
+      bindConversationToSession();
+      const task = seedLocalSubTask(CONV);
+
+      onTurnFinished(CONV, task.id);
+
+      await vi.waitFor(() => expect(agentStartTask).toHaveBeenCalledTimes(1));
+      expect(agentStartTask.mock.calls[0][0]).toBe(SESSION);
+    });
+
+    it('本机子任务自己的子对话（在 store 里但没有会话绑定）→ 不唤醒，也不抛错', async () => {
+      // 子对话是隐藏对话：它不在 `activeConversationBySession` 里（那里面记的是
+      // 每个 Tab 当前打开的对话），所以在它名下解析不出任何 SSH 会话 —— 放弃，
+      // 而不是把哨兵当会话开一轮。
+      const sub = 'conv-sub';
+      useConversationStore.setState((s) => ({
+        conversations: {
+          ...s.conversations,
+          [sub]: {
+            id: sub,
+            connectionId: 'conn-1',
+            title: '本机子agent',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+        },
+        messages: {
+          ...s.messages,
+          [sub]: [
+            {
+              id: 'm-sub',
+              role: 'user',
+              content: '本机调研',
+              timestamp: new Date().toISOString(),
+            } satisfies AgentMessage,
+          ],
+        },
+      }));
+      const task = seedLocalSubTask(sub, 'sub-local-2');
+
+      onTurnFinished(sub, task.id);
+      await expect(
+        maybeContinueForConversation(sub, LOCAL_SESSION_SENTINEL),
+      ).resolves.toBeUndefined();
+
+      expect(agentStartTask).not.toHaveBeenCalled();
+      expect(jobPendingNotice).not.toHaveBeenCalled();
+    });
+
+    it('重启恢复的占位 task（sessionId 是空串）→ 仍然什么都不做', async () => {
+      bindConversationToSession();
+      useTaskStore.setState({
+        tasks: {
+          'task-placeholder': {
+            id: 'task-placeholder',
+            sessionId: '',
+            conversationId: CONV,
+            prompt: '重启残留',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+        },
+      });
+
+      onTurnFinished(CONV, 'task-placeholder');
+
+      await Promise.resolve();
+      expect(agentStartTask).not.toHaveBeenCalled();
+    });
   });
 });

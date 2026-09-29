@@ -25,6 +25,7 @@ import {
   conversationIsBusy,
 } from "@/stores/conversationStore";
 import { sessionConversationBindingManager } from "@/stores/sessionConversationBindingManager";
+import { isLocalSessionId } from "@/lib/toolCatalog";
 import { AGENT_MODES } from "@/lib/constants";
 import {
   isNearBottom,
@@ -174,14 +175,25 @@ export default function AgentPanel() {
     : null;
   const isSubConversation = !!activeConversation?.parentConversationId;
   const parentConversationId = activeConversation?.parentConversationId ?? null;
-  /** 子 agent 运行模式（plan 只读调研 / agent 读写执行）：驱动输入区文案。 */
-  const subAgentMode = (() => {
-    if (!activeConversationId) return "plan" as const;
+  /**
+   * 子 agent 派发信息：
+   * - `mode`（plan 只读调研 / agent 读写执行）驱动输入区文案；
+   * - `isLocal` 判定它是不是**本机**子任务（`local_subagent`）——本机子任务的
+   *   `sessionId` 是哨兵值（`isLocalSessionId`，见 toolCatalog 的
+   *   `LOCAL_SESSION_SENTINEL`），没有 SSH 会话。横条据此标「本机」，否则用户
+   *   会以为这条子对话跑在某台服务器上（与移动端 `MobileAgentHost` 同口径）。
+   */
+  const subAgentDispatch = (() => {
+    if (!activeConversationId) return { mode: "plan" as const, isLocal: false };
     const subTask = Object.values(tasks).find(
       (t) => t.conversationId === activeConversationId && t.parentTaskId,
     );
-    return (subTask?.mode === "agent" ? "agent" : "plan") as "plan" | "agent";
+    return {
+      mode: (subTask?.mode === "agent" ? "agent" : "plan") as "plan" | "agent",
+      isLocal: isLocalSessionId(subTask?.sessionId),
+    };
   })();
+  const subAgentMode = subAgentDispatch.mode;
 
   // 图片支持按「当前会话实际生效模型」判定（会话记忆 → 全局最近使用），
   // 避免会话内切到非视觉模型时仍允许附图。普通派生值（随每次渲染重算，
@@ -1203,9 +1215,18 @@ export default function AgentPanel() {
               返回主对话
             </button>
             <div className="flex-1 min-w-0 border-l border-zinc-700/50 pl-3">
-              <div className="text-xs text-zinc-400 truncate">
-                {subAgentMode === "agent" ? "子agent执行" : "子agent调研"} ·{" "}
-                {activeConversation?.title ?? "子agent对话"}
+              <div className="flex min-w-0 items-center gap-1.5 text-xs text-zinc-400">
+                {/* 本机子任务（local_subagent）：这条子对话在用户这台电脑上跑，
+                    没有 SSH 会话。不标的话用户会以为它跑在某台服务器上。 */}
+                {subAgentDispatch.isLocal && (
+                  <span className="flex-shrink-0 rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-sky-300">
+                    本机
+                  </span>
+                )}
+                <span className="min-w-0 truncate">
+                  {subAgentMode === "agent" ? "子agent执行" : "子agent调研"} ·{" "}
+                  {activeConversation?.title ?? "子agent对话"}
+                </span>
               </div>
               <div className="text-[11px] text-zinc-600 mt-0.5">
                 {subAgentMode === "agent"

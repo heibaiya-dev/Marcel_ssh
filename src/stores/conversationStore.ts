@@ -328,6 +328,10 @@ export function conversationIsBusy(conversationId: string): boolean {
  * 切换对话后恢复"当前活动任务"：
  * 该对话有 running task（主 agent / 子 agent）→ 设为 activeTaskId（停止按钮、
  * isRunning 随之恢复）；否则清空。
+ *
+ * `!!t.sessionId` 排除的是重启恢复的占位 task（空串）；本机子任务的哨兵值算
+ * 真任务 —— 切回它的子对话时「停止」按钮要跟着恢复（与
+ * `conversationHasRunningTask` 同一口径）。
  */
 function restoreRunningTaskForConversation(conversationId: string) {
   const taskStore = useTaskStore.getState();

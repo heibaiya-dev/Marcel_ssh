@@ -2,9 +2,42 @@ import { memo, useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { diffLines } from 'diff';
 
 interface Props {
-  toolName: 'write_file' | 'edit_file';
+  /**
+   * 走本视图的工具名。**刻意写死成字面量 union，不从 `toolCatalog` 的
+   * `FileChangeToolName` import**：往 catalog 的 `payload: 'file-change'` 清单里
+   * 加名字时，`ToolCallCard` 的传参处会编译不过，逼着人回来扩这里、并想清楚
+   * 新工具该走哪一支（见 `toolCatalog.ts` 中 `FILE_CHANGE_TOOL_NAMES` 的说明）。
+   */
+  toolName: 'write_file' | 'edit_file' | 'local_edit_file';
   arguments: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+}
+
+/** 渲染分支：整文件内容（write 形状）/ 前后对照 diff（edit 形状）。 */
+type FileChangeBranch = 'content' | 'diff';
+
+/**
+ * 工具名 → 分支。
+ *
+ * `never` 兜底是刻意的：props 的 union 一扩（比如将来把 `local_write_file` 也接
+ * 进来）而这里没登记，`tsc` 立刻报错 —— 否则新名字会掉进 diff 分支，拿需要
+ * `old_content` / `new_content` 的分支去渲染只给 `content` 的参数，得到一个空
+ * diff，比显示原始输出更误导。
+ */
+function branchOf(toolName: Props['toolName']): FileChangeBranch {
+  switch (toolName) {
+    case 'write_file':
+      return 'content';
+    // 本机编辑与远端编辑参数键、metadata 形状完全一致（后端同一份
+    // `build_edit_display_metadata`），共用 diff 这一支。
+    case 'edit_file':
+    case 'local_edit_file':
+      return 'diff';
+    default: {
+      const exhaustive: never = toolName;
+      return exhaustive;
+    }
+  }
 }
 
 type DiffRow = {
@@ -225,7 +258,7 @@ function MatchNavBar({
 }
 
 function FileChangeView({ toolName, arguments: args, metadata }: Props) {
-  if (toolName === 'write_file') {
+  if (branchOf(toolName) === 'content') {
     const content = String(args.content ?? '');
     if (!content) return null;
 
@@ -251,7 +284,9 @@ function FileChangeView({ toolName, arguments: args, metadata }: Props) {
     );
   }
 
-  // edit_file
+  // ── diff 分支：edit_file / local_edit_file ──
+  // metadata（before/after/hunks/match_line_positions/occurrences…）与参数键
+  // （old_content/new_content/replace_all）两侧同形，所以这一段完全共用。
   const oldContent = String(args.old_content ?? '');
   const newContent = String(args.new_content ?? '');
   const replaceAll = args.replace_all === true;

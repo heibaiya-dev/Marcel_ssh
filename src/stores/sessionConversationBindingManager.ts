@@ -2,6 +2,7 @@ import { useSessionStore } from './sessionStore';
 import { useConversationStore } from './conversationStore';
 import { useTaskStore, finalizeTaskLocally } from './taskStore';
 import { isTaskBusy } from '@/lib/agentStatus';
+import { isLocalSessionId } from '@/lib/toolCatalog';
 import type { Session } from '@/lib/types';
 
 /**
@@ -20,11 +21,14 @@ class SessionConversationBindingManager {
     const liveSessions = sessionState.sessions;
 
     // 1. 优先检查正在运行的任务所绑定的 sessionId
+    //    （本机子任务的 sessionId 是哨兵值，不是会话：下面 `liveSessions[...]`
+    //    本来就查不到它，这里再显式排除一次，语义上写清「哨兵不当占用者」）
     const taskStore = useTaskStore.getState();
     const runningTask = Object.values(taskStore.tasks).find(
       (t) =>
         t.conversationId === conversationId &&
         !!t.sessionId &&
+        !isLocalSessionId(t.sessionId) &&
         liveSessions[t.sessionId] &&
         liveSessions[t.sessionId].status === 'connected' &&
         isTaskBusy(t.status),
@@ -63,10 +67,13 @@ class SessionConversationBindingManager {
     const bySession = convState.activeConversationBySession;
 
     // 1. 运行中任务占用的 conversation
+    //    （同样排除本机子任务的哨兵值：它不属于任何 SSH 会话，也就谈不上
+    //    「被某个 Tab 占用」）
     const taskStore = useTaskStore.getState();
     for (const t of Object.values(taskStore.tasks)) {
       if (
         t.sessionId &&
+        !isLocalSessionId(t.sessionId) &&
         t.sessionId !== excludeSessionId &&
         liveSessions[t.sessionId] &&
         liveSessions[t.sessionId].status === 'connected' &&

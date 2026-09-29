@@ -996,6 +996,17 @@ export interface SubTaskStartPayload {
   sessionId?: string;
   /** 子 agent 运行模式："plan"（只读调研）| "agent"（读写执行）。缺省 plan。 */
   mode?: 'plan' | 'agent';
+  /**
+   * 子 agent 在哪台机器上干活：`'local'` = 运行 Marcel SSH 的**这台电脑**
+   * （`local_subagent`，没有 SSH 会话）。缺省 / 缺失 = 远端（既有行为）。
+   *
+   * ⚠️ 前端消费方目前**不读**这个字段：`AgentTask` 上没有承载它的位置（本轮
+   * 只扩本事件类型），判定一律走 `sessionId` 的哨兵值（`LOCAL_SESSION_SENTINEL`
+   * / `isLocalSessionId`，见 `toolCatalog.ts`）。后端两个字段都要发：`side` 是
+   * 权威标记，哨兵值保证「真任务 / 重启恢复的占位 task」的既有判定（`sessionId`
+   * 是否为空串）不会把正在跑的本机子任务误判成占位。
+   */
+  side?: 'local';
 }
 
 /**

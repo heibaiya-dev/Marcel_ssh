@@ -30,6 +30,9 @@ export function getConversationAgentStatus(
     }
   }
 
+  // `!!t.sessionId` = 排除重启恢复的占位 task（sessionId 为空串）。本机子任务
+  // （`local_subagent`）的 sessionId 是哨兵值 —— **这里要它算真任务**：正在跑/
+  // 等审批就得亮状态环，哨兵值恰恰为此非空。别把本机任务过滤掉。
   const convTasks = Object.values(tasks).filter(
     (t) => targetConvIds.has(t.conversationId) && !!t.sessionId,
   );
@@ -85,6 +88,9 @@ export function getSessionAgentStatus(
 
 /**
  * 获取全局所有运行中的任务（用于多 Agent 抽屉与计数胶囊）
+ *
+ * 同样按「sessionId 非空」排除重启恢复的占位 task：本机子任务的哨兵值算真任务，
+ * 它会进抽屉；抽屉那边按 `isLocalSessionId` 显示「本机」、跳转时不切终端标签。
  */
 export function getActiveRunningTasks(tasks: Record<string, AgentTask>): AgentTask[] {
   return Object.values(tasks).filter((t) => !!t.sessionId && isTaskBusy(t.status));
