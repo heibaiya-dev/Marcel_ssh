@@ -966,26 +966,23 @@ export async function sftpRename(
   return invoke("sftp_rename", { sessionId, oldPath, newPath });
 }
 
-export async function sftpUploadFolder(
-  sessionId: string,
-  remotePath: string,
-  archiveData: number[],
-): Promise<string> {
-  return invoke<string>("sftp_upload_folder", {
-    sessionId,
-    remotePath,
-    archiveData,
-  });
-}
-
+/**
+ * 读取文件内容（编辑器用）。`hasBom` 表示原文带 UTF-8 BOM（后端已剥掉 BOM 再给
+ * content），保存时必须原样回传，否则会静默丢掉 BOM。旧后端没有该字段，按无 BOM 处理。
+ */
 export async function sftpReadFile(
   sessionId: string,
   path: string,
-): Promise<{ content: string; mtime: number }> {
-  return invoke<{ content: string; mtime: number }>("sftp_read_file", {
+): Promise<{ content: string; mtime: number; hasBom: boolean }> {
+  const result = await invoke<{
+    content: string;
+    mtime: number;
+    hasBom?: boolean;
+  }>("sftp_read_file", {
     sessionId,
     path,
   });
+  return { ...result, hasBom: result.hasBom === true };
 }
 
 export async function sftpGetMtime(
@@ -995,12 +992,14 @@ export async function sftpGetMtime(
   return invoke<number>("sftp_get_mtime", { sessionId, path });
 }
 
+/** 写回文件。`bom` 为 true 时后端会在内容前补回 UTF-8 BOM（缺省 false，向后兼容）。 */
 export async function sftpWriteFile(
   sessionId: string,
   path: string,
   content: string,
+  bom = false,
 ): Promise<void> {
-  return invoke("sftp_write_file", { sessionId, path, content });
+  return invoke("sftp_write_file", { sessionId, path, content, bom });
 }
 
 export async function sftpDownloadStream(

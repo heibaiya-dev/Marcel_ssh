@@ -62,6 +62,8 @@ export default function FileEditorModal({
   const viewRef = useRef<EditorView | null>(null);
   const originalContentRef = useRef<string>('');
   const mtimeRef = useRef<number>(0);
+  /** 原文是否带 UTF-8 BOM：保存时原样回传，避免静默丢掉 BOM。 */
+  const hasBomRef = useRef(false);
   const saveRef = useRef<() => Promise<SaveResult>>(async () => 'blocked');
 
   const [loading, setLoading] = useState(false);
@@ -83,7 +85,8 @@ export default function FileEditorModal({
     setError(null);
     try {
       const content = viewRef.current.state.doc.toString();
-      await sftpWriteFile(sessionId, filePath, content);
+      // bom 原样回传：后端读到 BOM 会剥掉再给编辑器，保存时必须补回去
+      await sftpWriteFile(sessionId, filePath, content, hasBomRef.current);
       originalContentRef.current = content;
       // Update mtime after successful save
       try {
@@ -144,7 +147,7 @@ export default function FileEditorModal({
   }, []);
 
   const createEditor = useCallback(
-    async (content: string) => {
+    async (content: string, isCancelled: () => boolean) => {
       if (!editorContainerRef.current) return;
 
       destroyEditor();
@@ -153,6 +156,12 @@ export default function FileEditorModal({
       const loader = LANGUAGE_LOADERS[ext];
 
       const languageExtension = loader ? await loader().catch(() => []) : [];
+
+      // 等动态语言包期间组件可能已被卸载/关闭：cleanup 早就跑过 destroyEditor()，
+      // 此时若继续往下建 view，它会挂在已脱离文档的容器上且再没人销毁（泄漏）。
+      // 判定必须在最后一处 await 之后、`new EditorView` 之前（与 ImagePreviewModal
+      // 的 cancelled 标志同思路）。
+      if (isCancelled()) return;
 
       const updateListener = EditorView.updateListener.of(() => {
         updateLineCount();
@@ -219,7 +228,8 @@ export default function FileEditorModal({
         if (cancelled) return;
         originalContentRef.current = result.content;
         mtimeRef.current = result.mtime;
-        await createEditor(result.content);
+        hasBomRef.current = result.hasBom;
+        await createEditor(result.content, () => cancelled);
       } catch (err) {
         if (cancelled) return;
         setError(getErrorMessage(err));

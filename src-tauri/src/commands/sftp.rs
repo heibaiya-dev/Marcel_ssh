@@ -625,9 +625,13 @@ pub async fn sftp_compress_archive(
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReadFileResult {
     pub content: String,
     pub mtime: u64,
+    /// 原文件是否带 UTF-8 BOM。读时 BOM 被剥掉（编辑器不该显示它），
+    /// 保存时必须原样写回，否则一次「打开-保存」就会静默改掉文件头字节。
+    pub has_bom: bool,
 }
 
 const MAX_EDITOR_FILE_SIZE: u64 = 2 * 1024 * 1024;
@@ -671,16 +675,17 @@ pub async fn sftp_read_file(
     }
 
     // strip BOM if present
-    let bytes = if data.starts_with(b"\xEF\xBB\xBF") {
-        &data[3..]
-    } else {
-        &data[..]
-    };
+    let has_bom = has_utf8_bom(&data);
+    let bytes = if has_bom { &data[3..] } else { &data[..] };
 
     let content = String::from_utf8(bytes.to_vec())
         .map_err(|_| AppError::Ssh("无法解码文件，可能为二进制文件或使用了不支持的编码".into()))?;
 
-    Ok(ReadFileResult { content, mtime })
+    Ok(ReadFileResult {
+        content,
+        mtime,
+        has_bom,
+    })
 }
 
 #[tauri::command]
@@ -709,10 +714,15 @@ pub async fn sftp_write_file(
     session_id: String,
     path: String,
     content: String,
+    bom: Option<bool>,
 ) -> Result<(), AppError> {
     let path = validate_sftp_remote_path(&path)?;
     let sftp = state.ssh_manager.open_sftp(&session_id).await?;
     let temp_path = remote_sidecar_path(&path, "edit")?;
+
+    // BOM 属于原文件字节的一部分：读端剥掉后由 `ReadFileResult.hasBom` 单独
+    // 回传，写端据 `bom` 参数写回，缺省 false 即旧行为（不带 BOM）。
+    let data = encode_file_content(&content, bom.unwrap_or(false));
 
     let mut file = sftp
         .open_with_flags(
@@ -722,7 +732,7 @@ pub async fn sftp_write_file(
         .await
         .map_err(|e| AppError::Ssh(format!("打开远程文件失败: {}", e)))?;
 
-    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, content.as_bytes()).await {
+    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &data).await {
         let _ = sftp.remove_file(&temp_path).await;
         return Err(AppError::Ssh(format!("写入远程文件失败: {}", e)));
     }
