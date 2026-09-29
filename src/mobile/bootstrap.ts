@@ -1,5 +1,5 @@
 import type { AgentMode } from '@/lib/types';
-import { appReady } from '@/lib/tauri';
+import { appReady, sftpPreviewCleanup } from '@/lib/tauri';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useTaskStore } from '@/stores/taskStore';
 import { useSkillStore } from '@/stores/skillStore';
@@ -26,6 +26,12 @@ export function resolveBootstrapMode(
 export interface MobileBootstrapDeps {
   /** Window starts visible:false — must show early (desktop App does this). */
   appReady: () => Promise<void>;
+  /**
+   * 启动清理图片预览临时文件（`marcel-previews/`）。
+   * 移动端预览大图后进程被系统回收时，这些临时文件会留在 app_data 里只增不减
+   * （单张上限 50MB），必须在启动时扫一次 —— 桌面已在同样的时机清理。
+   */
+  cleanupPreviewTemp: () => Promise<void>;
   loadSettings: () => Promise<void>;
   getDefaultAgentMode: () => string | undefined | null;
   setMode: (mode: AgentMode) => void;
@@ -46,6 +52,14 @@ export async function runMobileBootstrap(
     await deps.appReady();
   } catch {
     /* browser preview has no tauri */
+  }
+  // 清理上次进程被回收时留下的预览临时文件：best-effort，失败不阻塞启动。
+  try {
+    void deps.cleanupPreviewTemp().catch(() => {
+      /* 清理失败不影响启动 */
+    });
+  } catch {
+    /* best-effort（同步抛出同样忽略） */
   }
   // 聚合启动快照：一次性 Hydrate 设置、连接 与 Skills
   await deps.loadSettings();
@@ -86,6 +100,7 @@ export async function bootstrapMobileApp(): Promise<void> {
   try {
     await runMobileBootstrap({
       appReady: () => appReady(),
+      cleanupPreviewTemp: () => sftpPreviewCleanup(),
       loadSettings: () => hydrateBootstrapData(),
       getDefaultAgentMode: () =>
         useSettingsStore.getState().settings.defaultAgentMode,
