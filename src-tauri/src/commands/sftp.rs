@@ -135,7 +135,7 @@ pub struct OpenWithSystemResult {
 pub enum SysopenPhase {
     /// 下载中：written/total 推送给 download 卡片。
     Downloading { written: u64, total: u64 },
-    /// 下载完成，即将调用系统默认应用打开。
+    /// 下载完成，且已成功调用系统默认应用打开。
     Opened,
     /// 已用系统应用打开，正在监视本地文件变化。
     Monitoring,
@@ -2436,6 +2436,38 @@ fn emit_sysopen_state(
     }
 }
 
+/// 查 sysopen 去重表：同一 (session, remote_path) 已有任务时返回 (task_id, 本地副本)。
+/// active_paths 有记录但 watchers 已无（任务已结束、残留未清）时顺手清掉残留并
+/// 返回 None，让调用方走完整流程。
+fn lookup_sysopen_task(
+    state: &crate::AppState,
+    session_id: &str,
+    remote_path: &str,
+) -> Option<(String, PathBuf)> {
+    let key = (session_id.to_string(), remote_path.to_string());
+    let existing_task_id = state.sysopen_active_paths.read().get(&key).cloned()?;
+    let local_path = state
+        .sysopen_watchers
+        .read()
+        .get(&existing_task_id)
+        .map(|(_, lp, _)| lp.clone());
+    match local_path {
+        Some(lp) => Some((existing_task_id, lp)),
+        None => {
+            state.sysopen_active_paths.write().remove(&key);
+            None
+        }
+    }
+}
+
+/// 复用一个已在跑的 sysopen 任务：再次用系统默认应用打开它的本地副本。
+fn reopen_sysopen_local_copy(app: &AppHandle, local_path: &Path) -> Result<(), AppError> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(local_path.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| AppError::Ssh(format!("重新打开失败: {}", e)))
+}
+
 /// 单次回传：本地文件 → 远程 .sysopen-sync 临时文件 → 原子 rename 替换原文件。
 /// 返回回传后的 (mtime, size) 签名，用于判断下次是否仍脏。
 async fn sysopen_sync_back(
@@ -2533,8 +2565,54 @@ async fn sysopen_is_dirty(local_path: &Path, last: &(Option<SystemTime>, u64)) -
     }
 }
 
+/// 取消时的收尾：本地副本相对上次同步仍是脏的就做一次最终回传。
+/// 返回 (要推送的终态, 是否保留本地副本)。
+/// 回传失败绝不能吞掉：用户最后一次保存只落在本地副本里，原来 `let _ = ...`
+/// 之后 teardown 无条件删副本，等于静默丢改动、界面还只说「已取消」。
+async fn sysopen_final_sync_on_cancel(
+    app: &AppHandle,
+    state: &crate::AppState,
+    session_id: &str,
+    remote_path: &str,
+    local_path: &Path,
+    task_id: &str,
+    download_id: &str,
+    upload_id: &str,
+    last_sig: &(Option<SystemTime>, u64),
+) -> (SysopenPhase, bool) {
+    if !sysopen_is_dirty(local_path, last_sig).await {
+        return (SysopenPhase::Cancelled, false);
+    }
+    match sysopen_sync_back(
+        app,
+        state,
+        session_id,
+        remote_path,
+        local_path,
+        task_id,
+        download_id,
+        upload_id,
+    )
+    .await
+    {
+        Ok(_) => (SysopenPhase::Cancelled, false),
+        Err(e) => (
+            SysopenPhase::Failed {
+                message: format!(
+                    "取消时最终回传失败：{}。本地副本已保留在 {}，可手动取回",
+                    e,
+                    local_path.display()
+                ),
+            },
+            true,
+        ),
+    }
+}
+
 /// 任务统一收尾：drop watcher（停止监听）、删本地临时文件、清状态表。
 /// 任何退出路径都应调用，确保不残留 watcher / 临时文件 / 去重表项。
+/// `keep_local`：取消时最终回传失败的情况下必须保留本地副本（用户的最终
+/// 改动只存在于这个文件里），此时不删文件与所属临时目录，路径已写进提示。
 async fn sysopen_teardown(
     state: &crate::AppState,
     task_id: &str,
@@ -2542,19 +2620,40 @@ async fn sysopen_teardown(
     remote_path: &str,
     local_path: &Path,
     watcher: Option<notify::RecommendedWatcher>,
+    keep_local: bool,
 ) {
     drop(watcher);
     let part_path = format!("{}.part", local_path.to_string_lossy());
     let _ = tokio::fs::remove_file(part_path).await;
-    let _ = tokio::fs::remove_file(local_path).await;
-    if let Some(task_temp_root) = local_path.parent() {
-        let _ = tokio::fs::remove_dir(task_temp_root).await;
+    if !keep_local {
+        let _ = tokio::fs::remove_file(local_path).await;
+        if let Some(task_temp_root) = local_path.parent() {
+            let _ = tokio::fs::remove_dir(task_temp_root).await;
+        }
     }
-    state.sysopen_watchers.write().remove(task_id);
-    state
-        .sysopen_active_paths
-        .write()
-        .remove(&(session_id.to_string(), remote_path.to_string()));
+    // compare-and-remove：只有表里仍记录着「本次这个任务」时才摘除。
+    // watchers 以 task_id 为键，身份靠随任务唯一的本地路径比对（每个任务
+    // 一个 uuid 临时目录）；active_paths 比对登记的 task_id。否则本任务的
+    // 收尾会把同键新任务的状态摘掉，新任务从此无法取消/去重。
+    {
+        let mut watchers = state.sysopen_watchers.write();
+        let is_same_task =
+            watchers
+                .get(task_id)
+                .is_some_and(|(stored_session, stored_local, _)| {
+                    stored_session == session_id && stored_local == local_path
+                });
+        if is_same_task {
+            watchers.remove(task_id);
+        }
+    }
+    {
+        let key = (session_id.to_string(), remote_path.to_string());
+        let mut active = state.sysopen_active_paths.write();
+        if active.get(&key).map(String::as_str) == Some(task_id) {
+            active.remove(&key);
+        }
+    }
 }
 
 /// sysopen 总控：下载 → 用系统应用打开 → notify 监视 → 改动回传。
@@ -2591,6 +2690,7 @@ async fn run_sysopen_task(
                 &remote_path,
                 &local_path,
                 None,
+                false,
             )
             .await;
             return;
@@ -2615,6 +2715,7 @@ async fn run_sysopen_task(
                 &remote_path,
                 &local_path,
                 None,
+                false,
             )
             .await;
             return;
@@ -2640,6 +2741,7 @@ async fn run_sysopen_task(
                 &remote_path,
                 &local_path,
                 None,
+                false,
             )
             .await;
             return;
@@ -2664,7 +2766,7 @@ async fn run_sysopen_task(
                             emit_sysopen_state(&app, &task_id, &download_id, &upload_id,
                                 SysopenPhase::Failed { message: format!("写入本地临时文件失败: {}", e) });
                             let _ = tokio::fs::remove_file(&temp_part).await;
-                            sysopen_teardown(&state, &task_id, &session_id, &remote_path, &local_path, None).await;
+                            sysopen_teardown(&state, &task_id, &session_id, &remote_path, &local_path, None, false).await;
                             return;
                         }
                         written += n as u64;
@@ -2680,7 +2782,7 @@ async fn run_sysopen_task(
                                         total, written
                                     ),
                                 });
-                            sysopen_teardown(&state, &task_id, &session_id, &remote_path, &local_path, None).await;
+                            sysopen_teardown(&state, &task_id, &session_id, &remote_path, &local_path, None, false).await;
                             return;
                         }
                         emit_sysopen_state(&app, &task_id, &download_id, &upload_id,
@@ -2690,7 +2792,7 @@ async fn run_sysopen_task(
                         emit_sysopen_state(&app, &task_id, &download_id, &upload_id,
                             SysopenPhase::Failed { message: format!("读取远程文件失败: {}", e) });
                         let _ = tokio::fs::remove_file(&temp_part).await;
-                        sysopen_teardown(&state, &task_id, &session_id, &remote_path, &local_path, None).await;
+                        sysopen_teardown(&state, &task_id, &session_id, &remote_path, &local_path, None, false).await;
                         return;
                     }
                 }
@@ -2717,6 +2819,7 @@ async fn run_sysopen_task(
             &remote_path,
             &local_path,
             None,
+            false,
         )
         .await;
         return;
@@ -2741,6 +2844,7 @@ async fn run_sysopen_task(
             &remote_path,
             &local_path,
             None,
+            false,
         )
         .await;
         return;
@@ -2762,19 +2866,13 @@ async fn run_sysopen_task(
             &remote_path,
             &local_path,
             None,
+            false,
         )
         .await;
         return;
     }
 
     // ── 阶段 2：用系统默认应用打开（tauri-plugin-opener） ──
-    emit_sysopen_state(
-        &app,
-        &task_id,
-        &download_id,
-        &upload_id,
-        SysopenPhase::Opened,
-    );
     {
         use tauri_plugin_opener::OpenerExt;
         if let Err(e) = app
@@ -2798,11 +2896,21 @@ async fn run_sysopen_task(
                 &remote_path,
                 &local_path,
                 None,
+                false,
             )
             .await;
             return;
         }
     }
+    // Opened 必须等打开真的成功后再发：先发会让前端下载卡片已经显示
+    // 「已用系统应用打开」，而实际失败只能再补一条 Failed 覆盖它。
+    emit_sysopen_state(
+        &app,
+        &task_id,
+        &download_id,
+        &upload_id,
+        SysopenPhase::Opened,
+    );
 
     // ── 阶段 3：notify 监视本地文件变化 ──
     emit_sysopen_state(
@@ -2844,6 +2952,7 @@ async fn run_sysopen_task(
                 &remote_path,
                 &local_path,
                 None,
+                false,
             )
             .await;
             return;
@@ -2866,6 +2975,7 @@ async fn run_sysopen_task(
             &remote_path,
             &local_path,
             None,
+            false,
         )
         .await;
         return;
@@ -2876,20 +2986,20 @@ async fn run_sysopen_task(
     let mut consecutive_failures: u32 = 0;
     let mut pending_sync = false;
     let mut final_phase = SysopenPhase::Synced;
+    // 取消时最终回传失败 → 保留本地副本（路径已写进 Failed 提示）
+    let mut keep_local_copy = false;
 
     loop {
         if pending_sync {
             tokio::select! {
                 biased;
                 _ = cancel_rx.changed() => {
-                    // 取消时若仍有未同步改动，做一次最终回传（尽力而为，失败忽略）
-                    if sysopen_is_dirty(&local_path, &last_sig).await {
-                        let _ = sysopen_sync_back(
-                            &app, &state, &session_id, &remote_path, &local_path,
-                            &task_id, &download_id, &upload_id,
-                        ).await;
-                    }
-                    final_phase = SysopenPhase::Cancelled;
+                    let (phase, keep) = sysopen_final_sync_on_cancel(
+                        &app, &state, &session_id, &remote_path, &local_path,
+                        &task_id, &download_id, &upload_id, &last_sig,
+                    ).await;
+                    final_phase = phase;
+                    keep_local_copy = keep;
                     break;
                 }
                 _ = tokio::time::sleep(SYSOPEN_SYNC_DEBOUNCE) => {
@@ -2926,13 +3036,12 @@ async fn run_sysopen_task(
             tokio::select! {
                 biased;
                 _ = cancel_rx.changed() => {
-                    if sysopen_is_dirty(&local_path, &last_sig).await {
-                        let _ = sysopen_sync_back(
-                            &app, &state, &session_id, &remote_path, &local_path,
-                            &task_id, &download_id, &upload_id,
-                        ).await;
-                    }
-                    final_phase = SysopenPhase::Cancelled;
+                    let (phase, keep) = sysopen_final_sync_on_cancel(
+                        &app, &state, &session_id, &remote_path, &local_path,
+                        &task_id, &download_id, &upload_id, &last_sig,
+                    ).await;
+                    final_phase = phase;
+                    keep_local_copy = keep;
                     break;
                 }
                 _ = notify_rx.recv() => {
@@ -2950,6 +3059,7 @@ async fn run_sysopen_task(
         &remote_path,
         &local_path,
         Some(watcher),
+        keep_local_copy,
     )
     .await;
 }
@@ -2981,61 +3091,18 @@ pub async fn sftp_open_with_system(
         return Err(AppError::Ssh("远端文件名包含非法字符".into()));
     }
 
-    // 同名去重：同一 (session, remote_path) 已有 sysopen 任务在跑 → 复用已下载的本地副本，
-    // 再次唤起系统应用打开，不重新下载、不重复监视（旧 task 仍在监视改动并自动回传）。
+    // 同名去重（快路径）：同一 (session, remote_path) 已有 sysopen 任务在跑 → 复用
+    // 已下载的本地副本，再次唤起系统应用打开，不重新下载、不重复监视
+    //（旧 task 仍在监视改动并自动回传）。
+    if let Some((existing_task_id, local_to_reopen)) =
+        lookup_sysopen_task(&state, &session_id, &remote_path)
     {
-        let existing_task_id = {
-            let active = state.sysopen_active_paths.read();
-            active
-                .get(&(session_id.clone(), remote_path.clone()))
-                .cloned()
-        };
-        if let Some(existing_task_id) = existing_task_id {
-            // 从 watchers 取已存在任务的本地路径
-            let local_to_reopen = {
-                let watchers = state.sysopen_watchers.read();
-                watchers.get(&existing_task_id).map(|(_, lp, _)| lp.clone())
-            };
-            match local_to_reopen {
-                Some(lp) => {
-                    use tauri_plugin_opener::OpenerExt;
-                    if let Err(e) = app
-                        .opener()
-                        .open_path(lp.to_string_lossy().to_string(), None::<&str>)
-                    {
-                        return Err(AppError::Ssh(format!("重新打开失败: {}", e)));
-                    }
-                    return Ok(OpenWithSystemResult {
-                        task_id: existing_task_id,
-                        local_path: lp.to_string_lossy().to_string(),
-                        reused: true,
-                    });
-                }
-                None => {
-                    // 异常：active_paths 有记录但 watchers 已无（任务已结束但残留未清）。
-                    // 清理残留后继续走完整下载+打开+监视流程。
-                    state
-                        .sysopen_active_paths
-                        .write()
-                        .remove(&(session_id.clone(), remote_path.clone()));
-                }
-            }
-        }
-    }
-
-    // 单 session 并发上限
-    {
-        let watchers = state.sysopen_watchers.read();
-        let count = watchers
-            .iter()
-            .filter(|(_, (sid, _, _))| sid.as_str() == session_id.as_str())
-            .count();
-        if count >= SYSOPEN_MAX_CONCURRENT_PER_SESSION {
-            return Err(AppError::Ssh(format!(
-                "同时打开的文件过多（上限 {}），请先关闭部分再重试",
-                SYSOPEN_MAX_CONCURRENT_PER_SESSION
-            )));
-        }
+        reopen_sysopen_local_copy(&app, &local_to_reopen)?;
+        return Ok(OpenWithSystemResult {
+            task_id: existing_task_id,
+            local_path: local_to_reopen.to_string_lossy().to_string(),
+            reused: true,
+        });
     }
 
     let sftp = state.ssh_manager.open_sftp(&session_id).await?;
@@ -3080,16 +3147,68 @@ pub async fn sftp_open_with_system(
     let local_filename = sysopen_local_filename(&remote_basename, &connection_name)?;
     let local_path = task_temp_root.join(local_filename);
 
-    // 先注册取消信号 + 活跃路径表，确保 spawn 后立即可被取消/去重
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    state.sysopen_watchers.write().insert(
-        task_id.clone(),
-        (session_id.clone(), local_path.clone(), cancel_tx),
-    );
-    state
-        .sysopen_active_paths
-        .write()
-        .insert((session_id.clone(), remote_path.clone()), task_id.clone());
+    // 注册 = 「查重 + 并发上限 + 落表」在同一个写锁临界区内一次做完。
+    // 上面那条快路径到这里的中间隔着两次 SFTP 往返（metadata、建临时目录），
+    // 若仍是 check-then-insert，两个并发请求会双双通过检查、各起一个监视任务，
+    // 之后互相覆盖回写；旧任务的收尾还会把新任务的状态表项摘掉。
+    enum Registration {
+        Registered(tokio::sync::watch::Receiver<bool>),
+        Reuse(String, PathBuf),
+        TooMany,
+    }
+    let registration = {
+        let mut watchers = state.sysopen_watchers.write();
+        let mut active = state.sysopen_active_paths.write();
+        let key = (session_id.clone(), remote_path.clone());
+        let existing = active
+            .get(&key)
+            .and_then(|id| watchers.get(id).map(|(_, lp, _)| (id.clone(), lp.clone())));
+        match existing {
+            Some((existing_task_id, local_path)) => {
+                Registration::Reuse(existing_task_id, local_path)
+            }
+            None => {
+                let count = watchers
+                    .iter()
+                    .filter(|(_, (sid, _, _))| sid.as_str() == session_id.as_str())
+                    .count();
+                if count >= SYSOPEN_MAX_CONCURRENT_PER_SESSION {
+                    Registration::TooMany
+                } else {
+                    // 先注册取消信号 + 活跃路径表，确保 spawn 后立即可被取消/去重
+                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                    watchers.insert(
+                        task_id.clone(),
+                        (session_id.clone(), local_path.clone(), cancel_tx),
+                    );
+                    active.insert(key, task_id.clone());
+                    Registration::Registered(cancel_rx)
+                }
+            }
+        }
+    };
+
+    let cancel_rx = match registration {
+        Registration::Registered(cancel_rx) => cancel_rx,
+        Registration::Reuse(existing_task_id, local_path) => {
+            // 抢锁晚了一步：另一个同目标请求已经注册。复用它，并把自己刚建的
+            // 空临时目录清掉，别在 marcel-sysopen 下攒目录。
+            let _ = std::fs::remove_dir_all(&task_temp_root);
+            reopen_sysopen_local_copy(&app, &local_path)?;
+            return Ok(OpenWithSystemResult {
+                task_id: existing_task_id,
+                local_path: local_path.to_string_lossy().to_string(),
+                reused: true,
+            });
+        }
+        Registration::TooMany => {
+            let _ = std::fs::remove_dir_all(&task_temp_root);
+            return Err(AppError::Ssh(format!(
+                "同时打开的文件过多（上限 {}），请先关闭部分再重试",
+                SYSOPEN_MAX_CONCURRENT_PER_SESSION
+            )));
+        }
+    };
 
     let result_local_path = local_path.to_string_lossy().to_string();
     let result_task_id = task_id.clone();
