@@ -142,6 +142,15 @@ pub async fn agent_stop_task(
             .cancel_with_reason(tid, crate::command_exec::CancelReason::Task)
             .await;
         let _ = state.command_exec.cancel_task_jobs(tid).await;
+        // 本机执行是另一套 manager（没有 SSH 会话可断连级联，见 AppState 的
+        // `local_command_exec` 注释），停止任务同样要停它名下的本机作业与前台
+        // 执行——否则用户点了停止，本机上跑的构建 / 脚本还在继续。两类调用的
+        // 分工与上面完全一致（前台走注册表，后台作业逐个终止）。
+        let _ = state
+            .local_command_exec
+            .cancel_with_reason(tid, crate::command_exec::CancelReason::Task)
+            .await;
+        let _ = state.local_command_exec.cancel_task_jobs(tid).await;
     }
     if tasks_to_cancel.len() > 1 {
         log::info!(

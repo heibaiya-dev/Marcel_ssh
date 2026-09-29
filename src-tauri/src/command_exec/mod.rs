@@ -32,12 +32,15 @@
 pub(crate) mod executor;
 mod job;
 mod ledger;
+/// 本机执行的传输层（与远端同构，见 `local_transport.rs` 模块注释）。
+mod local_transport;
 mod manager;
 mod ticket;
 
 pub use executor::ExecExit;
 pub use job::{JobInfo, JobOutputResult, JobStatus};
 pub use ledger::LEDGER_FILE_NAME;
+pub use local_transport::LocalExecTransport;
 pub use manager::{CommandExecutionManager, JobCaller, JobFilter, SubmitOutcome};
 pub use ticket::{
     truncate_display, CancelReason, CommandSource, CommandTicket, ExecutionSnapshot,

@@ -155,6 +155,27 @@ pub struct ToolContext {
     /// 后台作业按它归属——与 `conversation_id` 的区别在于子 agent：
     /// 子 agent 的作业要算在父对话名下，否则父对话既看不到、重启后也认不回。
     pub owner_conversation_id: Option<String>,
+    /// **本机侧标记**：这个 ctx 的目标是用户自己这台电脑（而不是 SSH 会话那台
+    /// 服务器）。只有本机子 agent 的 ctx 会置 `true`（由组装处置位，见
+    /// [`Self::with_local_side`]）；默认 `false`。
+    ///
+    /// 为什么必须有它：`local_bash` 只能在本机 ctx 上执行。而
+    /// [`Self::exec_ticket`] 在 `command_exec` 为 None 时会回退到 SSH 管理器，
+    /// 拿错 ctx 就会把「本机命令」打到服务器上——正是这类工具要避免的事。
+    /// 标记是那个工具的最后一道闸门，不是路由依据：本机能力只经本机子 agent 的
+    /// registry 暴露（声明表的 `ToolRoles::LocalSubOnly`）。
+    pub local_side: bool,
+    /// **任务启动时的 Agent 设置快照**（agent_loop 构造 ctx 时注入，与本任务
+    /// dispatcher 手里那份是同一个值），默认 `None`。
+    ///
+    /// 为什么工具需要一个「可能过期的设置」：有些工具要在自己内部**重算一遍**
+    /// dispatcher 的审批结论（`local_subagent` 的补问：只有 dispatcher 不问的那些
+    /// 组合才补一次）。两处必须用同一份输入 —— 工具若改读实时设置，任务中途改设置
+    /// 就会让「dispatcher 问不问」与「工具补不补」错位，出现重复问、或谁都不问。
+    ///
+    /// `None` = 没注入（测试 / 未来的其它调用方），工具应回落到实时设置并在日志 /
+    /// 注释里说清楚这一点。
+    pub agent_mode_settings: Option<Arc<crate::config::settings::AgentModeSettings>>,
 }
 
 impl ToolContext {
@@ -181,7 +202,29 @@ impl ToolContext {
             target_host_label: None,
             conversation_id: Some(conversation_id.into()),
             owner_conversation_id: None,
+            local_side: false,
+            agent_mode_settings: None,
         }
+    }
+
+    /// 声明这个上下文的目标是**用户自己这台电脑**（本机子 agent 组装 ctx 时调用）。
+    ///
+    /// 置位后 `ctx.command_exec` 应当挂 `AppState.local_command_exec`；`local_bash`
+    /// 用它做最后一道闸门（见该字段与 `tools/local_bash.rs` 的说明）。
+    pub fn with_local_side(mut self, local: bool) -> Self {
+        self.local_side = local;
+        self
+    }
+
+    /// 注入**任务启动时的 Agent 设置快照**（agent_loop 组装 ctx 时调用，传的正是
+    /// 本任务 dispatcher 手里那份）。工具要用它重算审批结论才不会与 dispatcher
+    /// 漂移，见字段说明。
+    pub fn with_agent_mode_settings(
+        mut self,
+        settings: Arc<crate::config::settings::AgentModeSettings>,
+    ) -> Self {
+        self.agent_mode_settings = Some(settings);
+        self
     }
 
     /// 声明归属对话（根对话）。子 agent 的上下文由此把作业记在父对话名下；

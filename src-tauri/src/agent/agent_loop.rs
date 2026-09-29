@@ -747,7 +747,17 @@ pub(crate) async fn run_agent_loop(
             // (a) 已结算待通知的作业：注入为一条通知，然后 continue 'round——
             //     回 for round 下一轮，让模型看到 notice 并 job_output 收集
             //     （不能 break 走 Done，那会把结局丢掉）。
-            let settled_jobs = state.command_exec.take_settled_jobs_for_task(&task_id);
+            //     本机作业与远端作业同构、同属这套「跑完再开一轮」的语义，所以
+            //     两边的结算**并进同一个列表**（各自的 `take_...` 只在自己的
+            //     在册表里置「已播报」，合起来不会重复告知同一条作业）；按启动
+            //     时间重排一次，通知里的先后与实际发生顺序一致。
+            let mut settled_jobs = state.command_exec.take_settled_jobs_for_task(&task_id);
+            settled_jobs.extend(
+                state
+                    .local_command_exec
+                    .take_settled_jobs_for_task(&task_id),
+            );
+            settled_jobs.sort_by_key(|job| job.started_at_millis);
             if !settled_jobs.is_empty() {
                 let notice = build_job_settlement_notice(&settled_jobs);
                 log::info!(

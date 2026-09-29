@@ -121,6 +121,15 @@ pub struct AppState {
     /// （取代旧的 long_exec_cancel_senders）、断连级联取消与后台作业
     /// （环形缓冲 + 溢出文件 + 非忙等读取）。
     pub command_exec: crate::command_exec::CommandExecutionManager,
+    /// 本机（用户这台电脑）命令执行管理器：与 `command_exec` **完全同构**
+    /// （同一个传输层抽象、同一套结果类型与收尾语义——超时/取消只停止等待、
+    /// 不杀进程），只是执行落在一台本机子进程上。
+    ///
+    /// 为什么要单独一个 manager 而不是共用：`command_exec` 构造时注册了
+    /// SshManager 的断连观察者（会话断开 → 级联取消该会话上的执行），本机作业
+    /// 与任何 SSH 会话都没有关系，共用会让「用户断了一台服务器」连坐杀掉本机
+    /// 正在跑的构建/脚本。这里用 `with_transport_at`（不注册断连观察者）。
+    pub local_command_exec: crate::command_exec::CommandExecutionManager,
     /// Watcher state for "open with system" files, keyed by task_id.
     /// Value = (session_id, local_path, cancel sender). local_path 用于「重复打开」时
     /// 复用已下载的本地副本（再次唤起系统应用，不重新下载、不重复监视）；
@@ -518,6 +527,24 @@ impl AppState {
         )
         .await;
 
+        // 本机执行管理器：与上面那台共用同一套命令执行体系（文件里只有子进程
+        // 而不是 SSH 通道这一点不同），台账与作业溢出目录同样落在配置目录下。
+        // `with_transport_at` 是**不注册断连观察者**的构造——SSH 断连不该连坐
+        // 取消本机作业，正合本机需求。**这里也刻意不挂 task drain hook**：那个
+        // 钩子回收的是多机操控自动拉起的 SSH 会话（见下方 state 构造之后的
+        // 注释），本机作业没有任何这类子资源，挂了也只会是空转。
+        // 本机作业 id 前缀 `local_job_N`：与远端 `job_N` 在形状上分开——两台
+        // manager 各自从自己的台账发号，不分开就会撞 id（合并通知 / 合并列表里
+        // 两条不同作业同名，读路径还会拿错数据）。前缀走**构造参数**而不是
+        // 构造后的 setter：`with_transport_at_prefixed` 内部不 clone inner，
+        // 没有「改不动前缀」的中间状态。
+        let local_command_exec =
+            crate::command_exec::CommandExecutionManager::with_transport_at_prefixed(
+                std::sync::Arc::new(crate::command_exec::LocalExecTransport::new()),
+                config_dir.join("local_command"),
+                crate::command_exec::CommandExecutionManager::LOCAL_JOB_ID_PREFIX,
+            );
+
         let state = Self {
             ssh_manager,
             agent_tasks: std::sync::Arc::new(PlRwLock::new(HashMap::new())),
@@ -539,6 +566,7 @@ impl AppState {
             plugin_install_cancel: crate::cancel::CancellationRegistry::new(),
             compactions: crate::cancel::CancellationRegistry::new(),
             command_exec,
+            local_command_exec,
             sysopen_watchers: std::sync::Arc::new(PlRwLock::new(HashMap::new())),
             sysopen_active_paths: std::sync::Arc::new(PlRwLock::new(HashMap::new())),
             settings_warning: std::sync::Arc::new(PlRwLock::new(settings_warning)),

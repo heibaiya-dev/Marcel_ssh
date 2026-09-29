@@ -40,7 +40,7 @@ use crate::ssh::connection::SshManager;
 
 use super::executor::{timeout_preview, ExecExit, ExecOutcome, ExecTransport, SshExecTransport};
 use super::job::{JobInfo, JobInstance, JobOutputResult, JobStatus};
-use super::ledger::{JobLedgerStore, LedgerJob, RETENTION_MILLIS};
+use super::ledger::{JobLedgerStore, LedgerJob, LEDGER_FILE_NAME, RETENTION_MILLIS};
 use super::ticket::{
     truncate_display, CancelReason, CommandSource, CommandTicket, ExecutionSnapshot,
     ExecutionStatus, DEFAULT_EXEC_TIMEOUT,
@@ -213,6 +213,20 @@ struct ManagerInner {
     jobs: PlMutex<HashMap<String, Arc<PlMutex<JobInstance>>>>,
     /// 作业台账：job 序号水位（跨应用运行单调，见 [`JobLedgerStore`]）。
     ledger: Arc<JobLedgerStore>,
+    /// 本实例分配的作业 id 前缀（构造参数：`new` / `with_transport_at` 取
+    /// [`CommandExecutionManager::DEFAULT_JOB_ID_PREFIX`]，
+    /// [`CommandExecutionManager::with_transport_at_prefixed`] 取调用方给的值）。
+    ///
+    /// 存在的理由：本应用有**两台同构的 manager**（远端 `AppState.command_exec`
+    /// 与本机 `AppState.local_command_exec`），各自从自己的台账发号。前缀相同
+    /// 时两边都会发出 `job_1`——合并后的通知 / 列表里两条不同的作业同名，
+    /// 读路径按 id 形状路由到错误的 manager 就会**静默读到另一条作业**。
+    ///
+    /// 用锁而不是普通字段：前缀是**共享**状态（`Clone` 共享同一份 inner），
+    /// 而 [`CommandExecutionManager::with_id_prefix`] 是签名兼容的便捷入口，
+    /// 拿不到独占引用也必须能真的生效——旧实现用 `Arc::get_mut(..).expect(..)`，
+    /// 误用会在启动期 panic（生产构造 `new` 内部就把 inner 交给了断连观察者）。
+    job_id_prefix: PlRwLock<String>,
     /// 溢出文件目录（应用配置目录下的 jobs_temp）。
     temp_dir: PathBuf,
     /// 末条作业结算后回收任务级资源的钩子（见
@@ -396,6 +410,20 @@ pub struct CommandExecutionManager {
 }
 
 impl CommandExecutionManager {
+    /// 远端（SSH）作业 id 前缀。**历史契约，逐字节不得改**：作业台账、溢出
+    /// 文件名与模型历史里记着的 `job_N` 都按它写死，改一个字符就等于把所有
+    /// 旧 id 变成另一个作业。
+    pub const DEFAULT_JOB_ID_PREFIX: &'static str = "job_";
+
+    /// 本机（用户这台电脑）作业 id 前缀。
+    ///
+    /// 与 [`Self::DEFAULT_JOB_ID_PREFIX`] 在**形状**上分开，是两条正确性保证：
+    /// ① 两台 manager 各自发号也不会撞 id（两边都从 `job_1` 开始时，合并的
+    /// 通知 / 列表里会出现两条同名但不同机器上的作业）；② 读路径（
+    /// `agent/tools/job_ops.rs` 的 `job_output` / `job_kill`）与界面命令因此
+    /// 才有判据把 id 路由到正确的 manager。
+    pub const LOCAL_JOB_ID_PREFIX: &'static str = "local_job_";
+
     /// 生产构造：绑定真实 SshManager，并注册断连观察者实现级联取消。
     /// `temp_dir` 用于后台作业的输出溢出文件（应用配置目录下），
     /// `ledger_path` 是作业台账文件（job 序号水位）。
@@ -419,6 +447,7 @@ impl CommandExecutionManager {
             recent: TokioMutex::new(VecDeque::new()),
             jobs: PlMutex::new(HashMap::new()),
             ledger: Arc::new(JobLedgerStore::load(ledger_path)),
+            job_id_prefix: PlRwLock::new(Self::DEFAULT_JOB_ID_PREFIX.to_string()),
             temp_dir,
             task_drain_hook: PlRwLock::new(None),
         });
@@ -467,6 +496,19 @@ impl CommandExecutionManager {
     /// 与 [`Self::with_transport`] 同，但把台账与溢出目录钉在指定目录上
     /// （测试用同一目录构造两次即可模拟「应用重启」）。
     pub fn with_transport_at(transport: Arc<dyn ExecTransport>, base: PathBuf) -> Self {
+        Self::with_transport_at_prefixed(transport, base, Self::DEFAULT_JOB_ID_PREFIX)
+    }
+
+    /// 同 [`Self::with_transport_at`]，但用调用方指定的作业 id 前缀发号。
+    ///
+    /// 本机管理器用 [`Self::LOCAL_JOB_ID_PREFIX`] 构造它，与远端 `job_N` 在
+    /// 形状上分开（理由见 [`Self::LOCAL_JOB_ID_PREFIX`]）。前缀是**构造参数**
+    /// 而不是构造后再改的状态，所以不存在「改了但没生效」这条路径。
+    pub fn with_transport_at_prefixed(
+        transport: Arc<dyn ExecTransport>,
+        base: PathBuf,
+        prefix: &str,
+    ) -> Self {
         let temp_dir = base.join("jobs_temp");
         let _ = std::fs::create_dir_all(&temp_dir);
         let inner = Arc::new(ManagerInner {
@@ -476,12 +518,32 @@ impl CommandExecutionManager {
             by_task_id: TokioMutex::new(HashMap::new()),
             recent: TokioMutex::new(VecDeque::new()),
             jobs: PlMutex::new(HashMap::new()),
-            ledger: Arc::new(JobLedgerStore::load(base.join("jobs.json"))),
+            // 台账文件名只认 `ledger::LEDGER_FILE_NAME`：硬编码字符串会在
+            // 改名时静默分叉（改了常量、这里还在读写旧文件，重启后作业
+            // 全「查无此作业」）。
+            ledger: Arc::new(JobLedgerStore::load(base.join(LEDGER_FILE_NAME))),
+            job_id_prefix: PlRwLock::new(prefix.to_string()),
             temp_dir,
             task_drain_hook: PlRwLock::new(None),
         });
         recover_ledger_jobs(&inner);
         Self { inner }
+    }
+
+    /// 指定本实例分配的作业 id 前缀（默认 [`Self::DEFAULT_JOB_ID_PREFIX`]）。
+    ///
+    /// 本机管理器用它取 [`Self::LOCAL_JOB_ID_PREFIX`]，与远端 `job_N` 分开；
+    /// 判据与理由见 [`Self::LOCAL_JOB_ID_PREFIX`]。**新代码请直接用
+    /// [`Self::with_transport_at_prefixed`]**（前缀当构造参数传），这里只是
+    /// 签名兼容的便捷入口。
+    ///
+    /// 前缀存在共享的锁里，所以签名兼容的 `&str` + 链式写法**任何时刻调用都
+    /// 真的生效**：不再有「拿不到独占引用就 panic」那条路（旧实现用
+    /// `Arc::get_mut(..).expect(..)`，而生产构造 `new` / 任何 `Clone` 之后都
+    /// 拿不到独占引用，误用会变成启动期 panic）。构造后立即调用仍是约定。
+    pub fn with_id_prefix(self, prefix: &str) -> Self {
+        *self.inner.job_id_prefix.write() = prefix.to_string();
+        self
     }
 
     /// 提交一次命令执行并等待完成。
@@ -703,9 +765,11 @@ impl CommandExecutionManager {
 
         let exec_id = self.inner.next_exec_id.fetch_add(1, Ordering::Relaxed) + 1;
         // 序号来自落盘台账：跨应用运行单调递增，旧 job_id 永不复用
-        // （模型的历史里可能一直记着上一次运行的 job_1）。
+        // （模型的历史里可能一直记着上一次运行的 job_1）。前缀区分实例
+        // （远端 `job_` / 本机 `local_job_`），两台 manager 的号段互不相干、
+        // 也绝不互相顶替——见 `ManagerInner::job_id_prefix`。
         let job_num = self.inner.ledger.allocate_job_num();
-        let job_id = format!("job_{}", job_num);
+        let job_id = format!("{}{}", *self.inner.job_id_prefix.read(), job_num);
 
         let (cancel_tx, cancel_rx) = watch::channel(CancelReason::User);
         let (notify_tx, _) = watch::channel(0usize);
@@ -1763,6 +1827,13 @@ mod tests {
         CommandExecutionManager::with_transport_at(Arc::new(MockTransport { behavior }), base)
     }
 
+    /// 带自定义 id 前缀的 manager（本机管理器的构造形态，见
+    /// [`CommandExecutionManager::LOCAL_JOB_ID_PREFIX`]）。
+    fn manager_with_prefix(behavior: MockBehavior, prefix: &str) -> CommandExecutionManager {
+        CommandExecutionManager::with_transport(Arc::new(MockTransport { behavior }))
+            .with_id_prefix(prefix)
+    }
+
     #[tokio::test]
     async fn exit_code_lands_in_job_detail_and_output() {
         // 非零退出不算执行失败（旧语义），但退出码必须能被读到：
@@ -1848,6 +1919,234 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("job_9"));
         assert!(msg.contains("job_list"), "要给出下一步动作：{}", msg);
+    }
+
+    #[tokio::test]
+    async fn default_job_ids_keep_the_historical_remote_shape() {
+        // 远端 id 形状是历史契约（台账、溢出文件名、模型历史里的 `job_N`）：
+        // 默认前缀一字不改 —— `job_` + 纯十进制序号，不引入任何新形状。
+        let mgr = manager(MockBehavior::Return("ok", false));
+        let info = mgr
+            .submit_background(
+                None,
+                CommandTicket::new("s1", "one", CommandSource::Agent),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.job_id, "job_1");
+        let num = info
+            .job_id
+            .strip_prefix(CommandExecutionManager::DEFAULT_JOB_ID_PREFIX)
+            .expect("默认前缀必须是 job_");
+        assert!(
+            num.parse::<u64>().is_ok(),
+            "序号必须是纯十进制（不带任何本机前缀）：{}",
+            info.job_id
+        );
+        assert!(!info
+            .job_id
+            .starts_with(CommandExecutionManager::LOCAL_JOB_ID_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn id_prefix_keeps_both_managers_job_ids_distinct() {
+        // 本机管理器取 `local_job_` 前缀：两台 manager 各自从自己的台账发号
+        // 都是 1 号，没有前缀就会撞成两条同名作业 —— 读路径按 id 路由时
+        // 会静默读到另一台 manager 上的作业。这条把形状与「互不顶替」钉住。
+        let remote = manager(MockBehavior::Return("remote-out", false));
+        let local = manager_with_prefix(
+            MockBehavior::Return("local-out", false),
+            CommandExecutionManager::LOCAL_JOB_ID_PREFIX,
+        );
+
+        let r = remote
+            .submit_background(
+                None,
+                CommandTicket::new("s1", "remote-cmd", CommandSource::Agent),
+                None,
+            )
+            .await
+            .unwrap();
+        let l = local
+            .submit_background(
+                None,
+                CommandTicket::new("local", "local-cmd", CommandSource::Agent),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(r.job_id, "job_1");
+        assert_eq!(l.job_id, "local_job_1");
+        assert_ne!(r.job_id, l.job_id, "两台 manager 绝不能发出同名作业");
+
+        // 本机 id 在远端 manager 上报「查无此作业」，而不是静默命中同号的远端作业
+        let err = remote
+            .job_output(
+                &l.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&l.job_id), "{}", err);
+        assert!(err.contains("job_list"), "{}", err);
+        // 远端 manager 上的 `job_1` 仍是它自己的那条
+        let read = remote
+            .job_output(
+                &r.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                JobCaller::Unscoped,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.job_id, r.job_id);
+    }
+
+    /// 前缀是**构造参数**（[`CommandExecutionManager::with_transport_at_prefixed`]）：
+    /// 本机管理器的正式构造形态。顺带钉住台账文件名只认 `LEDGER_FILE_NAME`
+    /// ——硬编码字符串会在改名时静默分叉（读写两个不同的文件）。
+    #[tokio::test]
+    async fn prefixed_constructor_issues_local_job_ids() {
+        let base = cross_run_base("prefixed-ctor");
+        let mgr = CommandExecutionManager::with_transport_at_prefixed(
+            Arc::new(MockTransport {
+                behavior: MockBehavior::Return("ok", false),
+            }),
+            base.clone(),
+            CommandExecutionManager::LOCAL_JOB_ID_PREFIX,
+        );
+        let info = mgr
+            .submit_background(
+                None,
+                CommandTicket::new("local", "build", CommandSource::Agent),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.job_id, "local_job_1");
+        assert!(
+            base.join(LEDGER_FILE_NAME).is_file(),
+            "台账必须落在 LEDGER_FILE_NAME 指名的文件上"
+        );
+    }
+
+    /// 兼容入口 [`CommandExecutionManager::with_id_prefix`] 在 manager 已被
+    /// clone 之后也必须真的生效、不能再 panic：生产构造 `new` 在构造期就把
+    /// inner 交给了断连观察者（旧实现的 `Arc::get_mut(..).expect(..)` 在那条
+    /// 路径上必然炸），而 Clone 同样共享同一份 inner。
+    #[tokio::test]
+    async fn id_prefix_setter_applies_even_after_the_manager_was_cloned() {
+        let mgr = manager(MockBehavior::Return("ok", false));
+        let shared = mgr.clone();
+        let mgr = mgr.with_id_prefix(CommandExecutionManager::LOCAL_JOB_ID_PREFIX);
+
+        let a = mgr
+            .submit_background(
+                None,
+                CommandTicket::new("local", "one", CommandSource::Agent),
+                None,
+            )
+            .await
+            .unwrap();
+        let b = shared
+            .submit_background(
+                None,
+                CommandTicket::new("local", "two", CommandSource::Agent),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(a.job_id, "local_job_1");
+        assert_eq!(
+            b.job_id, "local_job_2",
+            "clone 共享同一份 inner：前缀对所有句柄生效，否则 id 形状会分叉"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_jobs_are_fenced_like_remote_ones() {
+        // 本机作业的归属围栏与远端同一套语义：别的对话读 / 杀 / 列 / 唤醒
+        // 都被挡住，且文案说的是「不是你的」而不是「查无此作业」。
+        let local = manager_with_prefix(
+            MockBehavior::Return("done", false),
+            CommandExecutionManager::LOCAL_JOB_ID_PREFIX,
+        );
+        let mine = local
+            .submit_background(
+                None,
+                CommandTicket::new("local", "build", CommandSource::Agent)
+                    .cancellable("task-local-fence", "本机构建")
+                    .owned_by("conv_a"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_job_settlement(&local, &mine.job_id, "local").await,
+            JobStatus::Completed
+        );
+
+        let agent = |conv: &'static str| JobCaller::Agent {
+            owner_conversation_id: Some(conv),
+        };
+        // 列表按归属围栏
+        assert!(local
+            .list_jobs(JobFilter::OwnerConversation("conv_b"), None)
+            .await
+            .is_empty());
+        assert_eq!(
+            local
+                .list_jobs(JobFilter::OwnerConversation("conv_a"), None)
+                .await
+                .len(),
+            1
+        );
+        // 唤醒同样按对话精确匹配（别的对话不会被叫醒）。必须在读输出**之前**
+        // 看：读到终态即视为结局已被消费（`settled_notified`），此后不再播报。
+        assert!(local.pending_job_notices("conv_b").is_empty());
+        assert_eq!(local.pending_job_notices("conv_a").len(), 1);
+
+        // 自己的：读得到（这次读取消费掉待播报结局）
+        assert!(local
+            .job_output(
+                &mine.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                agent("conv_a")
+            )
+            .await
+            .is_ok());
+        // 别人的：读 / 杀都被挡，文案说明是归属问题（复用既有文案，不新造）
+        let read_err = local
+            .job_output(
+                &mine.job_id,
+                0,
+                JobOutputResult::MAX_READ_BYTES,
+                false,
+                Duration::ZERO,
+                agent("conv_b"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(read_err.contains("另一个对话"), "{}", read_err);
+        let kill_err = local
+            .kill_job(&mine.job_id, CancelReason::Agent, agent("conv_b"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(kill_err.contains("另一个对话"), "{}", kill_err);
     }
 
     #[tokio::test]
@@ -2920,7 +3219,7 @@ mod tests {
             .await
             .unwrap();
         wait_for_job_settlement(&mgr, &info.job_id, "s1").await;
-        let before = std::fs::read(base.join("jobs.json")).unwrap();
+        let before = std::fs::read(base.join(LEDGER_FILE_NAME)).unwrap();
         mgr.inner.jobs.lock().remove(&info.job_id);
         let mut offset = 0;
         let mut output = String::new();
@@ -2963,7 +3262,7 @@ mod tests {
         assert!(!empty.lossy);
         assert_eq!(empty.status, JobStatus::Completed);
         assert_eq!(
-            std::fs::read(base.join("jobs.json")).unwrap(),
+            std::fs::read(base.join(LEDGER_FILE_NAME)).unwrap(),
             before,
             "分页不改写台账"
         );
@@ -2995,7 +3294,7 @@ mod tests {
         std::fs::write(&spill, b"head").unwrap();
         const CAPTURED: usize = 8 * 1024 * 1024;
         {
-            let ledger = JobLedgerStore::load(base.join("jobs.json"));
+            let ledger = JobLedgerStore::load(base.join(LEDGER_FILE_NAME));
             ledger.upsert(LedgerJob {
                 job_id: "job_1".into(),
                 session_id: "sess_1".into(),
@@ -3050,7 +3349,7 @@ mod tests {
         let base = cross_run_base("no-spill");
         const CAPTURED: usize = 5000;
         {
-            let ledger = JobLedgerStore::load(base.join("jobs.json"));
+            let ledger = JobLedgerStore::load(base.join(LEDGER_FILE_NAME));
             ledger.upsert(LedgerJob {
                 job_id: "job_1".into(),
                 session_id: "sess_1".into(),
