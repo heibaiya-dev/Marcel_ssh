@@ -1,8 +1,13 @@
-import { getErrorMessage as baseGetErrorMessage } from './errors';
+import { parseAppError } from './errors';
 import { IMAGE_EXTENSIONS } from './constants';
 
+/**
+ * 字节数 → 展示文案。0 显示 `0 B`：列表里「没有大小」由调用方显式给 `-`
+ * （目录行），而进度语境复用本函数（`sftpTransferManager.progressText`、
+ * `sftpUploadStatus`），`- / 3.2 MB` 会被读成「总量未知」，所以 0 必须是 0 B。
+ */
 export function formatSize(bytes: number): string {
-  if (bytes === 0) return '-';
+  if (bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(1024));
   return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
@@ -50,22 +55,27 @@ export function isDialogCancelled(err: unknown): boolean {
   return msg.includes('File picker cancelled');
 }
 
+/** SFTP 错误码 → 中文友好提示（对应 Rust `AppError::Sftp { code }`）。 */
+const SFTP_CODE_HINTS: Record<number, string> = {
+  2: '文件或目录不存在',
+  3: '权限不足',
+  4: '操作失败',
+  5: '错误的文件句柄',
+};
+
+/**
+ * 在基础文案上补一句 SFTP 错误码的含义。
+ *
+ * 码在 **`data.code`** 里：Rust 序列化形态是 `{ kind: 'Sftp', message, data: { code } }`
+ * （`src-tauri/src/error.rs`）。此前读顶层 `obj.code`，与线上形态不符，是永远走不到的
+ * 死分支——用户只看得到 `SFTP error (code 2): ...` 这种机器话。
+ */
 export function getErrorMessage(err: unknown): string {
-  if (err && typeof err === 'object') {
-    const obj = err as Record<string, unknown>;
-    if (typeof obj.code === 'number') {
-      const sftpCodes: Record<number, string> = {
-        2: '文件或目录不存在',
-        3: '权限不足',
-        4: '操作失败',
-        5: '错误的文件句柄',
-      };
-      const hint = sftpCodes[obj.code];
-      if (hint) {
-        const msg = typeof obj.message === 'string' ? obj.message : baseGetErrorMessage(err);
-        return `${msg}（${hint}）`;
-      }
-    }
+  const { message, data } = parseAppError(err);
+  const code = data?.code;
+  if (typeof code === 'number') {
+    const hint = SFTP_CODE_HINTS[code];
+    if (hint) return `${message}（${hint}）`;
   }
-  return baseGetErrorMessage(err);
+  return message;
 }

@@ -140,9 +140,38 @@ describe('transferScheduler', () => {
     expect(status(a.id)).toBe('cancelling');
     expect(sftpCancelDownload).toHaveBeenCalledWith(a.id);
 
-    downloads[0].reject('下载已取消');
+    // 生产形态：AppError::Ssh 的 Display 会加 `SSH error: ` 前缀（error.rs），
+    // 取消判定必须包含式匹配，否则用户点取消会看到红色「下载失败」。
+    downloads[0].reject({ kind: 'Ssh', message: 'SSH error: 下载已取消' });
     await flush();
     expect(status(a.id)).toBe('cancelled');
+    expect(useTransferStore.getState().items[a.id].statusText).toContain('下载已取消');
+  });
+
+  it('treats agent-style suffixed cancel message as cancelled', async () => {
+    const uploads = deferredMock(sftpUploadStream as ReturnType<typeof vi.fn>);
+    const a = makeItem();
+    enqueueTransfer(a);
+
+    // Agent 传输路径的取消文案带后缀（sftp_transfer.rs: `上传已取消: {msg}`）
+    uploads[0].reject({ kind: 'Ssh', message: 'SSH error: 上传已取消: channel closed' });
+    await flush();
+    expect(status(a.id)).toBe('cancelled');
+  });
+
+  it('does not treat overwrite-refused message as cancelled', async () => {
+    const uploads = deferredMock(sftpUploadStream as ReturnType<typeof vi.fn>);
+    const a = makeItem();
+    enqueueTransfer(a);
+
+    // 与 Rust 侧 is_download_cancel 同口径：策略拒绝是失败，不是取消
+    uploads[0].reject({
+      kind: 'Ssh',
+      message: 'SSH error: 本地文件已存在（未允许覆盖）',
+    });
+    await flush();
+    expect(status(a.id)).toBe('error');
+    expect(useTransferStore.getState().items[a.id].statusText).toContain('上传失败');
   });
 
   it('fails queued items whose session is not alive at start', () => {

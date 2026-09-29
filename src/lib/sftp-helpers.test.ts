@@ -2,8 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { formatSize, modeToString, getErrorMessage } from '@/lib/sftp-helpers';
 
 describe('formatSize', () => {
-  it('returns dash for zero bytes', () => {
-    expect(formatSize(0)).toBe('-');
+  it('formats zero bytes as 0 B', () => {
+    // 进度文案复用本函数（sftpTransferManager / sftpUploadStatus）：
+    // `- / 3.2 MB` 会被读成"总量未知"，0 必须显示成 0 B
+    expect(formatSize(0)).toBe('0 B');
   });
 
   it('formats bytes', () => {
@@ -59,6 +61,13 @@ describe('modeToString', () => {
 });
 
 describe('getErrorMessage', () => {
+  /** Rust 序列化形态：{ kind, message, data: { code } }（src-tauri/src/error.rs） */
+  const sftpError = (code: number) => ({
+    kind: 'Sftp',
+    message: `SFTP error (code ${code}): something went wrong`,
+    data: { code },
+  });
+
   it('returns string directly', () => {
     expect(getErrorMessage('connection failed')).toBe('connection failed');
   });
@@ -68,29 +77,41 @@ describe('getErrorMessage', () => {
   });
 
   it('appends hint for SFTP code 2 (no such file)', () => {
-    const err = { message: 'open failed', code: 2 };
-    expect(getErrorMessage(err)).toContain('open failed');
-    expect(getErrorMessage(err)).toContain('文件或目录不存在');
+    const msg = getErrorMessage(sftpError(2));
+    expect(msg).toContain('SFTP error (code 2)');
+    expect(msg).toContain('文件或目录不存在');
   });
 
   it('appends hint for SFTP code 3 (permission denied)', () => {
-    const err = { message: 'access denied', code: 3 };
-    expect(getErrorMessage(err)).toContain('权限不足');
+    expect(getErrorMessage(sftpError(3))).toContain('权限不足');
   });
 
   it('appends hint for SFTP code 4 (operation failed)', () => {
-    const err = { message: 'op failed', code: 4 };
-    expect(getErrorMessage(err)).toContain('操作失败');
+    expect(getErrorMessage(sftpError(4))).toContain('操作失败');
   });
 
   it('appends hint for SFTP code 5 (bad file handle)', () => {
-    const err = { message: 'bad handle', code: 5 };
-    expect(getErrorMessage(err)).toContain('错误的文件句柄');
+    expect(getErrorMessage(sftpError(5))).toContain('错误的文件句柄');
   });
 
   it('returns raw message for unknown SFTP code', () => {
-    const err = { message: 'unknown error', code: 99 };
-    expect(getErrorMessage(err)).toBe('unknown error');
+    expect(getErrorMessage(sftpError(99))).toBe(
+      'SFTP error (code 99): something went wrong',
+    );
+  });
+
+  it('ignores non-numeric codes (KeyAuth 的 code 是字符串枚举)', () => {
+    const err = {
+      kind: 'KeyAuth',
+      message: '此私钥已加密，请输入私钥密码',
+      data: { code: 'needs_passphrase' },
+    };
+    expect(getErrorMessage(err)).toBe('此私钥已加密，请输入私钥密码');
+  });
+
+  it('returns structured message for non-Sftp AppError kinds', () => {
+    const err = { kind: 'Ssh', message: 'SSH error: 连接已关闭' };
+    expect(getErrorMessage(err)).toBe('SSH error: 连接已关闭');
   });
 
   it('falls back to JSON.stringify for non-standard objects', () => {

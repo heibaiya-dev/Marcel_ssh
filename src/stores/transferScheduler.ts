@@ -18,7 +18,20 @@ import {
   type TransferLane,
 } from './transferStore';
 
-const CANCELLED_MSGS = new Set(['上传已取消', '下载已取消']);
+/**
+ * 传输命令是否因「用户取消」而失败。
+ *
+ * 判定必须是**包含式**：后端取消是 `AppError::Ssh("上传已取消")`，序列化后的
+ * message 恒带 Display 前缀（`SSH error: 上传已取消`），Agent 传输路径还会带后缀
+ * （`上传已取消: xx`）——之前用精确匹配集合，一条都命中不了，用户点取消却看到红色
+ * 「上传失败」，移动端还会据此弹红色错误横幅（`latestTransferFailure` 只看 error）。
+ *
+ * 口径与 Rust 侧 `sftp_transfer::is_download_cancel` 保持一致：「未允许覆盖」这类
+ * 策略拒绝不是取消。
+ */
+function isCancelMessage(msg: string): boolean {
+  return msg.includes('取消') && !msg.includes('未允许覆盖');
+}
 
 // 模块级：每条车道当前运行项 id
 const running: Record<TransferLane, string | null> = {
@@ -104,7 +117,7 @@ function pump(lane: TransferLane): void {
     })
     .catch((err) => {
       const msg = getErrorMessage(err);
-      if (CANCELLED_MSGS.has(msg)) {
+      if (isCancelMessage(msg)) {
         finalize(next.id, {
           status: 'cancelled',
           statusText:
