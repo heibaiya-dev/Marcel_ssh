@@ -15,14 +15,13 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { subscribeTauriEvent, type Unsubscribe } from '@/lib/tauriEvent';
 
 export type DropPosition = { x: number; y: number };
 type DropHandler = (paths: string[], position?: DropPosition) => void;
 
 // ─── 模块级状态：enabled handler 栈，栈顶为当前活跃处理器 ───
 const handlerStack: DropHandler[] = [];
-let listenersAttached = false;
 
 function activeHandler(): DropHandler | null {
   return handlerStack.length > 0 ? handlerStack[handlerStack.length - 1]! : null;
@@ -48,30 +47,13 @@ function toCssPosition(position?: DropPosition): DropPosition | undefined {
   return { x: position.x / dpr, y: position.y / dpr };
 }
 
-// ─── 确保全局监听器只创建一次 ───
-async function attachGlobalListeners() {
-  if (listenersAttached) return;
-  listenersAttached = true;
-
-  // 文件放下
-  await listen<{ paths?: string[]; position?: DropPosition }>('tauri://drag-drop', (event) => {
-    setIsDragging(false);
-    const paths = event.payload.paths;
-    const handler = activeHandler();
-    if (paths && paths.length > 0 && handler) {
-      handler(paths, toCssPosition(event.payload.position));
-    }
-  });
-
-  // 文件拖入窗口
-  await listen('tauri://drag-enter', () => {
-    if (activeHandler()) setIsDragging(true);
-  });
-
-  // 拖拽离开窗口
-  await listen('tauri://drag-leave', () => {
-    setIsDragging(false);
-  });
+/** 统一的 drop 入口：只有栈顶消费者处理，其余实例不动。 */
+function handleDrop(paths: string[] | undefined, position?: DropPosition) {
+  setIsDragging(false);
+  const handler = activeHandler();
+  if (paths && paths.length > 0 && handler) {
+    handler(paths, toCssPosition(position));
+  }
 }
 
 // ─── Hook ───
@@ -90,7 +72,24 @@ export function useFileDrop(handler: DropHandler, enabled: boolean) {
       handlerRef.current(paths, position);
     };
     handlerStack.push(wrapper);
-    attachGlobalListeners();
+
+    // 用事件订阅原语而非裸 listen：旧实现把 `listenersAttached = true` 写在
+    // `await listen` **之前**且不接错误，任何一次注册失败都会留下未捕获 rejection，
+    // 并让本进程内的拖拽上传**永久失效**（守卫再也放不开）。
+    // subscribeTauriEvent 同步返回取消函数、注册失败只记日志并摘掉空壳通道；
+    // 失败后只要有新的挂载（或本实例重挂），同一事件名会重新注册，即可重试。
+    const offs: Unsubscribe[] = [
+      subscribeTauriEvent<{ paths?: string[]; position?: DropPosition }>(
+        'tauri://drag-drop',
+        (payload) => handleDrop(payload.paths, payload.position),
+      ),
+      subscribeTauriEvent('tauri://drag-enter', () => {
+        if (activeHandler()) setIsDragging(true);
+      }),
+      subscribeTauriEvent('tauri://drag-leave', () => {
+        setIsDragging(false);
+      }),
+    ];
 
     // 订阅拖拽状态
     const listener = (value: boolean) => setIsDraggingLocal(value);
@@ -98,6 +97,7 @@ export function useFileDrop(handler: DropHandler, enabled: boolean) {
     setIsDraggingLocal(isDraggingGlobal);
 
     return () => {
+      for (const off of offs) off();
       isDraggingListeners.delete(listener);
       const idx = handlerStack.lastIndexOf(wrapper);
       if (idx >= 0) handlerStack.splice(idx, 1);
