@@ -68,11 +68,66 @@ impl LocalPathPolicy {
     }
 }
 
-fn canonicalize_or_identity(p: &Path) -> Option<PathBuf> {
-    std::fs::canonicalize(p).ok()
+/// 取路径的规范形态；路径不存在（`~/.ssh`、`~/.aws` 等在本机可能根本没有）
+/// 或 canonicalize 失败时**原样返回**。
+///
+/// 这里必须是 identity 而不是 `None`：黑名单的语义是「这个位置**禁止**被
+/// 写入/读取」，与它当前存不存在无关。此前返回 `Option` + `filter_map`，等于
+/// 「受保护目录只要还没被创建过就自动退出黑名单」——Windows 新机上 `~/.ssh`、
+/// `~/.gnupg`、`~/.config`、`~/.aws`、`~/.kube` 全是这种状态，于是
+/// `download_file(local_path="C:\\Users\\X\\.ssh\\config", overwrite=true)`
+/// 会当场替 agent 把这个目录建出来再写文件进去（含后续其它 key 写入）。
+pub(crate) fn canonicalize_or_identity(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-fn default_blacklist() -> Vec<PathBuf> {
+/// 黑名单前缀比较用的路径「键」：只用于 [`blacklisted`] 的形态归一，不用于
+/// 访问文件，因此可以容忍 lossy 转换。
+///
+/// 为什么需要它（Windows 上两个形态差异会让黑名单直接失效）：
+/// 1. `std::fs::canonicalize` 在 Windows 返回 `\\?\` verbatim 形态
+///    （`\\?\C:\...`；UNC 是 `\\?\UNC\server\share\...`），而黑名单里不存在的
+///    受保护目录只能保留普通形态，两者用 `Path::starts_with` 比永远不相等；
+/// 2. 比较必须按 Windows 的大小写不敏感语义（`C:\Users\x\.ssh` 与
+///    `C:\Users\X\.SSH` 是同一个目录），否则改一下大小写就是一条绕过。
+///    ASCII 小写足够：盘符与这些受保护目录名都是 ASCII。
+/// 顺带把 `/` 统一成 `\`，免得同一路径的两种写法算出两个键。
+///
+/// 非 Windows 平台没有 verbatim 前缀；macOS 另做 ASCII 小写折叠（见下方 macOS
+/// 分支的说明），其余平台比较本就大小写敏感，原样返回。
+#[cfg(windows)]
+pub(crate) fn path_key(p: &Path) -> PathBuf {
+    let s = p.as_os_str().to_string_lossy().replace('/', "\\");
+    let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s
+    };
+    PathBuf::from(s.to_ascii_lowercase())
+}
+
+/// 非 Windows 平台：没有 verbatim 前缀。macOS 仍要做 ASCII 小写折叠——
+/// APFS / HFS+ 默认大小写**不敏感**，`/Users/me/.SSH/id_rsa` 与
+/// `/Users/me/.ssh/id_rsa` 是同一个文件，黑名单若按大小写敏感比较，
+/// 改一下大小写就是一条绕过（Windows 分支的注释里同一条理由）。
+/// Linux 及其余平台区分大小写，原样返回。
+///
+/// 代价：挂载在 macOS 上的**大小写敏感**卷（区分大小写格式化的 APFS / HFS+、
+/// 某些网络卷）上，`~/.SSH` 与 `~/.ssh` 是不同目录，前者会被误判成受保护位置。
+/// 这是安全方向的保守误报（拒绝而不是放行），可以接受。
+#[cfg(target_os = "macos")]
+pub(crate) fn path_key(p: &Path) -> PathBuf {
+    PathBuf::from(p.as_os_str().to_string_lossy().to_ascii_lowercase())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) fn path_key(p: &Path) -> PathBuf {
+    p.to_path_buf()
+}
+
+pub(crate) fn default_blacklist() -> Vec<PathBuf> {
     let mut raw: Vec<PathBuf> = Vec::new();
 
     if let Some(home) = dirs::home_dir() {
@@ -103,6 +158,10 @@ fn default_blacklist() -> Vec<PathBuf> {
             "/bin",
             "/sbin",
             "/var",
+            // `/dev`：Linux 分支早有它。缺了它，`/dev/zero`（len 恒为 0）这类
+            // 字符设备在本机读路径上没有任何黑名单兜底——修掉无界读的那道
+            // `is_file` 才是主防线，这条只是纵深（同时挡住 list 设备目录）。
+            "/dev",
         ] {
             raw.push(PathBuf::from(d));
         }
@@ -127,13 +186,41 @@ fn default_blacklist() -> Vec<PathBuf> {
     }
 
     raw.into_iter()
-        .filter_map(|p| canonicalize_or_identity(&p))
+        .map(|p| canonicalize_or_identity(&p))
         .collect()
+}
+
+/// Windows 上只接受「盘符 + 根」形态的本机路径，拒绝 UNC（`\\server\share`）、
+/// verbatim（`\\?\`）与设备命名空间（`\\.\`）前缀：
+/// - UNC 指向**另一台机器**的位置：本机黑名单在那台机器上什么也保护不了，
+///   而本工具承诺的本机语义只是「本机绝对路径 + 黑名单底线」；
+/// - `\\?\` / `\\.\` 会绕过 Win32 路径规范化与一部分解析规则（也让「校验的
+///   路径」和「落盘的路径」不再好对齐），LLM 没有任何理由用它。
+///
+/// 非 Windows 平台没有路径前缀概念，直接放行。
+#[cfg(windows)]
+pub(crate) fn reject_non_disk_prefix(p: &Path) -> Result<(), AppError> {
+    use std::path::Prefix;
+    if let Some(Component::Prefix(prefix)) = p.components().next() {
+        if !matches!(prefix.kind(), Prefix::Disk(_)) {
+            return Err(AppError::Agent(format!(
+                "local path 只支持本机盘符路径（如 C:\\Users\\you\\file.txt）：不支持网络共享 \
+                 (\\\\server\\share)、\\\\.\\ 与 \\\\?\\ 前缀。当前: {}",
+                p.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn reject_non_disk_prefix(_p: &Path) -> Result<(), AppError> {
+    Ok(())
 }
 
 /// Reserved Windows device names (case-insensitive).
 #[cfg(windows)]
-fn is_windows_reserved_name(name: &str) -> bool {
+pub(crate) fn is_windows_reserved_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
     matches!(
         stem.as_str(),
@@ -162,16 +249,25 @@ fn is_windows_reserved_name(name: &str) -> bool {
     )
 }
 
-fn validate_file_name(name: &str) -> Result<(), AppError> {
+/// 单个文件名（不含任何目录成分）的校验。本机路径的叶子与 upload_file 的
+/// `file_name` 参数共用。`/` 在任何平台都不是合法文件名（在 Windows 上它也是
+/// 分隔符）；`\` 只在 Windows 上非法（POSIX 的文件名里它是普通字符，不能误伤）。
+pub(crate) fn validate_file_name(name: &str) -> Result<(), AppError> {
     if name.is_empty() || name == "." || name == ".." {
         return Err(AppError::Agent(format!("invalid file name: {:?}", name)));
+    }
+    if name.contains('/') {
+        return Err(AppError::Agent(format!(
+            "file name contains path separator: {:?}",
+            name
+        )));
     }
     if name.contains('\0') {
         return Err(AppError::Agent("file name contains NUL byte".into()));
     }
     #[cfg(windows)]
     {
-        for ch in ['<', '>', ':', '"', '|', '?', '*'] {
+        for ch in ['<', '>', ':', '"', '|', '?', '*', '\\'] {
             if name.contains(ch) {
                 return Err(AppError::Agent(format!(
                     "file name contains illegal character {:?}",
@@ -211,8 +307,29 @@ fn resolve_against_ancestors(p: &Path) -> Result<PathBuf, AppError> {
                 ));
             }
             Component::Normal(s) => {
-                if s.to_string_lossy().contains('\0') {
+                let seg = s.to_string_lossy();
+                if seg.contains('\0') {
                     return Err(AppError::Agent("local path contains NUL byte".into()));
+                }
+                #[cfg(windows)]
+                {
+                    // `:` 出现在目录成分里只可能是 NTFS 数据流（`file.txt:stream`）
+                    // 或驱动器相对写法：都不是「普通文件路径」的语义，且 `:` 左边
+                    // 的名字可能命中黑名单前缀（`.ssh:stream`），一律拒绝。
+                    if seg.contains(':') {
+                        return Err(AppError::Agent(format!(
+                            "local path segment contains ':' (NTFS 数据流 / 非法写法): {:?}",
+                            seg
+                        )));
+                    }
+                    // 尾随空格 / 点：Win32 会把它们悄悄去掉（`secret.` → `secret`），
+                    // 落到别的目录去。这里拒绝，保证「校验的路径 == 落盘的路径」。
+                    if seg.ends_with(' ') || seg.ends_with('.') {
+                        return Err(AppError::Agent(format!(
+                            "local path segment ends with space or dot (Windows 会去掉它们): {:?}",
+                            seg
+                        )));
+                    }
                 }
             }
             _ => {}
@@ -270,6 +387,9 @@ pub async fn validate_local_download_path(
         ));
     }
 
+    // Windows 前缀门槛：UNC / verbatim / 设备命名空间都不接受。
+    reject_non_disk_prefix(raw)?;
+
     // File name checks.
     let file_name = raw
         .file_name()
@@ -277,6 +397,19 @@ pub async fn validate_local_download_path(
         .to_string_lossy()
         .to_string();
     validate_file_name(&file_name)?;
+
+    // 符号链接判定必须在 resolve **之前**、用**原始**路径做：
+    // `resolve_against_ancestors` 对已存在的叶子会 canonicalize，链接会被解析
+    // 成它的目标（普通文件/目录），之后再 `symlink_metadata` 永远看不到链接
+    // 本身——此前正是这个顺序让「拒绝覆盖符号链接」成了死代码。
+    if let Ok(meta) = fs::symlink_metadata(raw).await {
+        if meta.file_type().is_symlink() {
+            return Err(AppError::Agent(format!(
+                "local_path 是一个符号链接，拒绝覆盖（先删除链接或换一个普通文件路径）：{}",
+                raw.display()
+            )));
+        }
+    }
 
     // Resolve safely.
     let resolved = resolve_against_ancestors(raw)?;
@@ -291,12 +424,10 @@ pub async fn validate_local_download_path(
         )));
     }
 
-    // Existing-target handling.
+    // Existing-target handling. 叶子形态（symlink）已在上面按原始路径判过；
+    // 这里 resolved 的叶子一定是非链接（要么原本不存在，要么上面已拒绝）。
     if let Ok(meta) = fs::symlink_metadata(&resolved).await {
         let ft = meta.file_type();
-        if ft.is_symlink() {
-            return Err(AppError::Agent("refusing to overwrite a symlink".into()));
-        }
         if ft.is_dir() {
             return Err(AppError::Agent("refusing to overwrite a directory".into()));
         }
@@ -322,6 +453,7 @@ async fn validate_local_upload_path(p: &Path) -> Result<(), AppError> {
             "local_path 必须是本机（运行 Marcel SSH 的电脑）上已存在文件的绝对路径——它读的是你电脑上的文件，不是服务器文件。".into(),
         ));
     }
+    reject_non_disk_prefix(p)?;
     let meta = fs::metadata(p)
         .await
         .map_err(|e| AppError::Agent(format!("本地文件不可访问: {}", e)))?;
@@ -371,6 +503,21 @@ fn user_pick_cancelled() -> String {
         .to_string()
 }
 
+/// `user_pick=true` 但对话框没能弹出 / 返回值无法转成本机路径时的失败文案。
+///
+/// 必须与 [`user_pick_cancelled`] 区分：两者都拿不到路径，但下一步动作完全
+/// 相反——「用户取消」是用户的选择（该去问用户 / 换路径），「弹窗失败」是
+/// 环境问题（该重试或让用户手写路径）。此前 `.await.ok().flatten()` 把
+/// `JoinError`、`into_path` 失败与用户取消压成同一个 `None`，模型一律被告知
+/// 「用户取消了选择」——真实原因被吞掉，模型还会去追问一个根本没做选择的人。
+fn user_pick_failed(err: &str) -> String {
+    format!(
+        "系统文件对话框未能返回本机路径（不是用户取消，是弹窗/取路径失败）：{}。\
+         可改传显式 local_path 重试，或先调用 ask_user 工具与用户确认本机路径。",
+        err
+    )
+}
+
 /// 本地一侧（上传的源文件 / 下载的落点）由谁决定。
 #[derive(Debug, PartialEq, Eq)]
 enum LocalSide {
@@ -404,39 +551,53 @@ fn resolve_local_side(params: &serde_json::Value) -> LocalSide {
 }
 
 /// `user_pick` 上传：弹系统文件选择框让用户挑本机源文件（单选、不过滤类型）。
-/// 返回 None = 用户取消。阻塞式对话框会卡住调用线程，必须用 spawn_blocking
+///
+/// `Ok(None)` = 用户在对话框里点了取消；`Err` = 弹窗/取路径失败（两者语义不同，
+/// 见 [`user_pick_failed`]）。阻塞式对话框会卡住调用线程，必须用 spawn_blocking
 /// 离开 tokio 工作线程。
-async fn ask_user_pick_upload_source(app: &tauri::AppHandle) -> Option<PathBuf> {
+async fn ask_user_pick_upload_source(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
-        app.dialog()
+        match app
+            .dialog()
             .file()
             .set_title("选择要上传到服务器的文件")
             .blocking_pick_file()
-            .and_then(|fp| fp.into_path().ok())
+        {
+            None => Ok(None),
+            Some(fp) => fp
+                .into_path()
+                .map(Some)
+                .map_err(|e| format!("无法把对话框返回值转成本机路径: {}", e)),
+        }
     })
     .await
-    .ok()
-    .flatten()
+    .map_err(|e| format!("文件对话框任务异常退出: {}", e))?
 }
 
 /// `user_pick` 下载：弹系统保存对话框让用户选落点，预填远端文件名。
 async fn ask_user_pick_download_target(
     app: &tauri::AppHandle,
     suggested_name: String,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>, String> {
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
-        app.dialog()
+        match app
+            .dialog()
             .file()
             .set_title("选择保存位置")
             .set_file_name(suggested_name)
             .blocking_save_file()
-            .and_then(|fp| fp.into_path().ok())
+        {
+            None => Ok(None),
+            Some(fp) => fp
+                .into_path()
+                .map(Some)
+                .map_err(|e| format!("无法把对话框返回值转成本机路径: {}", e)),
+        }
     })
     .await
-    .ok()
-    .flatten()
+    .map_err(|e| format!("文件对话框任务异常退出: {}", e))?
 }
 
 // ────────────────────────────── UploadFileTool ──────────────────────────────
@@ -474,6 +635,60 @@ async fn remote_is_dir(sftp: &russh_sftp::client::SftpSession, path: &str) -> bo
     }
 }
 
+/// 校验 upload_file 的 `remote_path`：复用用户 SFTP 面板那条链的既有校验
+/// （[`crate::util::validate_sftp_remote_path`]：必须是服务器绝对路径、不含 `..`），
+/// 并返回归一化形态（折叠 `//`）。错误文案里带上是哪一条不合格，模型好改。
+fn validate_upload_remote_path(remote_path: &str) -> Result<String, AppError> {
+    match crate::util::validate_sftp_remote_path(remote_path) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            // 校验失败原因就写在 AppError::Ssh 的文案里（中文、可直接展示），
+            // 不要整段 to_string 带出 "SSH error:" 前缀。
+            let reason = match e {
+                AppError::Ssh(m) => m,
+                other => other.to_string(),
+            };
+            Err(AppError::Agent(format!(
+                "remote_path 非法（{}）：remote_path 是**服务器**上的路径，必须是绝对路径\
+                 （以 / 开头）、不能包含 `..`（路径穿越）或空字节。目录可写成 \
+                 /home/user/uploads/。当前值: {:?}",
+                reason, remote_path
+            )))
+        }
+    }
+}
+
+/// 校验 upload_file 的 `file_name` 参数（远端重命名用）：只接受单个文件名。
+/// 它会被拼到 `remote_path` 声称的目录后面，`../../etc/cron.d/x`、
+/// `sub/x` 或 `/etc/passwd` 这类值都能让落点越出模型声称的目录（远端服务器
+/// 会解析 `..`），必须在拼之前拒绝。
+fn validate_upload_remote_file_name(name: &str) -> Result<(), AppError> {
+    // 远端可能是 POSIX 也可能是 Windows 服务器：两种分隔符都当目录成分拒掉
+    // （本机校验器只在 Windows 上拒 `\`，这里不能依赖平台）。
+    if name.contains('/') || name.contains('\\') {
+        return Err(AppError::Agent(format!(
+            "file_name 非法（含路径分隔符）：它只能是**单个文件名**，目录部分请写在 \
+             remote_path 里。当前值: {:?}",
+            name
+        )));
+    }
+    match validate_file_name(name) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let reason = match e {
+                AppError::Agent(m) => m,
+                other => other.to_string(),
+            };
+            Err(AppError::Agent(format!(
+                "file_name 非法（{}）：它只能是**单个文件名**（不含 `/`、`\\`、`..`），\
+                 目录部分请写在 remote_path 里；想改文件名用 `新名字.txt` 这种纯文件名。\
+                 当前值: {:?}",
+                reason, name
+            )))
+        }
+    }
+}
+
 /// 解析上传的最终远端目标。
 ///
 /// 规则（消除「目录还是完整文件路径」的猜测）：
@@ -498,6 +713,9 @@ async fn resolve_upload_remote_path(
         .get("file_name")
         .and_then(|v| v.as_str())
         .filter(|n| !n.is_empty());
+    if let Some(name) = explicit_name {
+        validate_upload_remote_file_name(name)?;
+    }
 
     let (dir, name) = if let Some(name) = explicit_name {
         (remote_path.to_string(), name.to_string())
@@ -611,13 +829,24 @@ async fn upload_execute(
     if remote_path.is_empty() {
         return Ok(ToolOutput::fail("upload_file", "empty remote_path"));
     }
+    // remote_path 与用户 SFTP 面板走同一条校验（绝对路径、无 `..`）：否则
+    // `../x` 这类相对路径会落到远端 SFTP 的当前目录，与工具描述承诺的
+    // 「服务器上的路径」不是一回事。
+    let remote_path = match validate_upload_remote_path(remote_path) {
+        Ok(p) => p,
+        Err(e) => return Ok(ToolOutput::fail("upload_file", e.to_string())),
+    };
 
     // 本机源：显式 local_path 或 user_pick 弹窗（互斥，见 resolve_local_side）。
-    let local_path_buf = match resolve_local_side(&params) {
+    let local_side = resolve_local_side(&params);
+    // 用户在原生对话框里亲自挑的源文件 = 明确授权，不再要求模型确认体积。
+    let user_picked = matches!(local_side, LocalSide::UserPick);
+    let local_path_buf = match local_side {
         LocalSide::Given(p) => p,
         LocalSide::UserPick => match ask_user_pick_upload_source(&ctx.app_handle).await {
-            Some(p) => p,
-            None => return Ok(ToolOutput::fail("upload_file", user_pick_cancelled())),
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(ToolOutput::fail("upload_file", user_pick_cancelled())),
+            Err(e) => return Ok(ToolOutput::fail("upload_file", user_pick_failed(&e))),
         },
         LocalSide::Conflict => return Ok(ToolOutput::fail("upload_file", LOCAL_SIDE_CONFLICT)),
         LocalSide::Missing => {
@@ -684,7 +913,7 @@ async fn upload_execute(
 
     // 解析最终远端目标（探测式：remote_path 是目录还是完整文件路径）。
     let final_remote =
-        match resolve_upload_remote_path(&sftp, &local_path_buf, remote_path, &params).await {
+        match resolve_upload_remote_path(&sftp, &local_path_buf, &remote_path, &params).await {
             Ok(p) => p,
             Err(e) => {
                 return Ok(ToolOutput::fail("upload_file", e.to_string()));
@@ -985,8 +1214,9 @@ async fn download_execute(
         LocalSide::UserPick => {
             picked_by_user = true;
             match ask_user_pick_download_target(&ctx.app_handle, suggested_name).await {
-                Some(p) => p,
-                None => return Ok(ToolOutput::fail("download_file", user_pick_cancelled())),
+                Ok(Some(p)) => p,
+                Ok(None) => return Ok(ToolOutput::fail("download_file", user_pick_cancelled())),
+                Err(e) => return Ok(ToolOutput::fail("download_file", user_pick_failed(&e))),
             }
         }
         LocalSide::Conflict => return Ok(ToolOutput::fail("download_file", LOCAL_SIDE_CONFLICT)),
