@@ -16,7 +16,6 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn(async () => vi.fn()),
 }));
 vi.mock('@/lib/tauri', () => ({
-  sftpDownload: vi.fn(),
   sftpDownloadCancel: vi.fn(),
   sftpPreviewCleanup: vi.fn(),
   sftpRemove: vi.fn(),

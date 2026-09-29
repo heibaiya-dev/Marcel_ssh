@@ -935,21 +935,6 @@ export async function sftpListDir(
   return invoke<SftpFileEntry[]>("sftp_list_dir", { sessionId, path });
 }
 
-export async function sftpUpload(
-  sessionId: string,
-  remotePath: string,
-  data: number[],
-): Promise<void> {
-  return invoke("sftp_upload", { sessionId, remotePath, data });
-}
-
-export async function sftpDownload(
-  sessionId: string,
-  remotePath: string,
-): Promise<number[]> {
-  return invoke<number[]>("sftp_download", { sessionId, remotePath });
-}
-
 export async function sftpMkdir(
   sessionId: string,
   path: string,

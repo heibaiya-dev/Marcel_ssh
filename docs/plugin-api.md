@@ -941,7 +941,7 @@ HTTP API 仅支持以下命令子集（远少于后端实际命令数）：
 | `plugin_send_notification` / `notification` | `notification` |
 | `events.subscribe` / `events.unsubscribe`   | `events`       |
 
-其他后端命令（如 `sftp_list_dir`、`sftp_upload`、`agent_start_task` 等）**不支持**通过 HTTP API 调用。
+其他后端命令（如 `sftp_list_dir`、`sftp_upload_stream`、`agent_start_task` 等）**不支持**通过 HTTP API 调用。
 
 - 虚拟命令（`session.active` 等）通过后端状态实现，**不返回前端 store 派生字段**（如 `createdAt`）。如需含 `configId`/`createdAt` 的数据，请使用事件 IPC 通道
 - HTTP API 的 capability 检查**与事件 IPC 一致**：同时校验 manifest 声明、插件启用状态和用户在设置页的授权状态（三层授权，via `plugins::auth` 模块）
