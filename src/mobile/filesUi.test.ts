@@ -20,6 +20,12 @@ import {
   batchDeleteProgressText,
   defaultArchiveTargetPath,
   latestTransferFailure,
+  latestTransferCompletion,
+  transferCompletionNotice,
+  soleSelectedEntry,
+  canOpenEntry,
+  entryBadge,
+  entrySubtitle,
 } from './filesUi';
 
 function session(
@@ -437,5 +443,172 @@ describe('latestTransferFailure', () => {
       a: item('a', { sessionId: 's2', status: 'error', statusText: 'X' }),
     };
     expect(latestTransferFailure(items, ['a'], 's1')).toBeNull();
+  });
+});
+
+describe('latestTransferCompletion', () => {
+  function item(
+    id: string,
+    patch: Partial<StoredTransferItem> = {},
+  ): StoredTransferItem {
+    return {
+      id,
+      kind: 'download',
+      sessionId: 's1',
+      fileName: `${id}.log`,
+      localPath: `/local/${id}.log`,
+      remotePath: `/srv/${id}.log`,
+      written: 100,
+      total: 100,
+      statusText: '下载完成',
+      createdAt: 1,
+      status: 'done',
+      finishedAt: 10,
+      ...patch,
+    };
+  }
+
+  it('returns null when nothing finished successfully', () => {
+    const items: Record<string, StoredTransferItem> = {
+      a: item('a', { status: 'active' }),
+      b: item('b', { status: 'error' }),
+      c: item('c', { status: 'cancelled' }),
+      d: item('d', { status: 'queued' }),
+    };
+    expect(latestTransferCompletion(items, ['a', 'b', 'c', 'd'], 's1')).toBeNull();
+  });
+
+  it('returns the most recent done item for the session', () => {
+    const items: Record<string, StoredTransferItem> = {
+      a: item('a', { status: 'error' }),
+      b: item('b', { finishedAt: 20 }),
+      c: item('c', { finishedAt: 30, localPath: '/local/c.log' }),
+    };
+    expect(latestTransferCompletion(items, ['a', 'b', 'c'], 's1')).toEqual({
+      id: 'c',
+      kind: 'download',
+      fileName: 'c.log',
+      localPath: '/local/c.log',
+      remotePath: '/srv/c.log',
+      finishedAt: 30,
+    });
+  });
+
+  it('ignores sysopen tasks and other sessions', () => {
+    const items: Record<string, StoredTransferItem> = {
+      'sysopen-dl-t1': item('sysopen-dl-t1', { finishedAt: 99 }),
+      other: item('other', { sessionId: 's2', finishedAt: 98 }),
+      b: item('b', { finishedAt: 20 }),
+    };
+    expect(
+      latestTransferCompletion(
+        items,
+        ['sysopen-dl-t1', 'other', 'b'],
+        's1',
+      )?.id,
+    ).toBe('b');
+  });
+
+  it('returns null without a session id (avoids resurfacing on disconnect)', () => {
+    const items: Record<string, StoredTransferItem> = { a: item('a') };
+    expect(latestTransferCompletion(items, ['a'], '')).toBeNull();
+  });
+
+  it('tolerates missing finishedAt (older items)', () => {
+    const items: Record<string, StoredTransferItem> = {
+      a: item('a', { finishedAt: undefined }),
+    };
+    expect(latestTransferCompletion(items, ['a'], 's1')?.finishedAt).toBe(0);
+  });
+});
+
+describe('transferCompletionNotice', () => {
+  const base = {
+    id: 't',
+    fileName: 'app.log',
+    localPath: '/local/app.log',
+    remotePath: '/srv/app.log',
+    finishedAt: 1,
+  };
+
+  it('download points at the local save path', () => {
+    expect(
+      transferCompletionNotice({ ...base, kind: 'download' }),
+    ).toEqual({ text: '已保存到 /local/app.log', path: '/local/app.log' });
+  });
+
+  it('upload points at the remote target path', () => {
+    expect(
+      transferCompletionNotice({ ...base, kind: 'upload' }),
+    ).toEqual({ text: '已上传到 /srv/app.log', path: '/srv/app.log' });
+    expect(
+      transferCompletionNotice({ ...base, kind: 'folder-upload' }),
+    ).toEqual({ text: '已上传到 /srv/app.log', path: '/srv/app.log' });
+  });
+
+  it('falls back to the file name when the path is empty', () => {
+    expect(
+      transferCompletionNotice({ ...base, kind: 'download', localPath: '' }),
+    ).toEqual({ text: '已保存到 app.log', path: 'app.log' });
+    expect(
+      transferCompletionNotice({ ...base, kind: 'upload', remotePath: '' }),
+    ).toEqual({ text: '已上传到 app.log', path: 'app.log' });
+  });
+});
+
+describe('soleSelectedEntry', () => {
+  const dir = entry({ name: 'docs', is_dir: true, is_file: false });
+  const file = entry({ name: 'a.txt' });
+
+  it('returns the entry when exactly one is selected', () => {
+    expect(soleSelectedEntry([dir, file], new Set(['docs']))).toBe(dir);
+  });
+
+  it('returns null for empty or multiple selections', () => {
+    expect(soleSelectedEntry([dir, file], new Set())).toBeNull();
+    expect(soleSelectedEntry([dir, file], new Set(['docs', 'a.txt']))).toBeNull();
+  });
+
+  it('returns null when the selected name is not in the visible list', () => {
+    expect(soleSelectedEntry([file], new Set(['docs']))).toBeNull();
+  });
+});
+
+describe('canOpenEntry', () => {
+  it('opens regular files', () => {
+    expect(canOpenEntry(entry({ name: 'a.txt' }))).toBe(true);
+  });
+
+  it('does not try to open directories', () => {
+    expect(
+      canOpenEntry(entry({ name: 'd', is_dir: true, is_file: false })),
+    ).toBe(false);
+  });
+
+  it('opens symlinks (readdir lstat marks them is_file=false)', () => {
+    expect(
+      canOpenEntry(
+        entry({ name: 'link', is_file: false, is_symlink: true }),
+      ),
+    ).toBe(true);
+  });
+
+  it('refuses special files (no is_file and no is_symlink)', () => {
+    expect(canOpenEntry(entry({ name: 'fifo', is_file: false }))).toBe(false);
+  });
+});
+
+describe('entryBadge / entrySubtitle', () => {
+  it('labels directories', () => {
+    const dir = entry({ name: 'd', is_dir: true, is_file: false });
+    expect(entryBadge(dir)).toBe('DIR');
+    expect(entrySubtitle(dir)).toBe('目录');
+  });
+
+  it('labels symlinks distinctly from plain files', () => {
+    const link = entry({ name: 'l', is_file: false, is_symlink: true, size: 12 });
+    expect(entryBadge(link)).toBe('LINK');
+    expect(entrySubtitle(link)).toBe('符号链接 · 12 B');
+    expect(entrySubtitle(entry({ name: 'a.txt', size: 12 }))).toBe('12 B');
   });
 });

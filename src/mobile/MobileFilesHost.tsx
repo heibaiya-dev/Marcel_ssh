@@ -40,10 +40,14 @@ import { useSettingsStore } from '@/stores/settingsStore';
 import { withForegroundKeepAlive } from './mobileBridge';
 import {
   batchDeleteProgressText,
+  canOpenEntry,
   canQuickDelete,
+  entryBadge,
+  entrySubtitle,
   filesEmptyStateReason,
   filesListLoadingMode,
   joinRemotePath,
+  latestTransferCompletion,
   latestTransferFailure,
   openFileKind,
   parentPath,
@@ -51,10 +55,15 @@ import {
   buildFileManagerPathsPatch,
   resolveRememberedPath,
   shouldPersistFileManagerPath,
+  soleSelectedEntry,
   sortFileEntries,
   toggleSelectionName,
+  transferCompletionNotice,
   transferProgressPercent,
+  TRANSFER_COMPLETION_BANNER_MS,
+  TRANSFER_COMPLETION_FRESH_MS,
   type FilesEmptyStateReason,
+  type TransferCompletionInfo,
 } from './filesUi';
 import { registerBackHandler } from './backHandler';
 import { resolveSessionDisplayName, sessionStatusLabel } from './sessionUi';
@@ -138,6 +147,10 @@ export default function MobileFilesHost({
   const [renameValue, setRenameValue] = useState('');
   const [previewFile, setPreviewFile] = useState<OpenTarget | null>(null);
   const [editorFile, setEditorFile] = useState<OpenTarget | null>(null);
+  // 传输成功提示（短暂可见 + 可复制路径）；null = 不显示
+  const [completion, setCompletion] = useState<TransferCompletionInfo | null>(
+    null,
+  );
   const loadSeqRef = useRef(0);
   const pathInitKeyRef = useRef<string | null>(null);
 
@@ -196,22 +209,30 @@ export default function MobileFilesHost({
     });
   }, [settingsLoaded, pathReady, connectionKey, currentPath]);
 
+  // 最新目录的镜像。上传/下载完成回调捕获的是**发起那一刻**的 currentPath：
+  // 用户若在传输期间切走目录，那次刷新会在之后落地、把新目录的列表覆盖掉
+  // （路径栏与表格对不上，后续删除/重命名还会按新目录拼路径）。三处校验：
+  // 发起前、await 之后、finally —— 目录已经不是它，结果一律作废。
+  const currentPathRef = useRef(currentPath);
+  currentPathRef.current = currentPath;
+
   const loadDirectory = useCallback(
     async (path: string) => {
       if (!sessionId) return;
+      if (path !== currentPathRef.current) return;
       const seq = ++loadSeqRef.current;
       setLoading(true);
       setError(null);
       try {
         const items = await sftpListDir(sessionId, path);
-        if (seq !== loadSeqRef.current) return;
+        if (seq !== loadSeqRef.current || path !== currentPathRef.current) return;
         setEntries(items);
       } catch (err) {
-        if (seq !== loadSeqRef.current) return;
+        if (seq !== loadSeqRef.current || path !== currentPathRef.current) return;
         setEntries([]);
         setError(`加载失败：${getErrorMessage(err)}`);
       } finally {
-        if (seq === loadSeqRef.current) setLoading(false);
+        if (seq === loadSeqRef.current && path === currentPathRef.current) setLoading(false);
       }
     },
     [sessionId],
@@ -221,7 +242,8 @@ export default function MobileFilesHost({
     if (!sessionId || !pathReady) {
       if (!sessionId) {
         setEntries([]);
-        setError(null);
+        // 这里**不**清 error：掉线瞬间产生的失败提示（如「会话已断开，任务已
+        // 跳过」）正要靠它显示；切到另一个会话时由下面的路径恢复分支清空。
         setSelectedEntry(null);
         setSelectMode(false);
         setMultiSelected(new Set());
@@ -240,6 +262,12 @@ export default function MobileFilesHost({
     [entries, showHidden],
   );
 
+  // 选择模式里恰好选中一个条目时，把它当作单项操作目标（见 soleSelectedEntry 注释）
+  const soleSelected = useMemo(
+    () => soleSelectedEntry(filteredEntries, multiSelected),
+    [filteredEntries, multiSelected],
+  );
+
   const { uploadFile } = useSftpUpload(sessionId, currentPath);
   const { startDownload } = useSftpDownload(sessionId);
 
@@ -250,11 +278,16 @@ export default function MobileFilesHost({
   // 移动端无传输中心面板：传输任务失败（error 终态）后顶部条消失，用户无从得知。
   // 这里订阅当前 session 最近一次失败任务，若尚未提示过（去重 ref），就地展示错误条。
   // items/order 引用在 store 变更时才替换，订阅它们不会在进度更新时触发重渲染。
+  //
+  // 用**当前会话的真实 id**（而非 ready 才有的 sessionId）扫描：断连时
+  // sessionId 会变成 ''，而「会话已断开，任务已跳过」这类失败恰恰只在断连后产生，
+  // 用 ready id 扫就永远扫不到，提示自然也就没有。
+  const activeSessionKey = activeSession?.id ?? '';
   const transferItems = useTransferStore((s) => s.items);
   const transferOrder = useTransferStore((s) => s.order);
   const transferFailure = useMemo(
-    () => latestTransferFailure(transferItems, transferOrder, sessionId),
-    [transferItems, transferOrder, sessionId],
+    () => latestTransferFailure(transferItems, transferOrder, activeSessionKey),
+    [transferItems, transferOrder, activeSessionKey],
   );
   const surfacedFailureRef = useRef<string | null>(null);
   useEffect(() => {
@@ -265,12 +298,51 @@ export default function MobileFilesHost({
     setError(`${transferFailure.fileName}：${transferFailure.statusText}`);
   }, [transferFailure]);
 
-  // 会话/绑定切换后旧 session 的失败不应再提示；重置去重标记
+  // 成功终态同理：条目一到 done 就从顶部活动条消失，界面既不说「已完成」，
+  // 也不给文件落点。这里派生最近一次成功任务，短暂展示并给一个复制路径的出口。
+  const transferCompletion = useMemo(
+    () =>
+      latestTransferCompletion(transferItems, transferOrder, activeSessionKey),
+    [transferItems, transferOrder, activeSessionKey],
+  );
+  const surfacedCompletionRef = useRef<string | null>(null);
+
+  // 会话/绑定切换后旧 session 的提示不应再出现；重置去重标记。
+  // 断连（bindingKey 变成 null）不算切换：同一条失败提示被关掉后不该因为掉线
+  // 又冒出来（用户刚关掉就会以为出了新问题）。
+  const surfacedBindingRef = useRef<string | null>(null);
   useEffect(() => {
+    if (!bindingKey) return;
+    if (surfacedBindingRef.current === bindingKey) return;
+    surfacedBindingRef.current = bindingKey;
     surfacedFailureRef.current = null;
+    surfacedCompletionRef.current = null;
   }, [bindingKey]);
 
-  const isTransferring = uploadItem !== null || downloadItem !== null;
+  useEffect(() => {
+    if (!transferCompletion) return;
+    if (surfacedCompletionRef.current === transferCompletion.id) return;
+    // 只提示刚完成的：换会话/切标签回来时不补播历史记录
+    if (Date.now() - transferCompletion.finishedAt > TRANSFER_COMPLETION_FRESH_MS)
+      return;
+    surfacedCompletionRef.current = transferCompletion.id;
+    setCompletion(transferCompletion);
+  }, [transferCompletion]);
+
+  // 倒计时只在文件页可见时走：切走时先留着，回来再看得到
+  useEffect(() => {
+    if (!completion || !visible) return;
+    const timer = setTimeout(
+      () => setCompletion(null),
+      TRANSFER_COMPLETION_BANNER_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [completion, visible]);
+
+  // 上传 / 下载是两条独立车道（调度器本身就是 upload / download 两条 lane，
+  // 桌面两端也可并行）。用一个总布尔会互相禁用，把另一条道白白堵死。
+  const uploadBusy = uploadItem !== null;
+  const downloadBusy = downloadItem !== null;
 
   const navigateTo = useCallback((path: string) => {
     setCurrentPath(path || '/');
@@ -278,7 +350,12 @@ export default function MobileFilesHost({
 
   const openFile = useCallback(
     (entry: SftpFileEntry) => {
-      if (entry.is_dir || !entry.is_file) return;
+      if (entry.is_dir) return;
+      if (!canOpenEntry(entry)) {
+        // 设备/管道等特殊文件：给明确提示，不留一个点了没反应的按钮
+        setError(`「${entry.name}」不是普通文件，无法打开，请使用下载`);
+        return;
+      }
       const fullPath = joinRemotePath(currentPath, entry.name);
       const kind = openFileKind(entry.name);
       if (kind === 'image') {
@@ -381,11 +458,20 @@ export default function MobileFilesHost({
       setRenameEntry(null);
       setRenameValue('');
       setSelectedEntry(null);
+      // 从选择模式发起时同样收尾，避免留下指向旧名字的勾选
+      exitSelectMode();
       await loadDirectory(currentPath);
     } catch (err) {
       setError(`重命名失败：${getErrorMessage(err)}`);
     }
-  }, [renameEntry, renameValue, sessionId, currentPath, loadDirectory]);
+  }, [
+    renameEntry,
+    renameValue,
+    sessionId,
+    currentPath,
+    loadDirectory,
+    exitSelectMode,
+  ]);
 
   const handleGoUp = useCallback(() => {
     if (currentPath === '/') return;
@@ -528,22 +614,44 @@ export default function MobileFilesHost({
     [sessionId, currentPath, loadDirectory],
   );
 
+  // 错误横幅在两个分支（正常 / 空状态）里都要渲染。
+  // 主要是为了断连态：传输失败、后端拒绝（「会话已断开，任务已跳过」）常常正是
+  // 在连接掉线那一刻产生的，早退分支若把它挡在门外，setError 了也永远看不见。
+  const errorBanner = error ? (
+    <div className="flex flex-shrink-0 items-center justify-between border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+      <span className="min-w-0 flex-1 break-words">{error}</span>
+      <button
+        type="button"
+        onClick={() => setError(null)}
+        className="ml-2 flex-shrink-0 text-red-400"
+        aria-label="关闭错误"
+      >
+        ✕
+      </button>
+    </div>
+  ) : null;
+
   if (emptyReason !== 'ready' || !ids) {
     const copy =
       EMPTY_STATE_COPY[emptyReason === 'ready' ? 'no-session' : emptyReason];
     return (
       <div
-        className="flex h-full min-h-0 flex-col items-center justify-center gap-2 px-6 text-center"
+        className="flex h-full min-h-0 flex-col bg-zinc-950"
         data-region="mobile-files"
-        style={{ paddingTop: 'max(1rem, env(safe-area-inset-top, 0px))' }}
       >
-        <h2 className="text-lg font-semibold text-zinc-100">{copy.title}</h2>
-        <p className="text-sm text-zinc-500">{copy.body}</p>
-        {activeSession && (
-          <p className="text-xs text-zinc-600">
-            {sessionStatusLabel(activeSession.status)}
-          </p>
-        )}
+        {errorBanner}
+        <div
+          className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center"
+          style={{ paddingTop: 'max(1rem, env(safe-area-inset-top, 0px))' }}
+        >
+          <h2 className="text-lg font-semibold text-zinc-100">{copy.title}</h2>
+          <p className="text-sm text-zinc-500">{copy.body}</p>
+          {activeSession && (
+            <p className="text-xs text-zinc-600">
+              {sessionStatusLabel(activeSession.status)}
+            </p>
+          )}
+        </div>
       </div>
     );
   }
@@ -594,7 +702,7 @@ export default function MobileFilesHost({
           <button
             type="button"
             onClick={() => void handleUpload()}
-            disabled={isTransferring}
+            disabled={uploadBusy}
             className="rounded-lg bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white active:bg-indigo-500 disabled:opacity-50"
           >
             上传
@@ -666,14 +774,29 @@ export default function MobileFilesHost({
         />
       )}
 
-      {error && (
-        <div className="flex flex-shrink-0 items-center justify-between border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-          <span className="min-w-0 flex-1 break-words">{error}</span>
+      {errorBanner}
+
+      {completion && (
+        <div className="flex flex-shrink-0 items-center gap-2 border-b border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+          <span className="min-w-0 flex-1 break-all">
+            {transferCompletionNotice(completion).text}
+          </span>
           <button
             type="button"
-            onClick={() => setError(null)}
-            className="ml-2 flex-shrink-0 text-red-400"
-            aria-label="关闭错误"
+            onClick={() => {
+              void writeText(transferCompletionNotice(completion).path).catch(
+                (err) => setError(`复制路径失败：${getErrorMessage(err)}`),
+              );
+            }}
+            className="flex-shrink-0 rounded-md bg-emerald-600/30 px-2 py-0.5 text-xs text-emerald-100 active:bg-emerald-600/50"
+          >
+            复制路径
+          </button>
+          <button
+            type="button"
+            onClick={() => setCompletion(null)}
+            className="flex-shrink-0 text-emerald-400"
+            aria-label="关闭完成提示"
           >
             ✕
           </button>
@@ -698,17 +821,19 @@ export default function MobileFilesHost({
           </span>
           {!selectedEntry.is_dir && (
             <>
-              <button
-                type="button"
-                onClick={() => openFile(selectedEntry)}
-                className="rounded-lg bg-indigo-600 px-2.5 py-1.5 text-xs text-white active:bg-indigo-500"
-              >
-                打开
-              </button>
+              {canOpenEntry(selectedEntry) && (
+                <button
+                  type="button"
+                  onClick={() => openFile(selectedEntry)}
+                  className="rounded-lg bg-indigo-600 px-2.5 py-1.5 text-xs text-white active:bg-indigo-500"
+                >
+                  打开
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => void handleDownload()}
-                disabled={isTransferring}
+                disabled={downloadBusy}
                 className="rounded-lg bg-emerald-700 px-2.5 py-1.5 text-xs text-white active:bg-emerald-600 disabled:opacity-50"
               >
                 下载
@@ -783,6 +908,35 @@ export default function MobileFilesHost({
               ? '全不选'
               : '全选'}
           </button>
+          {/* 单选一个条目时补上单项操作：目录在移动端点按即进入，长按进入的
+              选择模式是它唯一的操作入口（对齐桌面右键菜单的压缩为 / 重命名）。 */}
+          {soleSelected && (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  setRenameEntry(soleSelected);
+                  setRenameValue(soleSelected.name);
+                  exitSelectMode();
+                }}
+                className="rounded-lg bg-zinc-700 px-2.5 py-1.5 text-xs text-zinc-100 active:bg-zinc-600"
+              >
+                重命名
+              </button>
+              {soleSelected.is_dir && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCompressEntry(soleSelected);
+                    exitSelectMode();
+                  }}
+                  className="rounded-lg bg-zinc-700 px-2.5 py-1.5 text-xs text-zinc-100 active:bg-zinc-600"
+                >
+                  压缩
+                </button>
+              )}
+            </>
+          )}
           <button
             type="button"
             onClick={() =>
@@ -882,11 +1036,13 @@ export default function MobileFilesHost({
                       className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg text-[10px] font-medium ${
                         entry.is_dir
                           ? 'bg-amber-500/15 text-amber-300'
-                          : 'bg-zinc-800 text-zinc-400'
+                          : entry.is_symlink
+                            ? 'bg-cyan-500/15 text-cyan-300'
+                            : 'bg-zinc-800 text-zinc-400'
                       }`}
                       aria-hidden
                     >
-                      {entry.is_dir ? 'DIR' : 'FILE'}
+                      {entryBadge(entry)}
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm text-zinc-100">
@@ -894,7 +1050,7 @@ export default function MobileFilesHost({
                         {entry.is_dir ? '/' : ''}
                       </span>
                       <span className="block text-[11px] text-zinc-500">
-                        {entry.is_dir ? '目录' : formatSize(entry.size)}
+                        {entrySubtitle(entry)}
                       </span>
                     </span>
                     {entry.is_dir && !selectMode && (
