@@ -1220,6 +1220,68 @@ pub(crate) fn remote_sidecar_path(path: &str, label: &str) -> Result<String, App
     })
 }
 
+/// 解析提交目标：目标是符号链接时返回链接指向的真实文件路径，
+/// 让提交「写穿」链接（与 shell 里 `> link` 语义一致），而不是用普通文件
+/// 把链接替换掉。相对链接目标按链接所在目录解析；悬空链接（canonicalize
+/// 失败）退化为手工解析，因为用户的本意就是让那个路径出现文件。
+async fn resolve_commit_target(
+    sftp: &russh_sftp::client::SftpSession,
+    target_path: &str,
+) -> Result<String, AppError> {
+    let mut current = target_path.to_string();
+    // 上限 8 层：REALPATH 通常一次就解完，手工解析一次一层，防御链接环路。
+    for _ in 0..8 {
+        match sftp.symlink_metadata(&current).await {
+            Ok(meta) if meta.is_symlink() => {
+                if let Ok(real) = sftp.canonicalize(&current).await {
+                    current = real;
+                    continue;
+                }
+                let link = sftp
+                    .read_link(&current)
+                    .await
+                    .map_err(|e| AppError::Ssh(format!("解析符号链接失败: {}", e)))?;
+                current = if link.starts_with('/') {
+                    link
+                } else {
+                    match current.rfind('/') {
+                        Some(0) => format!("/{}", link),
+                        Some(idx) => format!("{}/{}", &current[..idx], link),
+                        None => link,
+                    }
+                };
+            }
+            _ => break,
+        }
+    }
+    Ok(current)
+}
+
+/// 提交后还原目标原有权限位：rename 不继承被覆盖 inode 的 mode（sidecar 是
+/// 新建文件，服务器按 umask 给 0644），不还原就会把 0600 的 .env / 脚本、
+/// 0755 的可执行文件悄悄放宽或改窄。失败只告警——数据已经提交成功，
+/// 这时报错会让调用方误以为没写进去。
+async fn restore_remote_permissions(
+    sftp: &russh_sftp::client::SftpSession,
+    target_path: &str,
+    mode: Option<u32>,
+) {
+    let Some(mode) = mode else {
+        return;
+    };
+    let mut attrs = russh_sftp::protocol::FileAttributes::empty();
+    // 只带 MODE 位（不含文件类型位），SETSTAT 只改权限，不动大小/时间。
+    attrs.permissions = Some(mode & 0o7777);
+    if let Err(e) = sftp.set_metadata(target_path, attrs).await {
+        log::warn!(
+            "[sftp] 还原远程文件权限位失败 {} (mode={:o}): {}",
+            target_path,
+            mode & 0o7777,
+            e
+        );
+    }
+}
+
 /// 把临时远端文件原子提交到目标路径（可覆盖或拒绝覆盖已有）。
 /// `pub(crate)`：Agent 传输工具复用（上传走临时文件 + 原子提交）。
 pub(crate) async fn commit_remote_temp_file(
@@ -1228,7 +1290,9 @@ pub(crate) async fn commit_remote_temp_file(
     target_path: &str,
     allow_replace: bool,
 ) -> Result<(), AppError> {
-    let existing = sftp.metadata(target_path).await.ok();
+    let target = resolve_commit_target(sftp, target_path).await?;
+
+    let existing = sftp.metadata(&target).await.ok();
     if let Some(meta) = &existing {
         if meta.is_dir() {
             let _ = sftp.remove_file(temp_path).await;
@@ -1241,27 +1305,34 @@ pub(crate) async fn commit_remote_temp_file(
             ));
         }
     }
+    let preserve_mode = existing.as_ref().and_then(|meta| meta.permissions);
 
     if existing.is_none() {
-        return sftp
-            .rename(temp_path, target_path)
-            .await
-            .map_err(|e| AppError::Ssh(format!("提交远程文件失败: {}", e)));
+        // 目标原先不存在：无权限位可还原；提交失败也要删 sidecar
+        //（其余失败路径都删，这里曾漏掉导致失败后残留隐藏临时文件）。
+        return match sftp.rename(temp_path, &target).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = sftp.remove_file(temp_path).await;
+                Err(AppError::Ssh(format!("提交远程文件失败: {}", e)))
+            }
+        };
     }
 
-    let backup_path = remote_sidecar_path(target_path, "backup")?;
-    if let Err(e) = sftp.rename(target_path, &backup_path).await {
+    let backup_path = remote_sidecar_path(&target, "backup")?;
+    if let Err(e) = sftp.rename(&target, &backup_path).await {
         let _ = sftp.remove_file(temp_path).await;
         return Err(AppError::Ssh(format!("备份远程文件失败: {}", e)));
     }
 
-    if let Err(e) = sftp.rename(temp_path, target_path).await {
-        let _ = sftp.rename(&backup_path, target_path).await;
+    if let Err(e) = sftp.rename(temp_path, &target).await {
+        let _ = sftp.rename(&backup_path, &target).await;
         let _ = sftp.remove_file(temp_path).await;
         return Err(AppError::Ssh(format!("提交远程文件失败: {}", e)));
     }
 
     let _ = sftp.remove_file(&backup_path).await;
+    restore_remote_permissions(sftp, &target, preserve_mode).await;
     Ok(())
 }
 
