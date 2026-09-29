@@ -21,7 +21,125 @@ use crate::agent::tools::{AgentTool, ToolContext, ToolOutput};
 use crate::error::AppError;
 
 /// Hard ceiling for a single transfer to prevent runaway memory use.
-const MAX_TRANSFER_BYTES: u64 = 32 * 1024 * 1024;
+/// 「大文件」阈值：超过它不会直接开传，而是把决定权交回模型 —— 必须显式传
+/// `allow_large_transfer=true` 才放行（提示文案见 [`large_upload_notice`]）。
+///
+/// 理由（产品决策）：云服务器的上行通常很小，几 GB 的文件可能是几十分钟到
+/// 几小时的传输，值得先被确认一次，而不是默默占满带宽和会话。原实现是
+/// 32 MiB 硬顶 + 一句「Use rsync/scp」，那条既拦掉了本来合理的几十 MB 传输，
+/// 也没给模型任何判断余地。
+///
+/// **闸门只对非内网目标生效**（见 [`large_transfer_needs_confirmation`]）：
+/// 连着局域网/本机时带宽不是瓶颈，没必要打扰。
+const LARGE_TRANSFER_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// 模型对「>1GB 传输」的显式确认。
+fn allow_large_transfer(params: &serde_json::Value) -> bool {
+    params
+        .get("allow_large_transfer")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// 是否要拦住这次传输：超过 1GB、模型没确认、且**不是用户在原生对话框里
+/// 亲自挑的**（用户自己选的文件就是明确授权，再要求模型补参数只会让用户
+/// 重新选一次文件）。
+fn needs_large_transfer_confirmation(size: u64, confirmed: bool, user_picked: bool) -> bool {
+    size > LARGE_TRANSFER_BYTES && !confirmed && !user_picked
+}
+
+/// IP 是否属于「内网/本机」范围：RFC1918、回环、链路本地、IPv6 ULA。
+/// 运营商级 NAT（100.64/10）刻意**不**算内网 —— 那是公网链路。
+fn ip_is_private(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            // IPv4-mapped（::ffff:192.168.1.1）按内层地址判
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_private(std::net::IpAddr::V4(v4));
+            }
+            // ULA（fc00::/7）与链路本地（fe80::/10）用位判断，避免依赖
+            // 只在新版 std 才稳定的 `is_unicast_link_local`。
+            let head = v6.segments()[0];
+            v6.is_loopback() || (head & 0xffc0) == 0xfe80 || (head & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// 主机串的快速判定：`Some(true)` = 内网、`Some(false)` = 公网（IP 字面量），
+/// `None` = 得解析一次 DNS 才知道。
+fn host_lan_quick(host: &str) -> Option<bool> {
+    let trimmed = host.trim();
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Some(ip_is_private(ip));
+    }
+    let lower = bare.trim_end_matches('.').to_ascii_lowercase();
+    const LAN_SUFFIXES: [&str; 6] = [
+        ".local",
+        ".lan",
+        ".internal",
+        ".home",
+        ".home.arpa",
+        ".localdomain",
+    ];
+    if lower == "localhost" || LAN_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+        return Some(true);
+    }
+    None
+}
+
+/// 目标主机是否在局域网/本机。
+async fn target_is_lan(host: &str, port: u16) -> bool {
+    match host_lan_quick(host) {
+        Some(v) => v,
+        None => match tokio::net::lookup_host((host, port)).await {
+            // 任一解析结果落在内网段即算内网
+            Ok(addrs) => addrs.into_iter().any(|a| ip_is_private(a.ip())),
+            // 解析不出来（离线 / 名字错 / 无 DNS）：当公网处理 —— 宁可多提示一次，
+            // 也不要让一次几小时的公网传输悄悄开跑。
+            Err(_) => false,
+        },
+    }
+}
+
+/// 闸门总判定：>1GB、模型没确认、不是用户亲选，**且目标不是内网**。
+/// 前几条不成立就直接返回 false —— 会话查询/DNS 只在真要提示时才发生。
+async fn large_transfer_needs_confirmation(
+    ctx: &ToolContext,
+    size: u64,
+    confirmed: bool,
+    user_picked: bool,
+) -> bool {
+    if !needs_large_transfer_confirmation(size, confirmed, user_picked) {
+        return false;
+    }
+    match ctx.ssh.get_connection_info(&ctx.session_id).await {
+        Some((host, port)) => !target_is_lan(&host, port).await,
+        // 拿不到会话信息（理论上不该发生）：保守当公网
+        None => true,
+    }
+}
+
+/// 体积的人类可读写法（提示文案用，只会出现在 >1GB 的场景）。
+fn human_size(bytes: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    format!("{:.2} GB", bytes as f64 / GB)
+}
+
+/// 超阈值时的提示：措辞由用户给定（逐字保留），参数名必须出现 —— 模型只有
+/// 知道参数名才能过这一关。
+fn large_upload_notice(size: u64) -> String {
+    format!("文件体积为 {}，大于 1GB，对于云服务器，这需要的时间可能是灾难级的，所以请你在上传前思考「这有没有必要？」，如果真的有用，那么你可以加上 allow_large_transfer=true 参数把这个文件传上去。但如果是用户要求你传的，直接加上 allow_large_transfer=true 参数上传这个文件即可。", human_size(size))
+}
+
+/// 下载方向的同一条提示（与上传同构，只换方向词）。
+fn large_download_notice(size: u64) -> String {
+    format!("文件体积为 {}，大于 1GB，对于云服务器，这需要的时间可能是灾难级的，所以请你在下载前思考「这有没有必要？」，如果真的有用，那么你可以加上 allow_large_transfer=true 参数把这个文件取下来。但如果是用户要求你下载的，直接加上 allow_large_transfer=true 参数下载这个文件即可。", human_size(size))
+}
 
 // ────────────────────────────── LocalPathPolicy ──────────────────────────────
 
@@ -762,7 +880,12 @@ impl AgentTool for UploadFileTool {
          existing directory, a directory ending with '/', or a full target file path \
          (the tool probes the server: existing directories get the local file name \
          appended, anything else is treated as the exact target file path). To rename \
-         on the server pass file_name.\n\
+         on the server pass file_name. Files larger than 1 GB are refused unless you \
+         pass allow_large_transfer=true: on a cloud server such a transfer can take a \
+         disastrously long time, so decide first whether it is really necessary (pass \
+         it directly when the user asked for this upload; not needed when the user \
+         picked the file themselves via user_pick, or when the server is on your local \
+         network — the prompt exists because public links are slow).\n\
          Multi-host: you may pass an optional `host` (the current machine or a \
          machine from the selected set, by its readable name) to upload to that \
          machine instead of the current one. Desktop only."
@@ -772,10 +895,11 @@ impl AgentTool for UploadFileTool {
         json!({
             "type": "object",
             "properties": {
-                "local_path": { "type": "string", "description": "Optional if user_pick=true. Absolute path of the file to upload ON THIS COMPUTER (not the server). System/secret paths are rejected." },
+                "local_path": { "type": "string", "description": "Optional if user_pick=true. Absolute path of the file to upload ON THIS COMPUTER (not the server), on a local drive (UNC/network shares are not supported). System/secret paths are rejected." },
                 "user_pick": { "type": "boolean", "description": "Optional. Open a native file picker and let the user choose the source file on this computer instead of passing local_path. Mutually exclusive with local_path; the call fails if the user cancels. Single user-in-the-loop uploads only — never for server-to-server transfers (relaying files between servers through this computer): stage with an explicit local_path or use bash scp/rsync there.", "default": false },
-                "remote_path": { "type": "string", "description": "Required. Destination ON THE SERVER: an existing directory, a directory ending with '/', or the full target file path. Existing directories get the local file name appended; otherwise the path is used as-is as the target file." },
-                "file_name": { "type": "string", "description": "Optional. Rename the uploaded file on the server. When given, remote_path is treated as a directory and file_name is appended." },
+                "remote_path": { "type": "string", "description": "Required. Absolute destination ON THE SERVER (must start with '/'; '..' is rejected): an existing directory, a directory ending with '/', or the full target file path. Existing directories get the local file name appended; otherwise the path is used as-is as the target file." },
+                "file_name": { "type": "string", "description": "Optional. Rename the uploaded file on the server. A single file name only — no '/', '\\\\' or '..' (put directories in remote_path). When given, remote_path is treated as a directory and file_name is appended." },
+                "allow_large_transfer": { "type": "boolean", "description": "Optional. Files larger than 1 GB are refused unless you pass true here: on a cloud server such a transfer can take a disastrously long time, so decide first whether it is really necessary. Pass true to proceed — do it directly when the user asked for this upload. Not needed when the user picked the file themselves via user_pick.", "default": false },
                 "host": { "type": "string", "description": format!("Optional. Target machine's readable name: the current machine or one from the multi-host selected set. When omitted, uploads to the current session's machine. Desktop only. {}", super::HOST_MATCH_RULE) }
             },
             "required": ["remote_path"]
@@ -871,13 +995,13 @@ async fn upload_execute(
             ))
         }
     };
-    if size > MAX_TRANSFER_BYTES {
+    // 内网/本机目标不打扰：闸门只在公网目标上生效。
+    if large_transfer_needs_confirmation(ctx, size, allow_large_transfer(&params), user_picked)
+        .await
+    {
         return Ok(ToolOutput::fail(
             format!("upload {}", local_path_buf.display()),
-            format!(
-                "file too large: {} bytes (limit {} bytes). Use rsync/scp via bash.",
-                size, MAX_TRANSFER_BYTES
-            ),
+            large_upload_notice(size),
         ));
     }
 
@@ -1134,7 +1258,13 @@ impl AgentTool for DownloadFileTool {
          scp/rsync via bash instead. System/secret local paths (/, ~/.ssh, System32) \
          are blocked. Existing files are not overwritten unless overwrite=true (when \
          user_pick is on, replacing an existing file confirmed by the user in the \
-         save dialog counts as overwrite). Limit: 32 MB.\n\
+         save dialog counts as overwrite). Files larger than 1 GB are refused unless \
+         you pass allow_large_transfer=true: on a cloud server such a transfer can take \
+         a disastrously long time, so decide first whether it is really necessary (pass \
+         it directly when the user asked for this download; user_pick does NOT waive \
+         this — the save dialog only chooses where to put it; it is also not needed \
+         when the server is on your local network, since the prompt exists because \
+         public links are slow).\n\
          Multi-host: you may pass an optional `host` (the current machine or a \
          machine from the selected set, by its readable name) to download from \
          that machine instead of the current one. Desktop only."
@@ -1145,9 +1275,10 @@ impl AgentTool for DownloadFileTool {
             "type": "object",
             "properties": {
                 "remote_path": { "type": "string", "description": "Required. Absolute path of the remote file on the server to download" },
-                "local_path":  { "type": "string", "description": "Optional. Absolute save path ON THIS COMPUTER (not the server). Omit to save to the system Downloads folder with the remote file name. Mutually exclusive with user_pick. System/secret paths are rejected." },
+                "local_path":  { "type": "string", "description": "Optional. Absolute save path ON THIS COMPUTER (not the server), on a local drive (UNC/network shares are not supported). Omit to save to the system Downloads folder with the remote file name. Mutually exclusive with user_pick. System/secret paths are rejected." },
                 "user_pick": { "type": "boolean", "description": "Optional. Open a native save dialog and let the user choose where to save (prefilled with the remote file name) instead of passing local_path. Mutually exclusive with local_path; the call fails if the user cancels. Single user-in-the-loop downloads only — never for server-to-server transfers (relaying files between servers through this computer): stage with an explicit local_path or use bash scp/rsync there.", "default": false },
                 "overwrite": { "type": "boolean", "description": "If true, overwrite an existing regular file. Symlinks and directories are never overwritten. Default: false.", "default": false },
+                "allow_large_transfer": { "type": "boolean", "description": "Optional. Files larger than 1 GB are refused unless you pass true here: on a cloud server such a transfer can take a disastrously long time, so decide first whether it is really necessary. Pass true to proceed — do it directly when the user asked for this download. user_pick does NOT waive this (the save dialog only chooses where to put it).", "default": false },
                 "host": { "type": "string", "description": format!("Optional. Target machine's readable name: the current machine or one from the multi-host selected set. When omitted, downloads from the current session's machine. Desktop only. {}", super::HOST_MATCH_RULE) }
             },
             "required": ["remote_path"]
@@ -1210,6 +1341,42 @@ async fn download_execute(
     let policy = LocalPathPolicy::default_policy();
     let suggested_name = remote_file_name(remote_path).unwrap_or_else(|| "download".to_string());
 
+    // 先探测远端文件与大小（在碰本机一侧之前）：文件不存在 / 不是普通文件 /
+    // 超过 1GB 且模型没有确认时直接失败，不让用户先白选一次保存位置。
+    let sftp = match ctx.ssh.open_sftp(&ctx.session_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(ToolOutput::fail(
+                format!("download {}", remote_path),
+                format!("SFTP unavailable: {}", e),
+            ))
+        }
+    };
+    let meta = match sftp.metadata(remote_path).await {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(ToolOutput::fail(
+                format!("download {}", remote_path),
+                format!("获取远程文件信息失败: {}", e),
+            ))
+        }
+    };
+    if !meta.is_regular() {
+        return Ok(ToolOutput::fail(
+            format!("download {}", remote_path),
+            "只能下载普通文件".to_string(),
+        ));
+    }
+    let total = meta.len();
+    // 下载不做 user_pick 豁免：保存对话框选的是落点，不等于「这么大也值得下载」。
+    // 内网/本机目标不打扰（闸门只在公网目标上生效）。
+    if large_transfer_needs_confirmation(ctx, total, allow_large_transfer(&params), false).await {
+        return Ok(ToolOutput::fail(
+            format!("download {}", remote_path),
+            large_download_notice(total),
+        ));
+    }
+
     // 落点三选一：显式 local_path / user_pick 弹窗 / 省略落系统 Downloads。
     // user_pick 时用户已在系统保存对话框里亲自确认「替换已有文件」，validation
     // 直接放行 overwrite（黑名单、symlink/目录拒绝照常生效）。
@@ -1257,41 +1424,6 @@ async fn download_execute(
     let transfer_id = crate::agent::transfer::new_transfer_id();
     let task_id = ctx.task_id.clone().unwrap_or_default();
 
-    // 打开远端文件并取大小（超限检查在流式前，避免传一半才发现超限）。
-    let sftp = match ctx.ssh.open_sftp(&ctx.session_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            return Ok(ToolOutput::fail(
-                format!("download {}", remote_path),
-                format!("SFTP unavailable: {}", e),
-            ))
-        }
-    };
-    let meta = match sftp.metadata(remote_path).await {
-        Ok(m) => m,
-        Err(e) => {
-            return Ok(ToolOutput::fail(
-                format!("download {}", remote_path),
-                format!("获取远程文件信息失败: {}", e),
-            ))
-        }
-    };
-    if !meta.is_regular() {
-        return Ok(ToolOutput::fail(
-            format!("download {}", remote_path),
-            "只能下载普通文件".to_string(),
-        ));
-    }
-    let total = meta.len();
-    if total > MAX_TRANSFER_BYTES {
-        return Ok(ToolOutput::fail(
-            format!("download {}", remote_path),
-            format!(
-                "remote file too large: {} bytes (limit {} bytes). Use rsync/scp via bash.",
-                total, MAX_TRANSFER_BYTES
-            ),
-        ));
-    }
     let mut remote = match sftp.open_with_flags(remote_path, OpenFlags::READ).await {
         Ok(f) => f,
         Err(e) => {
@@ -1820,5 +1952,369 @@ mod tests {
         let target = canon.join("CON");
         let res = validate_local_download_path(&target, false, &policy).await;
         assert!(res.is_err());
+    }
+
+    // ── 黑名单形态归一：「目录还不存在」与 canonical 形态差异 ──
+    //    （Windows 上 canonicalize 返回 `\\?\` verbatim 形态，identity 条目是
+    //    普通形态，直接 starts_with 比不出来。）
+
+    #[test]
+    fn canonicalize_or_identity_keeps_missing_path() {
+        let td = TempDir::new().unwrap();
+        let missing = td.path().join("not-created-yet");
+        assert!(!missing.exists());
+        // 不存在必须保留原样（返回 None 会让 filter_map 把它从黑名单里剔掉）。
+        assert_eq!(canonicalize_or_identity(&missing), missing);
+    }
+
+    /// 黑名单两侧形态能对上，全靠 `path_key`：在 Windows 上 `canonicalize`
+    /// 返回 `\\?\` verbatim 形态，与普通形态直接 `starts_with` 永远不相等。
+    /// 这条用例把该前提钉住——将来 canonicalize 的形态变了（或平台行为变了）
+    /// 会在这里显式失败，提醒复核归一逻辑。
+    #[cfg(windows)]
+    #[test]
+    fn windows_canonical_form_needs_normalization_to_match_plain_path() {
+        let td = TempDir::new().unwrap();
+        let canon = std::fs::canonicalize(td.path()).unwrap();
+        let s = canon.as_os_str().to_string_lossy().to_string();
+        assert!(
+            s.starts_with(r"\\?\"),
+            "canonicalize 形态变了（{}），path_key 的 verbatim 归一段需复核",
+            s
+        );
+        assert!(!canon.starts_with(td.path()));
+        assert_eq!(path_key(&canon), path_key(td.path()));
+    }
+
+    #[test]
+    fn default_blacklist_covers_home_secret_dirs_whether_present_or_not() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let bl = default_blacklist();
+        for sub in [".ssh", ".gnupg", ".config", ".aws", ".kube"] {
+            let p = home.join(sub);
+            if p.exists() {
+                // 存在：条目是 canonical 形态，靠 path_key 归一后仍要能命中。
+                assert_eq!(
+                    path_key(&canonicalize_or_identity(&p)),
+                    path_key(&p),
+                    "{}",
+                    sub
+                );
+            } else {
+                // 不存在：必须仍在黑名单里（identity 形态）——否则工具会替
+                // agent 把受保护目录创建出来。
+                assert!(
+                    bl.iter().any(|b| path_key(b) == path_key(&p)),
+                    "{} 在本机不存在时也必须留在黑名单",
+                    sub
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn download_into_missing_blacklisted_dir_rejected() {
+        let td = TempDir::new().unwrap();
+        // 黑名单条目是「本机还不存在」的目录（identity 形态，非 canonical，
+        // 与 TempDir 的真实路径无 verbatim 前缀可比性）——它必须仍然生效。
+        let protected = td.path().join("protected-not-created");
+        assert!(!protected.exists());
+        let policy = LocalPathPolicy::from_blacklist(vec![protected.clone()]);
+        let target = protected.join("config");
+        let res = validate_local_download_path(&target, true, &policy).await;
+        assert!(
+            res.is_err(),
+            "受保护目录尚不存在时也必须拒绝（否则会当场创建它并写入）: {:?}",
+            res
+        );
+        assert!(!protected.exists(), "拒绝时不得创建该目录");
+    }
+
+    // ── 符号链接：判定必须发生在 resolve（canonicalize）之前 ──
+
+    /// Windows 上的对应用例。创建符号链接需要开发者模式/管理员权限：造不出来
+    /// 就跳过（跳过会打印原因，不伪装成通过）。能造出来时这条断言真正跑到，
+    /// 它钉住的正是「resolve 之前判叶子」这一顺序——旧实现先 canonicalize
+    /// （链接被解析成普通文件）再 symlink_metadata，永远拒不了。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn download_windows_symlink_overwrite_rejected_when_creatable() {
+        let td = TempDir::new().unwrap();
+        let canon = canon_temp(&td);
+        let policy = no_bl_policy();
+        let real = canon.join("real.bin");
+        std::fs::write(&real, b"hi").unwrap();
+        let link = canon.join("link.bin");
+        if std::os::windows::fs::symlink_file(&real, &link).is_err() {
+            eprintln!("skip: 本机无法创建符号链接（需开发者模式或管理员权限）");
+            return;
+        }
+        // 先记录「旧实现为什么看不见链接」：resolve 会把已存在的叶子
+        // canonicalize 成链接目标（普通文件），所以 resolve 之后再做
+        // symlink_metadata 永远看不到链接本身。
+        let resolved = resolve_against_ancestors(&link).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&real).unwrap());
+        assert!(!std::fs::symlink_metadata(&resolved)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // 现在的判定在 resolve 之前用原始路径做，必须拒绝。
+        let res = validate_local_download_path(&link, true, &policy).await;
+        assert!(res.is_err(), "覆盖符号链接必须被拒绝: {:?}", res);
+    }
+
+    // ── Windows 路径前缀 / 组件形态 ──
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_verbatim_and_devicens_prefix_rejected() {
+        for bad in [
+            r"\\server\share\file.txt",
+            r"\\?\C:\Users\X\a.txt",
+            r"\\.\C:\x.txt",
+            r"\\?\UNC\server\share\a.txt",
+        ] {
+            assert!(
+                reject_non_disk_prefix(Path::new(bad)).is_err(),
+                "{} 必须被拒绝",
+                bad
+            );
+        }
+        assert!(reject_non_disk_prefix(Path::new(r"C:\Users\X\a.txt")).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn download_unc_path_rejected() {
+        // 旧实现在共享不可达时也会报错（no existing ancestor），但那是巧合：
+        // 共享可达时 resolve 会成功且黑名单覆盖不到另一台机器上的位置。
+        // 这条用例把「一律拒绝」钉成策略，不再依赖可达性。
+        let policy = no_bl_policy();
+        let res =
+            validate_local_download_path(Path::new(r"\\server\share\a.txt"), true, &policy).await;
+        assert!(res.is_err(), "UNC 落点必须被拒绝: {:?}", res);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn download_ads_and_trailing_dot_segment_rejected() {
+        let td = TempDir::new().unwrap();
+        let policy = no_bl_policy();
+        let canon = canon_temp(&td);
+        // NTFS 数据流写法（`:stream`）
+        let ads = canon.join("a.txt:stream");
+        assert!(validate_local_download_path(&ads, true, &policy)
+            .await
+            .is_err());
+        // 中间目录带尾随点：Win32 会静默去掉，校验的路径 ≠ 落盘的路径。
+        let dotted = canon.join("dir.").join("a.txt");
+        assert!(validate_local_download_path(&dotted, true, &policy)
+            .await
+            .is_err());
+    }
+
+    // ── upload 远端参数：file_name / remote_path 复用既有校验 ──
+
+    #[test]
+    fn upload_file_name_rejects_traversal_and_separators() {
+        for bad in [
+            "../../etc/cron.d/x",
+            "/etc/passwd",
+            "sub/x",
+            r"..\windows\x",
+            "..",
+            ".",
+            "",
+        ] {
+            assert!(
+                validate_upload_remote_file_name(bad).is_err(),
+                "{:?} 必须被拒绝",
+                bad
+            );
+        }
+        for ok in ["x.txt", "报告.pdf", "a b.tar.gz", "no-extension"] {
+            assert!(
+                validate_upload_remote_file_name(ok).is_ok(),
+                "{:?} 应当接受",
+                ok
+            );
+        }
+    }
+
+    #[test]
+    fn upload_remote_path_requires_absolute_without_parentdir() {
+        for bad in ["../x", "x/y", "/a/../b", "", "/a\0b"] {
+            assert!(validate_upload_remote_path(bad).is_err(), "{:?}", bad);
+        }
+        // 归一化：折叠重复斜杠（与用户 SFTP 面板同一条校验）。
+        assert_eq!(validate_upload_remote_path("/a//b/").unwrap(), "/a/b/");
+        assert_eq!(
+            validate_upload_remote_path("/home/user/uploads").unwrap(),
+            "/home/user/uploads"
+        );
+    }
+
+    // ── user_pick：用户取消 vs 弹窗失败必须给不同文案 ──
+
+    #[test]
+    fn user_pick_failure_text_differs_from_cancel() {
+        let cancelled = user_pick_cancelled();
+        let failed = user_pick_failed("文件对话框任务异常退出: task panicked");
+        assert!(cancelled.contains("取消"), "{}", cancelled);
+        assert!(
+            failed.contains("不是用户取消"),
+            "失败文案必须点明不是用户取消: {}",
+            failed
+        );
+        assert!(failed.contains("task panicked"), "保留底层原因: {}", failed);
+        assert_ne!(cancelled, failed);
+    }
+
+    // ── 大文件（>1GB）确认闸门 ──
+    // 提示措辞由用户给定、逐字钉住：模型只有看到 allow_large_transfer=true 才
+    // 知道怎么过这一关，改文案之前先改这里的断言。
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn large_transfer_confirmation_matrix() {
+        // 阈值本身不拦
+        assert!(!needs_large_transfer_confirmation(GB, false, false));
+        // 刚过阈值且未确认 → 拦
+        assert!(needs_large_transfer_confirmation(GB + 1, false, false));
+        // 模型确认了 → 放行
+        assert!(!needs_large_transfer_confirmation(GB + 1, true, false));
+        // 用户在原生对话框里亲自挑的 → 放行（否则要他重选一次文件）
+        assert!(!needs_large_transfer_confirmation(GB + 1, false, true));
+    }
+
+    #[test]
+    fn allow_large_transfer_param_parsing() {
+        assert!(!allow_large_transfer(&json!({})));
+        assert!(!allow_large_transfer(
+            &json!({ "allow_large_transfer": false })
+        ));
+        // 只有真正的布尔 true 算确认：字符串 "true" 不算
+        assert!(!allow_large_transfer(
+            &json!({ "allow_large_transfer": "true" })
+        ));
+        assert!(allow_large_transfer(
+            &json!({ "allow_large_transfer": true })
+        ));
+    }
+
+    #[test]
+    fn large_transfer_notice_text_is_pinned() {
+        let expected_upload = concat!(
+            "文件体积为 2.00 GB，大于 1GB，对于云服务器，这需要的时间可能是灾难级的，",
+            "所以请你在上传前思考「这有没有必要？」，如果真的有用，那么你可以加上 ",
+            "allow_large_transfer=true 参数把这个文件传上去。",
+            "但如果是用户要求你传的，直接加上 allow_large_transfer=true 参数上传这个文件即可。"
+        );
+        assert_eq!(large_upload_notice(2 * GB), expected_upload);
+
+        let expected_download = concat!(
+            "文件体积为 1.50 GB，大于 1GB，对于云服务器，这需要的时间可能是灾难级的，",
+            "所以请你在下载前思考「这有没有必要？」，如果真的有用，那么你可以加上 ",
+            "allow_large_transfer=true 参数把这个文件取下来。",
+            "但如果是用户要求你下载的，直接加上 allow_large_transfer=true 参数下载这个文件即可。"
+        );
+        assert_eq!(large_download_notice(3 * GB / 2), expected_download);
+    }
+
+    #[test]
+    fn human_size_formats_gb_with_two_decimals() {
+        assert_eq!(human_size(GB), "1.00 GB");
+        assert_eq!(human_size(2 * GB + GB / 2), "2.50 GB");
+    }
+
+    // ── 闸门只对非内网目标生效 ──
+
+    #[test]
+    fn ip_private_classification() {
+        use std::net::IpAddr;
+        let lan = [
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "fc00::1",
+            "::ffff:192.168.1.1",
+        ];
+        for ip in lan {
+            assert!(
+                ip_is_private(ip.parse::<IpAddr>().unwrap()),
+                "{ip} 应判为内网"
+            );
+        }
+        let wan = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.15.0.1", // 172.16/12 之外
+            "172.32.0.1",
+            "100.64.0.1", // 运营商级 NAT：公网链路，刻意不算内网
+            "203.0.113.10",
+            "fe00::1", // fe80::/10 之外
+            "2400:3200::1",
+            "::ffff:8.8.8.8",
+        ];
+        for ip in wan {
+            assert!(
+                !ip_is_private(ip.parse::<IpAddr>().unwrap()),
+                "{ip} 应判为公网"
+            );
+        }
+    }
+
+    #[test]
+    fn host_lan_quick_matrix() {
+        // IP 字面量（含带方括号的 IPv6）直接判，不需要 DNS
+        assert_eq!(host_lan_quick("192.168.1.10"), Some(true));
+        assert_eq!(host_lan_quick("203.0.113.7"), Some(false));
+        assert_eq!(host_lan_quick("[::1]"), Some(true));
+        assert_eq!(host_lan_quick("[2001:db8::1]"), Some(false));
+        // 已知的本地后缀（含尾点写法）
+        assert_eq!(host_lan_quick("localhost"), Some(true));
+        assert_eq!(host_lan_quick("nas.local."), Some(true));
+        assert_eq!(host_lan_quick("db.internal"), Some(true));
+        // 普通主机名：交给一次 DNS 解析
+        assert_eq!(host_lan_quick("web1"), None);
+        assert_eq!(host_lan_quick("example.com"), None);
+    }
+
+    /// 与 user_pick 那条护栏同构：描述与 schema 都必须写明 1GB 规则与参数名，
+    /// 否则模型既不知道有门槛、也不知道怎么过。
+    #[test]
+    fn transfer_tools_document_large_transfer_rule() {
+        let upload = UploadFileTool::new();
+        let download = DownloadFileTool::new();
+        for (name, desc, schema) in [
+            (
+                "upload_file",
+                upload.description(),
+                upload.parameters_schema().to_string(),
+            ),
+            (
+                "download_file",
+                download.description(),
+                download.parameters_schema().to_string(),
+            ),
+        ] {
+            assert!(
+                desc.contains("allow_large_transfer") && desc.contains("1 GB"),
+                "{name} 描述缺少大文件规则"
+            );
+            assert!(
+                schema.contains("allow_large_transfer"),
+                "{name} schema 缺少 allow_large_transfer"
+            );
+        }
     }
 }

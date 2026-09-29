@@ -16,10 +16,6 @@ use crate::error::AppError;
 use crate::util::{is_content_uri, shell_escape, validate_local_path, validate_sftp_remote_path};
 use crate::AppState;
 
-const MAX_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
-const MAX_STREAM_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_DOWNLOAD_BYTES: u64 = 32 * 1024 * 1024;
-
 /// 远端长任务（压缩 / 解压）的显式超时。
 /// 解压大文件夹/大压缩包可能远超命令执行默认的 120s（见
 /// [`crate::command_exec::ticket::DEFAULT_EXEC_TIMEOUT`]），停留在默认值
@@ -1402,12 +1398,7 @@ pub async fn sftp_upload_stream(
         (file, local_meta.len(), true)
     };
 
-    if total > MAX_STREAM_UPLOAD_BYTES {
-        return Err(AppError::Ssh(format!(
-            "文件过大 ({} MB)，单文件上传限制为 2 GB",
-            total as f64 / 1_048_576.0
-        )));
-    }
+    // 不设体积上限：与大文件下载对齐，能传多大由磁盘和源文件决定。
 
     // 普通路径：流式上传逻辑与 Agent 传输工具共用同一实现
     // （stream_upload_single_file，含 sidecar + 取消 + 完整性校验 + done 事件）。
@@ -2048,14 +2039,7 @@ pub async fn sftp_upload_folder_stream(
     })?;
     let total = zip_meta.len();
 
-    if total > MAX_STREAM_UPLOAD_BYTES {
-        let _ = tokio::fs::remove_file(&zip_path).await;
-        return Err(AppError::Ssh(format!(
-            "压缩包过大 ({} MB)，单次上传限制为 2 GB",
-            total as f64 / 1_048_576.0
-        )));
-    }
-
+    // 打包体积同样不设上限（压缩包大小由目录内容决定，超限与否不再由本机判定）。
     emit_folder_upload_status(&app, &upload_id, "uploading", 0, total);
 
     let sftp = state.ssh_manager.open_sftp(&session_id).await?;
