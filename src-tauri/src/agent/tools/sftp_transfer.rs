@@ -1087,7 +1087,10 @@ async fn download_execute(
             task_id,
             transfer_id
         );
-        return Ok(ToolOutput::fail("download_file", "任务已结束，未开始传输。"));
+        return Ok(ToolOutput::fail(
+            "download_file",
+            "任务已结束，未开始传输。",
+        ));
     }
     let _mutex = crate::agent::transfer::acquire_mutex(&state).await;
 
@@ -1384,7 +1387,9 @@ mod tests {
     fn download_overwrite_rejection_is_not_cancel() {
         // 策略拒绝（覆盖/已存在）不是用户取消，必须归 error。
         assert!(!is_download_cancel("本地文件已存在（未允许覆盖）"));
-        assert!(!is_download_cancel("本地文件已存在且未允许覆盖（未显式传 overwrite=true）：/x/y"));
+        assert!(!is_download_cancel(
+            "本地文件已存在且未允许覆盖（未显式传 overwrite=true）：/x/y"
+        ));
         assert!(!is_download_cancel("保存路径已存在同名目录"));
     }
 

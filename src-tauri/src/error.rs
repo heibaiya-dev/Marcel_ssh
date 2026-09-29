@@ -67,10 +67,7 @@ pub enum AppError {
     /// 凭据（私钥或密码）认证失败，带机器可读的原因码（见 `KeyAuthCode`）。
     /// `message` 已是给用户看的中文文案，前端直接展示。
     #[error("{message}")]
-    KeyAuth {
-        code: KeyAuthCode,
-        message: String,
-    },
+    KeyAuth { code: KeyAuthCode, message: String },
     #[error("{0}")]
     Other(String),
 }

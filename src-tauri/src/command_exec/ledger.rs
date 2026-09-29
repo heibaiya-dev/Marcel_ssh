@@ -314,8 +314,8 @@ impl JobLedgerStore {
             // 结束时间未知（中断在应用退出那一刻，没人来得及记）就退回开始
             // 时间——否则这类记录永远不满足保留期，只能等条目上限来兜。
             let stamp = j.finished_at_millis.unwrap_or(j.started_at_millis);
-            let too_old = j.status.is_terminal()
-                && now_millis.saturating_sub(stamp) > RETENTION_MILLIS;
+            let too_old =
+                j.status.is_terminal() && now_millis.saturating_sub(stamp) > RETENTION_MILLIS;
             if too_old {
                 dropped.extend(j.spill_path.clone());
             }
@@ -398,7 +398,8 @@ fn read_ledger(path: &Path) -> Result<JobLedger, LoadError> {
     if !path.exists() {
         return Ok(JobLedger::default());
     }
-    let content = std::fs::read_to_string(path).map_err(|e| LoadError::Unreadable(e.to_string()))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| LoadError::Unreadable(e.to_string()))?;
     if content.trim().is_empty() {
         return Ok(JobLedger::default());
     }
@@ -448,11 +449,8 @@ mod tests {
 
     /// 每个测试用独立临时目录，避免台账文件互相污染。
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "marcel-ledger-test-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("marcel-ledger-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir

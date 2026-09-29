@@ -730,7 +730,13 @@ impl SshManager {
         timeout: Duration,
     ) -> Result<(String, bool), AppError> {
         let outcome = crate::command_exec::executor::run_raw(
-            self, session_id, command, timeout, None, String::new(), None,
+            self,
+            session_id,
+            command,
+            timeout,
+            None,
+            String::new(),
+            None,
         )
         .await?;
         Ok(match outcome {

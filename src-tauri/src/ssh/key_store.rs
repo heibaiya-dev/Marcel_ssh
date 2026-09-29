@@ -275,7 +275,9 @@ impl KeyStore {
                 if path.extension().and_then(|x| x.to_str()) != Some("key") {
                     return None;
                 }
-                path.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
             })
             .collect();
         ids.sort();
@@ -338,11 +340,7 @@ impl KeyStore {
 
         // 同一把钥匙按指纹去重：重复导入不堆两份。来源变了就顺手更新来源
         // （密钥在磁盘上被挪过位置是常事），名字与 id 保持不变以免打断已有连接。
-        if let Some(existing) = index
-            .keys
-            .iter_mut()
-            .find(|k| k.fingerprint == fingerprint)
-        {
+        if let Some(existing) = index.keys.iter_mut().find(|k| k.fingerprint == fingerprint) {
             let mut changed = false;
             if let Some(origin) = origin_path {
                 if existing.origin_path.as_deref() != Some(origin) {
@@ -381,8 +379,7 @@ impl KeyStore {
     }
 
     fn load_pem(&self, id: &str) -> Result<Zeroizing<String>, AppError> {
-        let text = std::fs::read_to_string(self.key_file_path(id))
-            .map_err(|_| missing_entry())?;
+        let text = std::fs::read_to_string(self.key_file_path(id)).map_err(|_| missing_entry())?;
         let master = master_key()?;
         open_envelope(&master, id, &text)
     }
@@ -557,9 +554,9 @@ fn master_key() -> Result<Zeroizing<[u8; 32]>, AppError> {
     // 串行化：并发导入时若两处同时判定"还没有主密钥"，后写的那把会覆盖先写的，
     // 先写那把加密出来的密文就再也解不开了
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().map_err(|_| {
-        AppError::Config("密钥库主密钥锁已损坏，请重启应用".into())
-    })?;
+    let _guard = LOCK
+        .lock()
+        .map_err(|_| AppError::Config("密钥库主密钥锁已损坏，请重启应用".into()))?;
 
     if let Some(encoded) = keychain::get_password(MASTER_KEY_ACCOUNT)? {
         let bytes = B64.decode(encoded.trim()).map_err(|_| {
@@ -617,10 +614,14 @@ fn open_envelope(
             ),
         });
     }
-    let nonce = B64.decode(envelope.nonce.as_bytes()).map_err(|_| undecryptable())?;
-    let ciphertext = B64.decode(envelope.ct.as_bytes()).map_err(|_| undecryptable())?;
-    let cipher =
-        Aes256Gcm::new_from_slice(master).map_err(|_| AppError::Config("密钥库主密钥无效".into()))?;
+    let nonce = B64
+        .decode(envelope.nonce.as_bytes())
+        .map_err(|_| undecryptable())?;
+    let ciphertext = B64
+        .decode(envelope.ct.as_bytes())
+        .map_err(|_| undecryptable())?;
+    let cipher = Aes256Gcm::new_from_slice(master)
+        .map_err(|_| AppError::Config("密钥库主密钥无效".into()))?;
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(&nonce),
@@ -830,7 +831,9 @@ mod tests {
     fn missing_index_is_rebuilt_from_the_encrypted_files() {
         let (_dir, store) = fixture();
         let pem = sample_key(None);
-        let meta = store.import_text(&pem, "重要密钥", None, None).expect("import");
+        let meta = store
+            .import_text(&pem, "重要密钥", None, None)
+            .expect("import");
         // 索引是"目录页"，不是数据本身；它没了不该表现成"密钥全没了"
         std::fs::remove_file(store.index_path()).unwrap();
 
@@ -1046,10 +1049,7 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         // 给对密码才真的换，并记下"这把带密码"
-        let updated = store
-            .replace_from_origin(&id, Some("pw"))
-            .unwrap()
-            .unwrap();
+        let updated = store.replace_from_origin(&id, Some("pw")).unwrap().unwrap();
         assert!(updated.encrypted);
     }
 

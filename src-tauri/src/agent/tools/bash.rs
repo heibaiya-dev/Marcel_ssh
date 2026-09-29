@@ -166,7 +166,9 @@ impl BashTool {
             if let Some(owner) = &ctx.owner_conversation_id {
                 ticket = ticket.owned_by(owner);
             }
-            let job_info = ctx.submit_background(ticket, Some(description.clone())).await?;
+            let job_info = ctx
+                .submit_background(ticket, Some(description.clone()))
+                .await?;
 
             // Zeroize password and rewritten command immediately
             if let Some(ref mut p) = sudo_password {
@@ -607,7 +609,10 @@ mod tests {
             let err = tool
                 .validate_arguments(&args)
                 .expect_err("缺说明必须被拦下");
-            assert!(err.contains("description"), "提示里要点名缺的是哪个参数：{err}");
+            assert!(
+                err.contains("description"),
+                "提示里要点名缺的是哪个参数：{err}"
+            );
         }
     }
 

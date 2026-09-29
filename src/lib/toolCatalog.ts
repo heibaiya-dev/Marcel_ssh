@@ -442,6 +442,7 @@ export function toolLabel(toolName: string): string {
   return toolSpec(toolName)?.label ?? toolName;
 }
 
+
 /**
  * 卡片标题行显示什么名字。
  *

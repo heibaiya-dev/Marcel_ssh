@@ -367,7 +367,9 @@ mod tests {
         );
         // 但重定向目标照查：写就是写。
         assert_eq!(
-            assessor.assess_command("cat /tmp/x > /etc/hosts").disposition,
+            assessor
+                .assess_command("cat /tmp/x > /etc/hosts")
+                .disposition,
             Disposition::ForceApproval
         );
         // `-delete` / `-o` 会让"只读"命令变成写。

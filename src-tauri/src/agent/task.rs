@@ -313,8 +313,18 @@ mod tests {
             (AgentStatus::Cancelled, false),
         ];
         for (status, running) in cases {
-            assert_eq!(status.is_running(), running, "{:?} 的运行态判定不符", status);
-            assert_eq!(status.is_terminal(), !running, "{:?} 的终态判定不符", status);
+            assert_eq!(
+                status.is_running(),
+                running,
+                "{:?} 的运行态判定不符",
+                status
+            );
+            assert_eq!(
+                status.is_terminal(),
+                !running,
+                "{:?} 的终态判定不符",
+                status
+            );
         }
     }
 

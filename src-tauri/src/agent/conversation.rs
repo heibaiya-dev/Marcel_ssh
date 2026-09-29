@@ -183,7 +183,8 @@ fn sum_with_sub_conversations(
         last_context: own.last_context,
     };
 
-    let mut stmt = conn.prepare("SELECT usage_json FROM conversations WHERE parent_conversation_id = ?1")?;
+    let mut stmt =
+        conn.prepare("SELECT usage_json FROM conversations WHERE parent_conversation_id = ?1")?;
     let mut rows = stmt.query_map([conversation_id], |row| row.get::<_, Option<String>>(0))?;
     while let Some(child_raw) = rows.next() {
         let child = ConversationUsage::from_json_column(child_raw?);
@@ -1053,15 +1054,14 @@ impl ConversationDb {
                 )?;
 
                 // 查询从 Checkpoint 开始（含 Checkpoint 本身）到末尾的所有活跃消息
-                let mut msg_stmt = conn.prepare(
-                    &format!(
-                        "SELECT {}
+                let mut msg_stmt = conn.prepare(&format!(
+                    "SELECT {}
                         FROM messages
                         WHERE conversation_id = ?1 
                         AND (created_at > ?2 OR (created_at = ?2 AND rowid >= ?3))
                         ORDER BY created_at ASC, rowid ASC",
-                        messages_select_columns()
-                    ))?;
+                    messages_select_columns()
+                ))?;
                 let messages = msg_stmt
                     .query_map(
                         rusqlite::params![conversation_id, cp_created_at, cp_rowid],
@@ -1115,16 +1115,15 @@ impl ConversationDb {
             return Ok((vec![], false));
         };
 
-        let mut stmt = conn.prepare(
-            &format!(
-                "SELECT {}
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {}
                 FROM messages
                 WHERE conversation_id = ?1 
                 AND (created_at < ?2 OR (created_at = ?2 AND rowid < ?3))
                 ORDER BY created_at DESC, rowid DESC
                 LIMIT ?4",
-                messages_select_columns()
-            ))?;
+            messages_select_columns()
+        ))?;
 
         let mut messages = stmt
             .query_map(
@@ -1539,8 +1538,10 @@ impl ConversationDb {
         let mut resolved = ResolvedWindow::default();
         if window.start == WindowStart::LatestCard {
             // 读时现算：没有卡片（从未压缩）⇒ 无下界，会话全部可读
-            resolved.from = Self::boundary_card(conn, conversation_id)?
-                .map(|c| MsgPos { created_at: c.created_at, rowid: c.rowid });
+            resolved.from = Self::boundary_card(conn, conversation_id)?.map(|c| MsgPos {
+                created_at: c.created_at,
+                rowid: c.rowid,
+            });
         }
         if let Some(id) = window.upto_message_id.as_deref() {
             resolved.upto = Some(
@@ -1709,25 +1710,21 @@ impl ConversationDb {
         limit: Option<usize>,
     ) -> RusqliteResult<Vec<StoredMessage>> {
         let sql = match limit {
-            Some(_) => {
-                &format!(
-                    "SELECT {}
+            Some(_) => &format!(
+                "SELECT {}
                     FROM messages
                     WHERE conversation_id = ?1
                     ORDER BY created_at ASC, rowid ASC
                     LIMIT ?2",
-                    messages_select_columns()
-                )
-            }
-            None => {
-                &format!(
-                    "SELECT {}
+                messages_select_columns()
+            ),
+            None => &format!(
+                "SELECT {}
                     FROM messages
                     WHERE conversation_id = ?1
                     ORDER BY created_at ASC, rowid ASC",
-                    messages_select_columns()
-                )
-            }
+                messages_select_columns()
+            ),
         };
 
         let mut stmt = conn.prepare(sql)?;
@@ -1779,10 +1776,7 @@ impl ConversationDb {
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
-            &format!(
-                "INSERT INTO messages {}",
-                messages_insert_clause()
-            ),
+            &format!("INSERT INTO messages {}", messages_insert_clause()),
             (
                 &id,
                 conversation_id,
@@ -1892,10 +1886,7 @@ impl ConversationDb {
         }
 
         tx.execute(
-            &format!(
-                "INSERT INTO messages {}",
-                messages_insert_clause()
-            ),
+            &format!("INSERT INTO messages {}", messages_insert_clause()),
             (
                 &id,
                 conversation_id,
@@ -2180,9 +2171,11 @@ impl ConversationDb {
         // `query_row(...).optional()` 三层含义：外层 None = 行不存在；
         // 内层 None = 列是 NULL（老行 / 第一次记）。
         let raw: Option<String> = match conn
-            .query_row("SELECT usage_json FROM conversations WHERE id = ?1", [conversation_id], |row| {
-                row.get::<_, Option<String>>(0)
-            })
+            .query_row(
+                "SELECT usage_json FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
             .optional()?
         {
             None => return Ok(None),
@@ -3139,7 +3132,10 @@ mod tests {
             .expect("row exists");
         assert_eq!(after1.prompt_tokens, 100);
         assert_eq!(after1.reasoning_tokens, Some(4));
-        assert!(after1.cached_read_tokens.is_none(), "没报过就是 None，不是 0");
+        assert!(
+            after1.cached_read_tokens.is_none(),
+            "没报过就是 None，不是 0"
+        );
         assert_eq!(after1.last_context.map(|c| c.used_tokens), Some(100));
 
         let round2 = crate::llm::provider::TokenUsage {
@@ -3187,11 +3183,10 @@ mod tests {
             tools_tokens: 0,
             message_tokens: 5,
         };
-        assert!(
-            db.record_usage("no-such-conv", Some(&round), last)
-                .expect("ghost must not error")
-                .is_none()
-        );
+        assert!(db
+            .record_usage("no-such-conv", Some(&round), last)
+            .expect("ghost must not error")
+            .is_none());
 
         let conv = db.create_conversation("conn_1", "A").expect("conv");
         {
@@ -3331,10 +3326,7 @@ mod tests {
         let conv_v = serde_json::to_value(&conv).expect("serialize conv");
         assert!(conv_v.get("usage").is_none(), "空用量不该发给前端");
 
-        let with_usage = Conversation {
-            usage,
-            ..conv
-        };
+        let with_usage = Conversation { usage, ..conv };
         let conv_v = serde_json::to_value(&with_usage).expect("serialize conv");
         assert_eq!(conv_v["usage"]["promptTokens"], 3);
     }
@@ -3370,9 +3362,15 @@ mod tests {
             .expect("exists");
 
         // 行上：各记自己的（子 agent 的一轮只落在子对话行上）
-        let parent_row = db.get_conversation(&parent.id).expect("get").expect("exists");
+        let parent_row = db
+            .get_conversation(&parent.id)
+            .expect("get")
+            .expect("exists");
         assert_eq!(parent_row.usage.prompt_tokens, 1000);
-        let child_row = db.get_conversation(&child.id).expect("get").expect("exists");
+        let child_row = db
+            .get_conversation(&child.id)
+            .expect("get")
+            .expect("exists");
         assert_eq!(child_row.usage.prompt_tokens, 500);
 
         // 界面读数：父子相加
@@ -3602,12 +3600,15 @@ mod tests {
             .expect("get")
             .expect("exists");
         assert!(pinned.pinned);
-        assert!(db.set_conversation_pinned("conv-old", false).expect("unpin"));
-        assert!(!db
-            .get_conversation("conv-old")
-            .expect("get")
-            .expect("exists")
-            .pinned);
+        assert!(db
+            .set_conversation_pinned("conv-old", false)
+            .expect("unpin"));
+        assert!(
+            !db.get_conversation("conv-old")
+                .expect("get")
+                .expect("exists")
+                .pinned
+        );
 
         // 旧库迁移后 usage_json 列可用：旧数据缺省 = 整块为空（前端显示 `—`，
         // 不是 0），记一轮之后能读回累计值
@@ -3633,7 +3634,10 @@ mod tests {
             .expect("conv-old 存在");
         assert_eq!(recorded.prompt_tokens, 100);
         assert_eq!(recorded.total_tokens, 120);
-        assert!(recorded.reasoning_tokens.is_none(), "未报过的可选字段保持 None");
+        assert!(
+            recorded.reasoning_tokens.is_none(),
+            "未报过的可选字段保持 None"
+        );
         let reloaded = db
             .get_conversation("conv-old")
             .expect("get")
@@ -4012,7 +4016,9 @@ mod tests {
         assert_eq!(cp_id, active2.messages[0].id);
 
         // 3. 测试 load_earlier_messages 从卡片开始向前拉取归档历史
-        let (earlier, has_more) = db.load_earlier_messages(&conv.id, &cp_id, 50).expect("earlier");
+        let (earlier, has_more) = db
+            .load_earlier_messages(&conv.id, &cp_id, 50)
+            .expect("earlier");
         assert_eq!(earlier.len(), 3); // u1, a1, t1
         assert!(!has_more);
         assert_eq!(earlier[0].content, "u1");
@@ -4201,13 +4207,21 @@ mod tests {
             .expect("late");
 
         let assert_rich = |m: &StoredMessage, what: &str| {
-            assert_eq!(m.tool_calls_json.as_deref(), Some(tools), "{what}: tool_calls");
+            assert_eq!(
+                m.tool_calls_json.as_deref(),
+                Some(tools),
+                "{what}: tool_calls"
+            );
             assert_eq!(
                 m.reasoning_content.as_deref(),
                 Some(reasoning),
                 "{what}: reasoning"
             );
-            assert_eq!(m.image_paths_json.as_deref(), Some(images), "{what}: images");
+            assert_eq!(
+                m.image_paths_json.as_deref(),
+                Some(images),
+                "{what}: images"
+            );
             assert!(
                 m.content == "早的消息" || m.content == "晚的消息" || m.content == "唯一一条",
                 "{what}: content 被别的列顶掉了（列序错位？）: {}",
@@ -4237,7 +4251,10 @@ mod tests {
             // 该分支的 SQL 是 `rowid >= 卡片 rowid` —— 卡片本身也在返回集里
             assert_eq!(active.messages.len(), 2, "卡片 + 卡片之后的消息");
             assert_eq!(active.messages[1].id, late.id);
-            assert_rich(active.messages.last().expect("last"), "load_active_messages(checkpoint)");
+            assert_rich(
+                active.messages.last().expect("last"),
+                "load_active_messages(checkpoint)",
+            );
         }
         // ④ 翻页取更早（load_earlier_messages 的内联 SELECT）
         {
@@ -4250,7 +4267,9 @@ mod tests {
         }
         // ⑤ 没有卡片时回落到全量路径
         {
-            let plain = db.create_conversation("conn_2", "no-checkpoint").expect("conv2");
+            let plain = db
+                .create_conversation("conn_2", "no-checkpoint")
+                .expect("conv2");
             db.save_message_with_images(
                 &plain.id,
                 "assistant",
@@ -4439,9 +4458,11 @@ mod tests {
         // 那行旧 schema INSERT 被当成违规，护栏固定报红（实测：LF 工作区通过、CRLF 失败）。
         let source = include_str!("conversation.rs").replace("\r\n", "\n");
         let production = source
-            .split("
+            .split(
+                "
 #[cfg(test)]
-mod tests")
+mod tests",
+            )
             .next()
             .expect("include_str 至少有一段");
 
@@ -4471,7 +4492,10 @@ mod tests")
 
         // needle 在运行时拼出来：`include_str!` 会把**本测试自己**也扫进去，把字面量
         // 直接写在这条断言里，它就会命中自己。
-        let insert_needle = format!("INSERT INTO messages ({}, conversation_id", MESSAGES_COLUMNS[0]);
+        let insert_needle = format!(
+            "INSERT INTO messages ({}, conversation_id",
+            MESSAGES_COLUMNS[0]
+        );
         assert!(
             !haystack.contains(&squeeze(&insert_needle)),
             "源码里出现了手写的 INSERT 列清单（应由 messages_insert_clause() 生成）"
@@ -4484,7 +4508,9 @@ mod tests")
     ///
     /// 结构（行序）：u1 a1 t1 [卡片] u2 a2 —— 与 `load_active_messages` 的
     /// "卡片之前 = 归档、卡片及之后 = 当前上下文"完全对齐。
-    fn seed_compacted_conversation(db: &ConversationDb) -> (String, Vec<String>, String, Vec<String>) {
+    fn seed_compacted_conversation(
+        db: &ConversationDb,
+    ) -> (String, Vec<String>, String, Vec<String>) {
         let conv = db.create_conversation("conn_1", "history").expect("conv");
         let mut archived = Vec::new();
         for (i, (role, content)) in [
@@ -4564,7 +4590,10 @@ mod tests")
         let ov = db.history_overview(&conv_id, None).expect("overview");
         assert_eq!(ov.total, 6, "3 条归档 + 卡片 + 2 条当前上下文");
         assert_eq!(ov.archived, 3, "卡片之前的 3 条 = 归档");
-        assert_eq!(ov.active, 3, "卡片及之后 = 当前上下文（卡片本身算上下文里有的）");
+        assert_eq!(
+            ov.active, 3,
+            "卡片及之后 = 当前上下文（卡片本身算上下文里有的）"
+        );
         assert_eq!(ov.oldest.as_ref().expect("oldest").id, archived[0]);
         assert_eq!(ov.newest.as_ref().expect("newest").id, active[1]);
         assert_eq!(
@@ -4582,8 +4611,15 @@ mod tests")
     fn history_overview_without_compaction() {
         let db = create_test_db();
         let conv = db.create_conversation("conn_1", "plain").expect("conv");
-        db.save_message(&conv.id, "user", "只有一条", "2026-01-01T00:00:00Z", None, None)
-            .expect("msg");
+        db.save_message(
+            &conv.id,
+            "user",
+            "只有一条",
+            "2026-01-01T00:00:00Z",
+            None,
+            None,
+        )
+        .expect("msg");
 
         let ov = db.history_overview(&conv.id, None).expect("overview");
         assert_eq!(ov.total, 1);
@@ -4594,7 +4630,9 @@ mod tests")
 
         // 空会话也不炸
         let empty = db.create_conversation("conn_1", "empty").expect("empty");
-        let ov = db.history_overview(&empty.id, None).expect("overview empty");
+        let ov = db
+            .history_overview(&empty.id, None)
+            .expect("overview empty");
         assert_eq!(ov.total, 0);
         assert!(ov.oldest.is_none() && ov.newest.is_none());
     }
@@ -4689,7 +4727,14 @@ mod tests")
             .read_history(&conv_id, None, &archived[1], 1, 1)
             .expect("read around");
         let ids: Vec<&str> = read.messages.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec![archived[0].as_str(), archived[1].as_str(), archived[2].as_str()]);
+        assert_eq!(
+            ids,
+            vec![
+                archived[0].as_str(),
+                archived[1].as_str(),
+                archived[2].as_str()
+            ]
+        );
         assert!(!read.has_more_before, "已经到会话最早一条");
         assert!(read.has_more_after, "后面还有（含卡片与当前上下文）");
 
@@ -4776,7 +4821,9 @@ mod tests")
     /// 手动压缩（`tail_db_id = None`）取**队尾行**当卡片时间 ⇒ 卡片排到队尾紧后面，
     /// 也就排到冻结上界之后 ⇒ 窗口 `[最新卡, 派发锚]` 成为空区间。
     fn seed_empty_window_conversation(db: &ConversationDb) -> (String, String, String) {
-        let conv = db.create_conversation("conn_1", "empty-window").expect("conv");
+        let conv = db
+            .create_conversation("conn_1", "empty-window")
+            .expect("conv");
         for (i, (role, content)) in [
             ("user", "把 nginx 换成 caddy"),
             ("assistant", "先做只读检查"),
@@ -5001,7 +5048,11 @@ mod tests")
         let read = db
             .read_history(&conv_id, Some(&window), &card_id, 5, 0)
             .expect("read");
-        assert_eq!(read.messages.len(), 1, "窗口下界就是这张卡，前面没有可读的行");
+        assert_eq!(
+            read.messages.len(),
+            1,
+            "窗口下界就是这张卡，前面没有可读的行"
+        );
         assert_eq!(read.messages[0].id, card_id);
         assert!(!read.has_more_before, "窗口内前面没有更多");
         for m in &read.messages {
@@ -5039,7 +5090,14 @@ mod tests")
         // 别的会话的 id 在本会话里找不到 → 也是 Missing（调用方负责给出"不在可读范围"的文案）
         let other = db.create_conversation("conn_1", "other").expect("other");
         let foreign = db
-            .save_message(&other.id, "user", "别人的消息", "2026-01-01T00:00:00Z", None, None)
+            .save_message(
+                &other.id,
+                "user",
+                "别人的消息",
+                "2026-01-01T00:00:00Z",
+                None,
+                None,
+            )
             .expect("foreign");
         let err = db
             .read_history(&conv_id, None, &foreign.id, 0, 0)
@@ -5058,7 +5116,10 @@ mod tests")
         );
 
         let empty = db.create_conversation("conn_1", "empty").expect("empty");
-        assert!(db.history_tail_anchor(&empty.id).expect("anchor empty").is_none());
+        assert!(db
+            .history_tail_anchor(&empty.id)
+            .expect("anchor empty")
+            .is_none());
     }
 
     /// 状态门控的判据：只有会话里真的存在"读不到的东西"（压缩过、或派发过子对话）
@@ -5106,7 +5167,9 @@ mod tests")
             None,
         )
         .expect("save after compaction");
-        assert!(db.has_readable_history(&compacted).expect("still compacted"));
+        assert!(db
+            .has_readable_history(&compacted)
+            .expect("still compacted"));
     }
 
     /// 子对话清单（主 agent 核对前先看有哪些）。
@@ -5114,7 +5177,9 @@ mod tests")
     fn list_sub_conversations_reports_children_only() {
         let db = create_test_db();
         let parent = db.create_conversation("conn_1", "main").expect("parent");
-        let other = db.create_conversation("conn_1", "also main").expect("other");
+        let other = db
+            .create_conversation("conn_1", "also main")
+            .expect("other");
         let sub1 = db
             .create_sub_conversation("conn_1", "查一下磁盘", &parent.id)
             .expect("sub1");
@@ -5198,7 +5263,9 @@ mod tests")
         let reader_conv = conv_id.clone();
         let reader = std::thread::spawn(move || {
             for _ in 0..40 {
-                let ov = reader_db.history_overview(&reader_conv, None).expect("overview");
+                let ov = reader_db
+                    .history_overview(&reader_conv, None)
+                    .expect("overview");
                 assert_eq!(
                     ov.archived + ov.active,
                     ov.total,
@@ -5225,7 +5292,10 @@ mod tests")
                     .filter(|m| !m.content.starts_with(COMPACTION_CARD_PREFIX))
                     .map(|m| m.content.clone())
                     .collect();
-                assert_eq!(bodies, expected, "原文必须逐条完整且顺序不变，不允许缺行或错位");
+                assert_eq!(
+                    bodies, expected,
+                    "原文必须逐条完整且顺序不变，不允许缺行或错位"
+                );
                 assert!(
                     !read.has_more_after,
                     "只有 6 行、窗口开到 100，不该说还有更多"

@@ -517,10 +517,7 @@ mod tests {
         let language_section = |prompt: &str| -> String {
             let start = prompt.find("## 语言").expect("提示词里应有「语言」段");
             let rest = &prompt[start..];
-            let end = rest[3..]
-                .find("\n## ")
-                .map(|i| i + 3)
-                .unwrap_or(rest.len());
+            let end = rest[3..].find("\n## ").map(|i| i + 3).unwrap_or(rest.len());
             rest[..end].to_string()
         };
 

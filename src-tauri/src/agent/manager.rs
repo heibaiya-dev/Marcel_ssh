@@ -30,8 +30,8 @@ use crate::agent::templates::TemplateManager;
 use crate::agent::tools::{
     mcp::register_mcp_tools, plugin_tool::register_plugin_tools, ToolRegistry,
 };
-use crate::config::settings::{CommandApprovalEngine, ExperimentalSettings};
 use crate::config::keychain;
+use crate::config::settings::{CommandApprovalEngine, ExperimentalSettings};
 use crate::error::AppError;
 use crate::llm::jev::JevConfig;
 use crate::llm::manager::LlmManager;
@@ -823,7 +823,10 @@ pub(crate) fn tools_for_round(
     conv_db: &crate::agent::conversation::ConversationDb,
     conversation_id: &str,
 ) -> Vec<ToolDefinition> {
-    let expose = is_subtask || conv_db.has_readable_history(conversation_id).unwrap_or(true);
+    let expose = is_subtask
+        || conv_db
+            .has_readable_history(conversation_id)
+            .unwrap_or(true);
     apply_state_gate(base.to_vec(), expose)
 }
 
@@ -1112,7 +1115,10 @@ fn prune_terminal_tasks(state: &AppState, max_terminal: usize) {
             // 走到这里表项应当已空；非空 = 清理没跑到（或没取到），
             // 那些子资源此刻无人回收 —— 不许静默。
             let leftover_targets = prune_state.multi_host_targets.forget_owner(task_id).await;
-            let leftover_transfers = prune_state.agent_transfer_by_task.forget_owner(task_id).await;
+            let leftover_transfers = prune_state
+                .agent_transfer_by_task
+                .forget_owner(task_id)
+                .await;
             if !leftover_targets.is_empty() || !leftover_transfers.is_empty() {
                 log::warn!(
                     "任务 {} 记录剪枝时仍残留子资源（多机会话 {:?}／传输 {:?}）—— 清理未完成，这些资源已无人回收",
@@ -1273,22 +1279,21 @@ mod tests {
             parameters: serde_json::json!({ "type": "object" }),
         };
         let base = vec![def("bash"), def("read_history")];
-        let names = |v: Vec<ToolDefinition>| -> Vec<String> {
-            v.into_iter().map(|d| d.name).collect()
-        };
+        let names =
+            |v: Vec<ToolDefinition>| -> Vec<String> { v.into_iter().map(|d| d.name).collect() };
 
         let db = ConversationDb::in_memory().expect("db");
         let fresh = db.create_conversation("conn_1", "fresh").expect("fresh");
 
         // 全新会话：没有任何读不到的东西 ⇒ 不给（这正是要治的那种会话）
         assert_eq!(
-            names(tools_for_round(&base, false, &db, &fresh.id)),
+            names(tools_for_round(&base, false, &db, &fresh.id,)),
             vec!["bash"]
         );
 
         // 子代理恒给：它读主 agent 派发时刻的上下文，与父会话压不压缩无关
         assert_eq!(
-            names(tools_for_round(&base, true, &db, &fresh.id)),
+            names(tools_for_round(&base, true, &db, &fresh.id,)),
             vec!["bash", "read_history"]
         );
 
@@ -1297,7 +1302,7 @@ mod tests {
             .create_sub_conversation("conn_1", "查磁盘", &fresh.id)
             .expect("child");
         assert_eq!(
-            names(tools_for_round(&base, false, &db, &fresh.id)),
+            names(tools_for_round(&base, false, &db, &fresh.id,)),
             vec!["bash", "read_history"]
         );
         db.delete_conversation(&child.id).expect("delete child");
@@ -1313,7 +1318,7 @@ mod tests {
         )
         .expect("card");
         assert_eq!(
-            names(tools_for_round(&base, false, &db, &fresh.id)),
+            names(tools_for_round(&base, false, &db, &fresh.id,)),
             vec!["bash", "read_history"]
         );
     }

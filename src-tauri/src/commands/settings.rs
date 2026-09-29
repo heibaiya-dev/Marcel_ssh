@@ -322,7 +322,10 @@ mod tests {
 
         // 并且与 `{}` 反序列化路径逐字段一致（同一条链路的另一半）
         let from_empty: AppSettings = serde_json::from_str("{}").expect("deserialize {}");
-        assert_eq!(from_empty, s, "serde 缺字段路径与 Default::default() 不一致");
+        assert_eq!(
+            from_empty, s,
+            "serde 缺字段路径与 Default::default() 不一致"
+        );
     }
 
     fn validate(paths: Vec<String>) -> Result<(), String> {

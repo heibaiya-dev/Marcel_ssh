@@ -290,18 +290,70 @@ pub const DISK_COMMANDS: &[&str] = &[
 ///
 /// 两个例外不受这份豁免保护：重定向目标（那是写），以及带了 [`WRITE_FLAGS`] 的命令。
 const READ_ONLY_COMMANDS: &[&str] = &[
-    "ls", "cat", "pwd", "whoami", "hostname", "uname", "date", "uptime", "df", "du", "free",
-    "top", "ps", "id", "env", "head", "tail", "wc", "find", "grep", "egrep", "fgrep", "which",
-    "file", "stat", "lsof", "netstat", "ss", "ifconfig", "ip", "dig", "nslookup", "ping",
-    "traceroute", "curl", "wget", "less", "more", "sort", "uniq", "diff", "md5sum", "sha256sum",
-    "readlink", "realpath", "type", "man", "help", "echo", "printf",
+    "ls",
+    "cat",
+    "pwd",
+    "whoami",
+    "hostname",
+    "uname",
+    "date",
+    "uptime",
+    "df",
+    "du",
+    "free",
+    "top",
+    "ps",
+    "id",
+    "env",
+    "head",
+    "tail",
+    "wc",
+    "find",
+    "grep",
+    "egrep",
+    "fgrep",
+    "which",
+    "file",
+    "stat",
+    "lsof",
+    "netstat",
+    "ss",
+    "ifconfig",
+    "ip",
+    "dig",
+    "nslookup",
+    "ping",
+    "traceroute",
+    "curl",
+    "wget",
+    "less",
+    "more",
+    "sort",
+    "uniq",
+    "diff",
+    "md5sum",
+    "sha256sum",
+    "readlink",
+    "realpath",
+    "type",
+    "man",
+    "help",
+    "echo",
+    "printf",
 ];
 
 /// 会把上面那些"只读"命令变成写操作或执行操作的参数。带了这些就不再享受
 /// 受保护路径的豁免 —— 例如 `find /etc -delete`、`curl -o /etc/hosts ...`。
 const WRITE_FLAGS: &[&str] = &[
-    "-delete", "-exec", "-execdir", "-ok", "-okdir", // find
-    "-o", "-O", "--output", "--output-dir", // curl / wget
+    "-delete",
+    "-exec",
+    "-execdir",
+    "-ok",
+    "-okdir", // find
+    "-o",
+    "-O",
+    "--output",
+    "--output-dir", // curl / wget
 ];
 
 /// 系统级命令里"看一眼、什么也不改"的子命令形态。
@@ -354,7 +406,10 @@ pub(super) fn is_read_only_system_query(base: &str, args: &[String]) -> bool {
 /// （`cat /etc/passwd` 不算要改系统文件）。重定向目标不受这份豁免保护。
 pub fn is_read_only_command(parsed: &ParsedSegment) -> bool {
     READ_ONLY_COMMANDS.contains(&parsed.base_cmd.as_str())
-        && !parsed.args.iter().any(|a| WRITE_FLAGS.contains(&a.as_str()))
+        && !parsed
+            .args
+            .iter()
+            .any(|a| WRITE_FLAGS.contains(&a.as_str()))
 }
 
 /// `/dev` 下的虚拟设备 —— 往它们写等于丢弃或转发，不是"改系统"。
@@ -372,8 +427,8 @@ pub(super) fn is_virtual_device(path: &str) -> bool {
         return false;
     }
     const VIRTUAL: &[&str] = &[
-        "null", "zero", "full", "random", "urandom", "tty", "console", "stdin", "stdout",
-        "stderr", "ptmx", "core",
+        "null", "zero", "full", "random", "urandom", "tty", "console", "stdin", "stdout", "stderr",
+        "ptmx", "core",
     ];
     VIRTUAL.contains(&rest)
         || rest.starts_with("fd/")
@@ -519,7 +574,17 @@ mod tests {
 
     #[test]
     fn rm_target_root_and_glob_are_catastrophic() {
-        for p in ["/", "/*", "/.*", "~", "$HOME", "~/", "$HOME/", "/home", "/home/user"] {
+        for p in [
+            "/",
+            "/*",
+            "/.*",
+            "~",
+            "$HOME",
+            "~/",
+            "$HOME/",
+            "/home",
+            "/home/user",
+        ] {
             assert_eq!(
                 classify_rm_target(p),
                 RmTargetClass::Catastrophic,
@@ -532,7 +597,16 @@ mod tests {
     /// `/etc`、`/boot` 这类目录里没有"用户的活儿"，删它只能是出事了。
     #[test]
     fn rm_target_system_dirs_are_catastrophic() {
-        for p in ["/etc", "/etc/nginx", "/boot", "/dev", "/proc", "/bin", "/lib64", "/root"] {
+        for p in [
+            "/etc",
+            "/etc/nginx",
+            "/boot",
+            "/dev",
+            "/proc",
+            "/bin",
+            "/lib64",
+            "/root",
+        ] {
             assert_eq!(
                 classify_rm_target(p),
                 RmTargetClass::Catastrophic,

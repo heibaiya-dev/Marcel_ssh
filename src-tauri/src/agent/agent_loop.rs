@@ -757,9 +757,7 @@ pub(crate) async fn run_agent_loop(
                 );
                 // 落库 role=notice（不是 user）：它是系统写的告知，不是用户打的
                 // 字 —— 回读时显示成「系统告知」，与跨轮唤醒那条同一个身份。
-                if let Some(db_id) =
-                    persister.save_msg(ROLE_NOTICE, &notice, None, None)
-                {
+                if let Some(db_id) = persister.save_msg(ROLE_NOTICE, &notice, None, None) {
                     let mut m = LlmMessage::user(notice);
                     m.db_id = Some(db_id);
                     messages.push(m);

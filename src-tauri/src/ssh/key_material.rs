@@ -116,7 +116,8 @@ fn text_marks_encrypted(text: &str) -> bool {
 /// 这把私钥自身是否带密码保护。对全部受支持的格式都成立：
 /// 先看文本明示标记，再用"不给密码解一次"兜住 OpenSSH。
 pub fn is_encrypted(text: &str) -> bool {
-    text_marks_encrypted(text) || matches!(decode_secret_key(text, None), Err(KeyError::KeyIsEncrypted))
+    text_marks_encrypted(text)
+        || matches!(decode_secret_key(text, None), Err(KeyError::KeyIsEncrypted))
 }
 
 /// 解码私钥文本，失败时翻译成带原因码的结构化错误。
@@ -137,7 +138,9 @@ fn classify_decode_failure(text: &str, passphrase_supplied: bool, err: &KeyError
     }
 
     match err {
-        KeyError::UnsupportedKeyType { key_type_string, .. } => key_error(
+        KeyError::UnsupportedKeyType {
+            key_type_string, ..
+        } => key_error(
             KeyAuthCode::UnsupportedKey,
             format!(
                 "不支持这个私钥的类型（{}）。支持 OpenSSH、PEM、PKCS#8 与 PuTTY(.ppk) 私钥。",
@@ -167,9 +170,7 @@ pub(crate) mod tests {
     /// 两者 trait 不同源；`from_bytes` + `encrypt_with` 都是确定性的，测试反而更稳。
     /// `pub(crate)`：key_store 的单测也用它，避免两处各写一份造钥匙的代码。
     pub(crate) fn key_text(seed: u8, passphrase: Option<&str>) -> String {
-        use russh::keys::ssh_key::private::{
-            Ed25519Keypair, Ed25519PrivateKey, KeypairData,
-        };
+        use russh::keys::ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey, KeypairData};
         use russh::keys::ssh_key::{Cipher, Kdf, LineEnding, PrivateKey};
 
         let private = Ed25519PrivateKey::from_bytes(&[seed; 32]);
@@ -195,9 +196,7 @@ pub(crate) mod tests {
                 .expect("encrypt"),
             None => key,
         };
-        key.to_openssh(LineEnding::LF)
-            .expect("encode")
-            .to_string()
+        key.to_openssh(LineEnding::LF).expect("encode").to_string()
     }
 
     #[test]
@@ -322,7 +321,10 @@ pub(crate) mod tests {
     #[test]
     fn encrypted_openssh_key_classifies_passphrase_correctly() {
         let text = key_text(2, Some("s3cret"));
-        assert!(is_encrypted(&text), "encrypted OpenSSH key must be detected");
+        assert!(
+            is_encrypted(&text),
+            "encrypted OpenSSH key must be detected"
+        );
 
         match decode_pem(&text, None).unwrap_err() {
             AppError::KeyAuth { code, .. } => assert_eq!(code, KeyAuthCode::NeedsPassphrase),

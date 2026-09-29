@@ -776,9 +776,8 @@ async fn compact_region(
         match result {
             Ok(text) => break text,
             Err(e) => {
-                let fallbackable = !fallback_used
-                    && !matches!(trigger, "manual")
-                    && is_context_overflow_error(&e);
+                let fallbackable =
+                    !fallback_used && !matches!(trigger, "manual") && is_context_overflow_error(&e);
                 if !fallbackable {
                     return Err(e);
                 }
@@ -1078,10 +1077,7 @@ mod tests {
         assert!(overhead + region_shadowed_tokens(&msgs, &one_more) > budget);
 
         // 同样的消息：窗口给足 → 原样返回
-        assert_eq!(
-            apply_input_budget(&msgs, range, &[], 1_000_000),
-            Ok(range)
-        );
+        assert_eq!(apply_input_budget(&msgs, range, &[], 1_000_000), Ok(range));
     }
 
     /// 传工具 schema 会让摘要请求变大 → 预算收缩必须把它算进去（收到更小的区间）。
@@ -1135,9 +1131,8 @@ mod tests {
         let overhead = summary_request_overhead(&[]);
         let region_tokens = region_shadowed_tokens(&msgs, &range);
 
-        let smaller =
-            shrink_region_for_retry(&msgs, &cuts, &range, overhead, region_tokens, true)
-                .expect("砍半后应仍有可行区间");
+        let smaller = shrink_region_for_retry(&msgs, &cuts, &range, overhead, region_tokens, true)
+            .expect("砍半后应仍有可行区间");
 
         assert_eq!(smaller.start, range.start);
         assert!(smaller.end < range.end);

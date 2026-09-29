@@ -60,9 +60,15 @@ fn mentions_of_devices_in_strings_are_inert() {
 
 #[test]
 fn writes_to_protected_paths_force_approval() {
-    assert_eq!(assess("echo 'bad' > /etc/passwd"), Disposition::ForceApproval);
+    assert_eq!(
+        assess("echo 'bad' > /etc/passwd"),
+        Disposition::ForceApproval
+    );
     assert_eq!(assess("mkdir /etc/myapp"), Disposition::ForceApproval);
-    assert_eq!(assess("tee /etc/nginx/nginx.conf"), Disposition::ForceApproval);
+    assert_eq!(
+        assess("tee /etc/nginx/nginx.conf"),
+        Disposition::ForceApproval
+    );
 }
 
 #[test]
@@ -91,7 +97,10 @@ fn system_level_commands_force_approval() {
 fn sudo_wrapping_defaults_to_approval_not_forced() {
     assert_eq!(assess("sudo apt update"), Disposition::Approval);
     assert!(reason("sudo apt update").contains("sudo"));
-    assert_eq!(assess("sudo -n tail /var/log/nginx/access.log"), Disposition::Approval);
+    assert_eq!(
+        assess("sudo -n tail /var/log/nginx/access.log"),
+        Disposition::Approval
+    );
     // 提权 + 只读查询形态：保底档不被查询豁免写成放行。
     assert_eq!(assess("sudo systemctl status nginx"), Disposition::Approval);
     // 里面的规则继续生效，取最严。
@@ -106,10 +115,7 @@ fn sudo_wrapping_defaults_to_approval_not_forced() {
 /// 但要人看一眼。
 #[test]
 fn disk_tools_on_regular_files_need_approval() {
-    assert_eq!(
-        assess("mkfs.ext4 disk.img"),
-        Disposition::ForceApproval
-    );
+    assert_eq!(assess("mkfs.ext4 disk.img"), Disposition::ForceApproval);
     assert_eq!(
         assess("dd if=/dev/zero of=/tmp/img bs=1M count=10"),
         Disposition::ForceApproval
@@ -210,7 +216,12 @@ fn read_only_system_queries_are_allowed() {
         "iptables -L",
         "nft list ruleset",
     ] {
-        assert_eq!(assess(cmd), Disposition::Allow, "`{}` 是查询，不该抬档", cmd);
+        assert_eq!(
+            assess(cmd),
+            Disposition::Allow,
+            "`{}` 是查询，不该抬档",
+            cmd
+        );
     }
 }
 
@@ -218,8 +229,18 @@ fn read_only_system_queries_are_allowed() {
 /// 按名字批量杀的 `pkill` / `killall` 走直接拒绝（见下）。
 #[test]
 fn killing_a_specific_pid_is_allowed() {
-    for cmd in ["kill -9 1234", "kill -0 1234", "kill 1234", "kill -TERM 1234"] {
-        assert_eq!(assess(cmd), Disposition::Allow, "`{}` 是精确操作，不该拦", cmd);
+    for cmd in [
+        "kill -9 1234",
+        "kill -0 1234",
+        "kill 1234",
+        "kill -TERM 1234",
+    ] {
+        assert_eq!(
+            assess(cmd),
+            Disposition::Allow,
+            "`{}` 是精确操作，不该拦",
+            cmd
+        );
     }
 }
 
@@ -371,7 +392,11 @@ fn fork_bomb_is_denied() {
 #[test]
 fn denial_carries_an_actionable_reason() {
     let r = reason("rm -rf /etc");
-    assert!(r.contains("/etc"), "理由里应当出现踩线的路径，实际是 {:?}", r);
+    assert!(
+        r.contains("/etc"),
+        "理由里应当出现踩线的路径，实际是 {:?}",
+        r
+    );
 }
 
 // ───────────────────────── 解析不了 ─────────────────────────

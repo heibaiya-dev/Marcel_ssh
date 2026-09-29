@@ -117,7 +117,10 @@ pub async fn agent_stop_task(
     // 注意：必须在释放上面的写锁之后再调用（本函数要再取同一把锁）。
     if requested_while_absent {
         crate::agent::manager::request_cancel(state.inner(), &task_id);
-        log::info!("Stop requested before task {} was registered; recording it", task_id);
+        log::info!(
+            "Stop requested before task {} was registered; recording it",
+            task_id
+        );
         return Ok(());
     }
 

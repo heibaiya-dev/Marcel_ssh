@@ -657,10 +657,7 @@ fn reset_downloading(app: &AppHandle) {
     }
 }
 
-async fn run_download(
-    app: &AppHandle,
-    offer: &LatestRelease,
-) -> Result<DownloadOutcome, String> {
+async fn run_download(app: &AppHandle, offer: &LatestRelease) -> Result<DownloadOutcome, String> {
     let dir = update_dir(app)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建更新缓存目录: {}", e))?;
 

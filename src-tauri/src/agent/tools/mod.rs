@@ -1849,7 +1849,13 @@ mod tests {
         // 预检是 **opt-in** 的：没实现它的工具（含插件工具、动态工具）行为必须零变化。
         // 这条同时是"别把预检越权扩大成全局参数校验"的护栏。
         let r = ToolRegistry::with_builtins();
-        for name in ["read_file", "write_file", "search_files", "subagent", "job_kill"] {
+        for name in [
+            "read_file",
+            "write_file",
+            "search_files",
+            "subagent",
+            "job_kill",
+        ] {
             let tool = r.get(name).unwrap_or_else(|| panic!("没有工具 {name}"));
             assert!(
                 tool.validate_arguments(&serde_json::json!({})).is_ok(),
@@ -1863,7 +1869,8 @@ mod tests {
         let r = ToolRegistry::with_builtins();
         let bash = r.get("bash").expect("bash 已注册");
         assert!(
-            bash.validate_arguments(&serde_json::json!({"command": "ls"})).is_err(),
+            bash.validate_arguments(&serde_json::json!({"command": "ls"}))
+                .is_err(),
             "bash 应声明预检，缺 description 时在弹审批之前就被拦下"
         );
     }

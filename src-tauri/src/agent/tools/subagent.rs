@@ -267,7 +267,10 @@ impl AgentTool for SubagentTool {
                 .and_then(|t| t.parent_task_id.clone())
                 .is_some()
         {
-            log::warn!("subagent tool blocked: {} is itself a subagent", parent_task_id);
+            log::warn!(
+                "subagent tool blocked: {} is itself a subagent",
+                parent_task_id
+            );
             return Ok(ToolOutput::fail(
                 "subagent: 子agent不能再派发子agent",
                 "当前任务本身是子agent，不允许再派发子agent。",
@@ -421,7 +424,8 @@ impl AgentTool for SubagentTool {
         // 约束段的文本在 templates/agent/子agent_只读.hbs、子agent_执行.hbs：
         // 桌面/移动的工具清单差异用 can_transfer 分支，避免两份 cfg 副本各自漂移。
         let sub_instruction = if exec_mode == AgentMode::Agent {
-            TemplateManager.render_fragment("子agent_执行", &json!({ "can_transfer": cfg!(desktop) }))
+            TemplateManager
+                .render_fragment("子agent_执行", &json!({ "can_transfer": cfg!(desktop) }))
         } else {
             TemplateManager.render_fragment("子agent_只读", &json!({}))
         };
@@ -629,11 +633,7 @@ mod tests {
             false,
             Some(AgentMode::Plan)
         ));
-        assert!(!is_plan_parent_write_subagent_blocked(
-            "agent",
-            true,
-            None
-        ));
+        assert!(!is_plan_parent_write_subagent_blocked("agent", true, None));
     }
 
     #[test]

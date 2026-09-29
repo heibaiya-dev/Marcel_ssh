@@ -223,10 +223,7 @@ mod tests {
         drop((first, other));
 
         assert!(!reg.is_registered("c1"), "guard Drop 后应注销");
-        assert!(
-            reg.try_register("c1").is_some(),
-            "上一个结束后应能重新开始"
-        );
+        assert!(reg.try_register("c1").is_some(), "上一个结束后应能重新开始");
     }
 
     /// 取消路径：guard 还活着（命令尚未返回）时，接收端必须立刻收到信号 ——

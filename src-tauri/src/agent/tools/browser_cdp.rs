@@ -167,7 +167,10 @@ fn describe_exception(exc: &Value) -> String {
         .unwrap_or("unknown page exception");
     let line = raw.lines().next().unwrap_or(raw).trim();
     if line.chars().count() > EXCEPTION_LINE_MAX {
-        format!("{}…", line.chars().take(EXCEPTION_LINE_MAX).collect::<String>())
+        format!(
+            "{}…",
+            line.chars().take(EXCEPTION_LINE_MAX).collect::<String>()
+        )
     } else {
         line.to_string()
     }

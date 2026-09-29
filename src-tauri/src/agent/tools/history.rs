@@ -147,8 +147,7 @@ fn uint_arg(v: &serde_json::Value, key: &str) -> Result<usize, String> {
 
 impl Params {
     fn parse(v: &serde_json::Value) -> Result<Self, String> {
-        let action_raw =
-            str_arg(v, "action").ok_or("缺少 action（overview / search / read）")?;
+        let action_raw = str_arg(v, "action").ok_or("缺少 action（overview / search / read）")?;
         let action = Action::parse(&action_raw)?;
         let scope = match str_arg(v, "scope") {
             Some(raw) => Scope::parse(&raw)?,
@@ -274,53 +273,56 @@ fn resolve_target(
     }
 }
 
-    /// 派发上下文：上界取自**子任务自己**的 `parent_history_upto`（spawn 时冻结），
-    /// 父任务记录缺失 → `None`（调用方据此 fail-closed，而不是放任"不限上界"）。
-    #[test]
-    fn parent_context_comes_from_my_own_frozen_anchor() {
-        use crate::agent::task::{AgentMode, AgentStatus, AgentTask};
+/// 派发上下文：上界取自**子任务自己**的 `parent_history_upto`（spawn 时冻结），
+/// 父任务记录缺失 → `None`（调用方据此 fail-closed，而不是放任"不限上界"）。
+#[test]
+fn parent_context_comes_from_my_own_frozen_anchor() {
+    use crate::agent::task::{AgentMode, AgentStatus, AgentTask};
 
-        fn task(id: &str, conv: &str, parent: Option<&str>, upto: Option<&str>) -> AgentTask {
-            AgentTask {
-                id: id.into(),
-                session_id: "s1".into(),
-                conversation_id: conv.into(),
-                prompt: "p".into(),
-                mode: AgentMode::Agent,
-                status: AgentStatus::Executing,
-                has_plan: false,
-                created_at: chrono::Utc::now(),
-                parent_task_id: parent.map(String::from),
-                model_id: None,
-                turn_anchor_id: None,
-                parent_history_upto: upto.map(String::from),
-            }
+    fn task(id: &str, conv: &str, parent: Option<&str>, upto: Option<&str>) -> AgentTask {
+        AgentTask {
+            id: id.into(),
+            session_id: "s1".into(),
+            conversation_id: conv.into(),
+            prompt: "p".into(),
+            mode: AgentMode::Agent,
+            status: AgentStatus::Executing,
+            has_plan: false,
+            created_at: chrono::Utc::now(),
+            parent_task_id: parent.map(String::from),
+            model_id: None,
+            turn_anchor_id: None,
+            parent_history_upto: upto.map(String::from),
         }
-
-        // 子任务：父会话 id 来自父任务，上界来自我自己冻结的那个值
-        let child = task("sub", "conv-sub", Some("main"), Some("msg-9"));
-        let parent = task("main", "conv-main", None, None);
-        let (is_sub, ctx) = parent_context_from(&child, Some(&parent));
-        assert!(is_sub);
-        let ctx = ctx.expect("有父任务");
-        assert_eq!(ctx.parent_conversation_id, "conv-main");
-        assert_eq!(ctx.upto_message_id.as_deref(), Some("msg-9"));
-
-        // 主任务：不是子任务；即便传了父记录也不该被当成子代理
-        let main = task("main", "conv-main", None, None);
-        let (is_sub, ctx) = parent_context_from(&main, None);
-        assert!(!is_sub);
-        assert!(ctx.is_none());
-
-        // 父任务记录没了（被清理）：仍认得出是子任务，但拿不到范围 ⇒ 调用方明确报错
-        let orphan = task("sub", "conv-sub", Some("gone"), None);
-        let (is_sub, ctx) = parent_context_from(&orphan, None);
-        assert!(is_sub, "父子关系来自 parent_task_id，不依赖父记录还在不在");
-        assert!(ctx.is_none());
     }
 
-    /// 子对话必须确实是**本会话派发的**（挡住"随便猜一个会话 id"与跨会话族读取）。
-fn check_sub_belongs(own_conversation_id: &str, child: Option<&Conversation>) -> Result<(), String> {
+    // 子任务：父会话 id 来自父任务，上界来自我自己冻结的那个值
+    let child = task("sub", "conv-sub", Some("main"), Some("msg-9"));
+    let parent = task("main", "conv-main", None, None);
+    let (is_sub, ctx) = parent_context_from(&child, Some(&parent));
+    assert!(is_sub);
+    let ctx = ctx.expect("有父任务");
+    assert_eq!(ctx.parent_conversation_id, "conv-main");
+    assert_eq!(ctx.upto_message_id.as_deref(), Some("msg-9"));
+
+    // 主任务：不是子任务；即便传了父记录也不该被当成子代理
+    let main = task("main", "conv-main", None, None);
+    let (is_sub, ctx) = parent_context_from(&main, None);
+    assert!(!is_sub);
+    assert!(ctx.is_none());
+
+    // 父任务记录没了（被清理）：仍认得出是子任务，但拿不到范围 ⇒ 调用方明确报错
+    let orphan = task("sub", "conv-sub", Some("gone"), None);
+    let (is_sub, ctx) = parent_context_from(&orphan, None);
+    assert!(is_sub, "父子关系来自 parent_task_id，不依赖父记录还在不在");
+    assert!(ctx.is_none());
+}
+
+/// 子对话必须确实是**本会话派发的**（挡住"随便猜一个会话 id"与跨会话族读取）。
+fn check_sub_belongs(
+    own_conversation_id: &str,
+    child: Option<&Conversation>,
+) -> Result<(), String> {
     let Some(child) = child else {
         return Err("找不到这个子对话（可能已被删除）。".into());
     };
@@ -577,10 +579,7 @@ fn render_read(
     }
     if !notes.is_empty() {
         let hint = if lo > 0 {
-            format!(
-                "；用 anchor_id={} 往前继续读",
-                rows[lo].id
-            )
+            format!("；用 anchor_id={} 往前继续读", rows[lo].id)
         } else {
             String::new()
         };
@@ -608,7 +607,11 @@ fn clip_chars(s: &str, max_chars: usize) -> String {
 /// 所有 id 都来自**窗口内**的查询（`history_overview` 已按窗口裁过），所以这里
 /// 不会打印拿去做 `action=read` 必然失败的 id。窗口外还有东西时必须说出来，
 /// 否则 agent 会以为"会话就这么多"。
-fn render_overview(conversation_id: &str, scope: Scope, ov: &crate::agent::conversation::HistoryOverview) -> String {
+fn render_overview(
+    conversation_id: &str,
+    scope: Scope,
+    ov: &crate::agent::conversation::HistoryOverview,
+) -> String {
     // 范围内一条都没有：这不是"没有压缩过"，而是整个可读窗口为空（父会话在派发后
     // 又压过）。必须与"空会话"分开说，否则 agent 会得出相反结论。
     if ov.total == 0 && ov.hidden_before_window > 0 {
@@ -665,7 +668,7 @@ fn render_overview(conversation_id: &str, scope: Scope, ov: &crate::agent::conve
             if let Some(last) = &ov.archived_newest {
                 out.push_str(&format!(
                     "- 归档段范围：{} 条，最早 id={} 到最晚 id={}（{}）\n",
-                    ov.archived, 
+                    ov.archived,
                     ov.oldest.as_ref().map(|m| m.id.as_str()).unwrap_or("-"),
                     last.id,
                     last.timestamp
@@ -684,7 +687,10 @@ fn render_overview(conversation_id: &str, scope: Scope, ov: &crate::agent::conve
 }
 
 /// 子对话清单正文。
-fn render_sub_list(subs: &[crate::agent::conversation::SubConversationInfo], running: &dyn Fn(&str) -> bool) -> String {
+fn render_sub_list(
+    subs: &[crate::agent::conversation::SubConversationInfo],
+    running: &dyn Fn(&str) -> bool,
+) -> String {
     if subs.is_empty() {
         return "本会话没有派发过子对话。".to_string();
     }
@@ -883,7 +889,8 @@ impl AgentTool for ReadHistoryTool {
                 if let Err(e) = check_sub_belongs(&own_conversation_id, child.as_ref()) {
                     return Ok(ToolOutput::fail("回读历史：不在可读范围内", e));
                 }
-                if let Err(e) = check_sub_settled(conversation_is_running(&state, conversation_id)) {
+                if let Err(e) = check_sub_settled(conversation_is_running(&state, conversation_id))
+                {
                     return Ok(ToolOutput::fail("回读历史：子对话还在运行", e));
                 }
                 self.run_action(&db, &target, &params, "子对话")
@@ -951,10 +958,7 @@ fn render_sub_list_output(
     let subs = match db.list_sub_conversations(own_conversation_id) {
         Ok(s) => s,
         Err(e) => {
-            return ToolOutput::fail(
-                "回读历史：读子对话列表失败",
-                format!("读取会话库出错：{e}"),
-            )
+            return ToolOutput::fail("回读历史：读子对话列表失败", format!("读取会话库出错：{e}"))
         }
     };
     let text = render_sub_list(&subs, &|id: &str| conversation_is_running(state, id));
@@ -1009,15 +1013,16 @@ impl ReadHistoryTool {
                         ov.total, ov.archived
                     )
                 };
-                Ok(ToolOutput::ok(
-                    summary,
-                    text,
-                ))
+                Ok(ToolOutput::ok(summary, text))
             }
             Action::Search => {
                 let keyword = params.keyword.clone().unwrap_or_default();
-                let hits = match db.search_history(&conversation_id, &keyword, window.as_ref(), params.limit)
-                {
+                let hits = match db.search_history(
+                    &conversation_id,
+                    &keyword,
+                    window.as_ref(),
+                    params.limit,
+                ) {
                     Ok(h) => h,
                     Err(e) => return Ok(history_error_output(e, &conversation_id)),
                 };
@@ -1074,11 +1079,10 @@ impl ReadHistoryTool {
                     "hasMoreBefore": read.has_more_before,
                     "hasMoreAfter": read.has_more_after,
                 });
-                Ok(ToolOutput::ok(
-                    format!("回读历史：读 {} 条", read.messages.len()),
-                    text,
+                Ok(
+                    ToolOutput::ok(format!("回读历史：读 {} 条", read.messages.len()), text)
+                        .with_metadata(metadata),
                 )
-                .with_metadata(metadata))
             }
         }
     }
@@ -1170,9 +1174,18 @@ mod tests {
     #[test]
     fn params_reject_unknown_action_and_missing_required() {
         assert!(Params::parse(&json!({})).is_err(), "缺 action");
-        assert!(Params::parse(&json!({ "action": "list_all" })).is_err(), "未知 action");
-        assert!(Params::parse(&json!({ "action": "search" })).is_err(), "search 缺 keyword");
-        assert!(Params::parse(&json!({ "action": "read" })).is_err(), "read 缺 anchor_id");
+        assert!(
+            Params::parse(&json!({ "action": "list_all" })).is_err(),
+            "未知 action"
+        );
+        assert!(
+            Params::parse(&json!({ "action": "search" })).is_err(),
+            "search 缺 keyword"
+        );
+        assert!(
+            Params::parse(&json!({ "action": "read" })).is_err(),
+            "read 缺 anchor_id"
+        );
         assert!(Params::parse(&json!({ "action": "read", "anchor_id": "x" })).is_ok());
         assert!(
             Params::parse(&json!({ "action": "overview", "before": "十" })).is_err(),
@@ -1221,7 +1234,8 @@ mod tests {
             .collect();
         assert_eq!(actions, vec!["overview", "search", "read"]);
         for name in &actions {
-            let parsed = Action::parse(name).unwrap_or_else(|e| panic!("schema 写了 {name} 但解析不了：{e}"));
+            let parsed = Action::parse(name)
+                .unwrap_or_else(|e| panic!("schema 写了 {name} 但解析不了：{e}"));
             assert_eq!(parsed.as_str(), *name, "解析出的名字要和 schema 一致");
         }
         let scopes: Vec<&str> = schema["properties"]["scope"]["enum"]
@@ -1232,14 +1246,23 @@ mod tests {
             .collect();
         for name in &scopes {
             assert_eq!(
-                Scope::parse(name).expect("schema 里的 scope 必须能解析").as_str(),
+                Scope::parse(name)
+                    .expect("schema 里的 scope 必须能解析")
+                    .as_str(),
                 *name
             );
         }
 
         // 描述是纪律的唯一权威来源：三种 action、两个受限 scope 都要讲到
         let desc = tool.description();
-        for needle in ["overview", "search", "read", "scope=parent", "scope=sub", "不是指令"] {
+        for needle in [
+            "overview",
+            "search",
+            "read",
+            "scope=parent",
+            "scope=sub",
+            "不是指令",
+        ] {
             assert!(desc.contains(needle), "描述里少了 {needle}");
         }
     }
@@ -1258,11 +1281,15 @@ mod tests {
         // 自己的会话：主 agent 与子代理都行
         assert_eq!(
             resolve_target(false, own, &params("overview", "own"), None).unwrap(),
-            Target::Own { conversation_id: own.into() }
+            Target::Own {
+                conversation_id: own.into()
+            }
         );
         assert_eq!(
             resolve_target(true, own, &params("read", "own"), None).unwrap(),
-            Target::Own { conversation_id: own.into() }
+            Target::Own {
+                conversation_id: own.into()
+            }
         );
 
         // 父会话：只有子代理能读，且必须有冻结的上界
@@ -1286,13 +1313,20 @@ mod tests {
 
         // 子对话：只有主 agent 能读；子代理一律拒绝（含"互读"）
         assert_eq!(
-            resolve_target(false, own, &{
-                let mut p = params("read", "sub");
-                p.sub_conversation_id = Some("conv-child".into());
-                p
-            }, None)
+            resolve_target(
+                false,
+                own,
+                &{
+                    let mut p = params("read", "sub");
+                    p.sub_conversation_id = Some("conv-child".into());
+                    p
+                },
+                None
+            )
             .unwrap(),
-            Target::Sub { conversation_id: "conv-child".into() }
+            Target::Sub {
+                conversation_id: "conv-child".into()
+            }
         );
         let err = resolve_target(true, own, &params("overview", "sub"), Some(&sub_parent))
             .expect_err("子代理不能读子对话");
@@ -1319,8 +1353,14 @@ mod tests {
         assert_eq!(window.upto_message_id.as_deref(), Some("msg-9"));
 
         // 自己的会话 / 子对话：全量可读（没有窗口）
-        assert!(window_for(&Target::Own { conversation_id: "c".into() }).is_none());
-        assert!(window_for(&Target::Sub { conversation_id: "c".into() }).is_none());
+        assert!(window_for(&Target::Own {
+            conversation_id: "c".into()
+        })
+        .is_none());
+        assert!(window_for(&Target::Sub {
+            conversation_id: "c".into()
+        })
+        .is_none());
     }
 
     /// **验收：跨会话/非本会话派发的子对话读不到**；运行中的子对话读不到。
@@ -1328,7 +1368,8 @@ mod tests {
     fn sub_scope_rejects_foreign_and_running() {
         let own = "conv-own";
         assert!(check_sub_belongs(own, Some(&conv("c1", Some(own)))).is_ok());
-        let err = check_sub_belongs(own, Some(&conv("c2", Some("别的会话")))).expect_err("别人的子对话");
+        let err =
+            check_sub_belongs(own, Some(&conv("c2", Some("别的会话")))).expect_err("别人的子对话");
         assert!(err.contains("不是本会话派发"), "{err}");
         let err = check_sub_belongs(own, Some(&conv("c3", None))).expect_err("主会话不是子对话");
         assert!(err.contains("不是本会话派发"), "{err}");
@@ -1359,15 +1400,28 @@ mod tests {
                 .into(),
         );
         let body = render_body(&tool);
-        assert!(body.starts_with("工具：bash\n$ systemctl status nginx\n输出：\n"), "{body}");
+        assert!(
+            body.starts_with("工具：bash\n$ systemctl status nginx\n输出：\n"),
+            "{body}"
+        );
         assert!(body.contains("active (running)"));
-        assert!(!body.contains("disposition"), "不该把内部字段倒出来：{body}");
+        assert!(
+            !body.contains("disposition"),
+            "不该把内部字段倒出来：{body}"
+        );
 
         let mut assistant = stored("m3", "assistant", "接着看端口");
         assistant.tool_calls_json = Some(r#"[{"id":"c1","name":"bash","arguments":{}}]"#.into());
-        assert_eq!(render_body(&assistant), "接着看端口\n[这条回复调用了工具：bash]");
+        assert_eq!(
+            render_body(&assistant),
+            "接着看端口\n[这条回复调用了工具：bash]"
+        );
 
-        let card = stored("m4", "system", "【上下文已压缩】已整理 3 条历史消息（约 120 tokens）");
+        let card = stored(
+            "m4",
+            "system",
+            "【上下文已压缩】已整理 3 条历史消息（约 120 tokens）",
+        );
         assert!(render_body(&card).starts_with("压缩卡：\n【上下文已压缩】"));
         let notice = stored("m5", "system", "用户拒绝了这次调用");
         assert_eq!(render_body(&notice), "系统提示：用户拒绝了这次调用");
@@ -1399,10 +1453,18 @@ mod tests {
         // 锚点在正中
         let out = render_read(&rows, 5, 0, false, false, 200);
         assert!(out.text.contains("id=m5"), "锚点必留");
-        assert!(out.text.contains("本次没读更早的"), "裁掉的行要说明：{}", out.text);
+        assert!(
+            out.text.contains("本次没读更早的"),
+            "裁掉的行要说明：{}",
+            out.text
+        );
         assert!(out.text.contains("本次没读更晚的"));
         assert!(out.text.contains("用 anchor_id="), "给出继续读的锚点");
-        assert!(out.text.len() <= 400, "整体必须被截住，实际 {}", out.text.len());
+        assert!(
+            out.text.len() <= 400,
+            "整体必须被截住，实际 {}",
+            out.text.len()
+        );
     }
 
     /// 单条过长：截断 + 给 next_offset（用 offset 能读到余下的部分，不丢内容）。
@@ -1473,7 +1535,9 @@ mod tests {
         use crate::agent::conversation::ConversationDb;
 
         let db = std::sync::Arc::new(ConversationDb::in_memory().expect("db"));
-        let conv = db.create_conversation("conn_1", "被压过的会话").expect("conv");
+        let conv = db
+            .create_conversation("conn_1", "被压过的会话")
+            .expect("conv");
         let original = "systemctl status nginx 输出：inactive (dead)，unit 文件在 /lib/systemd/system/nginx.service";
         for (i, (role, content)) in [
             ("user", "把 nginx 换成 caddy，先看现状"),
@@ -1483,12 +1547,23 @@ mod tests {
         .iter()
         .enumerate()
         {
-            db.save_message(&conv.id, role, content, &format!("2026-01-01T00:0{i}:00Z"), None, None)
-                .expect("archived msg");
+            db.save_message(
+                &conv.id,
+                role,
+                content,
+                &format!("2026-01-01T00:0{i}:00Z"),
+                None,
+                None,
+            )
+            .expect("archived msg");
         }
         let orig_id = db.load_messages(&conv.id).expect("load")[2].id.clone();
         // 真实压缩落库：卡片 created_at 取被压末行的值
-        let tail = db.load_messages(&conv.id).expect("load").pop().expect("tail");
+        let tail = db
+            .load_messages(&conv.id)
+            .expect("load")
+            .pop()
+            .expect("tail");
         db.commit_compaction(
             &conv.id,
             &[],
@@ -1497,9 +1572,21 @@ mod tests {
             &tail.timestamp,
         )
         .expect("commit");
-        db.save_message(&conv.id, "user", "现在看 caddy 配置", "2026-01-01T00:10:00Z", None, None)
-            .expect("active msg");
-        let last_id = db.load_messages(&conv.id).expect("load").pop().expect("last").id;
+        db.save_message(
+            &conv.id,
+            "user",
+            "现在看 caddy 配置",
+            "2026-01-01T00:10:00Z",
+            None,
+            None,
+        )
+        .expect("active msg");
+        let last_id = db
+            .load_messages(&conv.id)
+            .expect("load")
+            .pop()
+            .expect("last")
+            .id;
         let card_id = db
             .history_overview(&conv.id, None)
             .expect("overview")
@@ -1532,22 +1619,32 @@ mod tests {
             "action": "read", "anchor_id": orig_id, "before": 1, "after": 2
         }))
         .expect("p");
-        let out = tool.run_action(&db, &own, &params, "本会话").expect("read around");
+        let out = tool
+            .run_action(&db, &own, &params, "本会话")
+            .expect("read around");
         assert!(out.output.contains("先做只读检查"), "{}", out.output);
-        assert!(out.output.contains("压缩卡"), "边界卡应出现在锚点后面：{}", out.output);
+        assert!(
+            out.output.contains("压缩卡"),
+            "边界卡应出现在锚点后面：{}",
+            out.output
+        );
         assert!(out.output.contains("现在看 caddy 配置"), "{}", out.output);
         assert!(out.output.contains("[锚点]"), "锚点位置要标出来");
 
         // ③ 检索只存在于归档里的词
-        let params = Params::parse(&json!({ "action": "search", "keyword": "inactive (dead)" }))
-            .expect("p");
-        let out = tool.run_action(&db, &own, &params, "本会话").expect("search");
+        let params =
+            Params::parse(&json!({ "action": "search", "keyword": "inactive (dead)" })).expect("p");
+        let out = tool
+            .run_action(&db, &own, &params, "本会话")
+            .expect("search");
         assert!(out.output.contains("命中 1 处"), "{}", out.output);
         assert!(out.output.contains(&format!("id={orig_id}")));
 
         // ④ 概览：说清楚归档了多少条、边界卡是谁
         let params = Params::parse(&json!({ "action": "overview" })).expect("p");
-        let out = tool.run_action(&db, &own, &params, "本会话").expect("overview");
+        let out = tool
+            .run_action(&db, &own, &params, "本会话")
+            .expect("overview");
         assert!(out.output.contains("归档段 3 条"), "{}", out.output);
         assert!(out.output.contains(&format!("id={card_id}")));
 
@@ -1567,12 +1664,16 @@ mod tests {
             "失败文案里也不许漏原文"
         );
 
-        let params = Params::parse(&json!({ "action": "search", "keyword": "inactive (dead)" }))
-            .expect("p");
+        let params =
+            Params::parse(&json!({ "action": "search", "keyword": "inactive (dead)" })).expect("p");
         let out = tool
             .run_action(&db, &parent_target, &params, "主 agent 的上下文")
             .expect("search parent");
-        assert!(out.output.contains("没有命中"), "窗口内检索不该命中归档：{}", out.output);
+        assert!(
+            out.output.contains("没有命中"),
+            "窗口内检索不该命中归档：{}",
+            out.output
+        );
 
         let params = Params::parse(&json!({
             "action": "read", "anchor_id": card_id, "before": 0, "after": 0
@@ -1596,8 +1697,15 @@ mod tests {
         .iter()
         .enumerate()
         {
-            db.save_message(&sub.id, role, content, &format!("2026-01-01T01:0{i}:00Z"), None, None)
-                .expect("sub msg");
+            db.save_message(
+                &sub.id,
+                role,
+                content,
+                &format!("2026-01-01T01:0{i}:00Z"),
+                None,
+                None,
+            )
+            .expect("sub msg");
         }
         let sub_target = Target::Sub {
             conversation_id: sub.id.clone(),
@@ -1606,13 +1714,20 @@ mod tests {
             "action": "read", "anchor_id": db.load_messages(&sub.id).expect("l")[0].id, "after": 10
         }))
         .expect("p");
-        let out = tool.run_action(&db, &sub_target, &params, "子对话").expect("read sub");
-        let expected: Vec<String> = db.load_messages(&sub.id).expect("l").iter().map(|m| m.content.clone()).collect();
+        let out = tool
+            .run_action(&db, &sub_target, &params, "子对话")
+            .expect("read sub");
+        let expected: Vec<String> = db
+            .load_messages(&sub.id)
+            .expect("l")
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
         let mut cursor = 0usize;
         for content in &expected {
-            let at = out.output[cursor..].find(content.as_str()).unwrap_or_else(|| {
-                panic!("子对话内容缺失或顺序不对：{content}\n{}", out.output)
-            });
+            let at = out.output[cursor..]
+                .find(content.as_str())
+                .unwrap_or_else(|| panic!("子对话内容缺失或顺序不对：{content}\n{}", out.output));
             cursor += at + content.len();
         }
     }

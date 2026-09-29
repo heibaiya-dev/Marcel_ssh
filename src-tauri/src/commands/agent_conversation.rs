@@ -152,7 +152,10 @@ fn conversation_usage(
     state: &AppState,
     conversation_id: &str,
 ) -> Option<crate::agent::conversation::ConversationUsage> {
-    match state.conversation_db.usage_with_sub_conversations(conversation_id) {
+    match state
+        .conversation_db
+        .usage_with_sub_conversations(conversation_id)
+    {
         Ok(u) => Some(u),
         Err(e) => {
             log::warn!("读取会话用量失败（{}）: {}", conversation_id, e);
@@ -280,10 +283,7 @@ pub async fn agent_load_earlier_messages(
         .conversation_db
         .load_earlier_messages(&conversation_id, &before_message_id, limit)
         .map_err(|e| AppError::Agent(format!("Failed to load earlier messages: {}", e)))?;
-    Ok(crate::agent::conversation::EarlierMessagesResult {
-        messages,
-        has_more,
-    })
+    Ok(crate::agent::conversation::EarlierMessagesResult { messages, has_more })
 }
 
 /// Rename a conversation.

@@ -225,14 +225,7 @@ pub async fn summarize_with_llm(
             // 事件通道只作内部转发，丢弃（摘要进度走 sink 回调）
             tokio::spawn(async move { while rx.recv().await.is_some() {} });
             manager
-                .stream_chat_with_sink(
-                    &messages,
-                    input.tools,
-                    &tx,
-                    Some(sink),
-                    None,
-                    None,
-                )
+                .stream_chat_with_sink(&messages, input.tools, &tx, Some(sink), None, None)
                 .await
                 .map_err(|e| format!("摘要生成失败：{}", e))?
         }
@@ -303,7 +296,9 @@ mod tests {
             "开头必须是警告，实际以 {:?} 起始",
             text.chars().take(24).collect::<String>()
         );
-        assert!(text.trim_end().ends_with("A reply that contains a tool call is invalid and will be discarded."));
+        assert!(text
+            .trim_end()
+            .ends_with("A reply that contains a tool call is invalid and will be discarded."));
     }
 
     /// 警告文案必须与我们自己的输出形态一致：不得引用别的产品的 summary 块。

@@ -376,7 +376,10 @@ impl SegmentedDownload<'_> {
         }
 
         // 每段独立开句柄：Windows 上克隆句柄共享文件指针，并发写会互相踩
-        let mut file = match std::fs::OpenOptions::new().write(true).open(&self.part_path) {
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.part_path)
+        {
             Ok(f) => f,
             Err(e) => return Err(FetchError::failed(format!("无法打开临时文件: {}", e))),
         };
@@ -514,7 +517,10 @@ mod tests {
     #[test]
     fn plan_segments_keeps_small_files_single() {
         // 小于一段最小字节数的文件不分段
-        assert_eq!(plan_segments(64 * 1024, MAX_SEGMENTS), vec![(0, 64 * 1024 - 1)]);
+        assert_eq!(
+            plan_segments(64 * 1024, MAX_SEGMENTS),
+            vec![(0, 64 * 1024 - 1)]
+        );
         assert_eq!(plan_segments(1, MAX_SEGMENTS), vec![(0, 0)]);
         assert!(plan_segments(0, MAX_SEGMENTS).is_empty());
     }
@@ -739,7 +745,12 @@ mod tests {
         let _ = std::fs::remove_file(&part);
         let no_cancel = || false;
         let progress = |done: u64, total: u64| {
-            eprintln!("进度 {}/{} ({:.1}%)", done, total, done as f64 / total as f64 * 100.0);
+            eprintln!(
+                "进度 {}/{} ({:.1}%)",
+                done,
+                total,
+                done as f64 / total as f64 * 100.0
+            );
         };
         let dl = SegmentedDownload {
             urls: vec![url],

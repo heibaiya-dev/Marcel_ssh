@@ -221,8 +221,14 @@ mod tests {
         let b = context_breakdown(&msgs, &tools);
         assert_eq!(b.system, estimate_message(&msgs[0]));
         assert_eq!(b.tools, estimate_header(None, &tools));
-        assert_eq!(b.messages, estimate_message(&msgs[1]) + estimate_message(&msgs[2]));
-        assert_eq!(b.system + b.tools + b.messages, estimate_total(&msgs, &tools));
+        assert_eq!(
+            b.messages,
+            estimate_message(&msgs[1]) + estimate_message(&msgs[2])
+        );
+        assert_eq!(
+            b.system + b.tools + b.messages,
+            estimate_total(&msgs, &tools)
+        );
     }
 
     /// 首条不是 system（工具轮次的尾部窗口等）：system 段为 0，全部算进 messages，

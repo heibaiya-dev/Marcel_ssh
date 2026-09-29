@@ -160,9 +160,7 @@ mod tests {
     }
 
     fn store_of(items: Vec<SavedConnection>) -> ConnectionStore {
-        ConnectionStore {
-            connections: items,
-        }
+        ConnectionStore { connections: items }
     }
 
     fn ids(store: &ConnectionStore) -> Vec<String> {
