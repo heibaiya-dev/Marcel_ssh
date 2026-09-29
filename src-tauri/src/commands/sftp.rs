@@ -718,6 +718,52 @@ pub async fn sftp_write_file(
     Ok(())
 }
 
+/// 进度事件节流阈值：距上次推送至少 100ms、或新增至少 1MB 才再推一次。
+/// 一次 2GB 的传输按 128KB 一次会推 ~1.6 万次事件、每次都写前端 store；节流只影响
+/// 中间进度，完成 / 失败 / 取消的收尾事件照旧发送，终态不会漏。
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+const PROGRESS_MIN_BYTES: u64 = 1024 * 1024;
+
+/// 节流判定（拆成纯函数便于测试）：间隔够久或新增字节够多才该发。
+fn progress_due(elapsed: Duration, last_written: u64, written: u64) -> bool {
+    elapsed >= PROGRESS_MIN_INTERVAL || written.saturating_sub(last_written) >= PROGRESS_MIN_BYTES
+}
+
+/// 单个传输实例的进度节流器：第一次调用立即放行（进度条马上出现），
+/// 之后按 [`progress_due`] 判定。
+struct ProgressThrottle {
+    last_emit: std::time::Instant,
+    last_written: u64,
+    emitted: bool,
+}
+
+impl ProgressThrottle {
+    fn new() -> Self {
+        Self {
+            last_emit: std::time::Instant::now(),
+            last_written: 0,
+            emitted: false,
+        }
+    }
+
+    fn should_emit(&mut self, written: u64) -> bool {
+        let now = std::time::Instant::now();
+        let due = progress_due(
+            now.duration_since(self.last_emit),
+            self.last_written,
+            written,
+        );
+        if !self.emitted || due {
+            self.emitted = true;
+            self.last_emit = now;
+            self.last_written = written;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// 远程 → 本地文件的分块拷贝循环（含取消、进度事件、结尾 flush）。
 /// 返回实际写入字节数；上层负责对目标文件做失败清理。
 /// `pub(crate)`：Agent 传输工具（下载）复用同一流式实现。
@@ -731,6 +777,7 @@ pub(crate) async fn stream_remote_to_local_file(
 ) -> Result<u64, AppError> {
     let mut buf = vec![0u8; 131072];
     let mut written: u64 = 0;
+    let mut throttle = ProgressThrottle::new();
 
     loop {
         check_cancelled(cancel_rx, "下载已取消")?;
@@ -766,11 +813,13 @@ pub(crate) async fn stream_remote_to_local_file(
             )));
         }
 
-        emit_event(
-            app,
-            "sftp-download-progress",
-            json!({ "downloadId": download_id, "written": written, "total": total }),
-        );
+        if throttle.should_emit(written) {
+            emit_event(
+                app,
+                "sftp-download-progress",
+                json!({ "downloadId": download_id, "written": written, "total": total }),
+            );
+        }
     }
 
     tokio::select! {
@@ -1250,6 +1299,7 @@ pub(crate) async fn stream_upload_single_file(
 
     let mut buf = vec![0u8; 131072];
     let mut written: u64 = 0;
+    let mut throttle = ProgressThrottle::new();
 
     let result: Result<(), AppError> = async {
         loop {
@@ -1275,11 +1325,25 @@ pub(crate) async fn stream_upload_single_file(
 
             written += n as u64;
 
-            emit_event(
-                app,
-                "sftp-upload-progress",
-                json!({ "uploadId": upload_id, "written": written, "total": total }),
-            );
+            // 增长检测（与下载侧同构）：实际读取一旦超过开始时的 stat 大小，
+            // 说明本地文件正被程序追加（如活跃日志）。继续读会一路追着增长的
+            // EOF 上传、进度字节数超过 total，最后报一句无意义的「上传不完整」。
+            // 检查放在进度事件之前，避免 UI 闪现超 100% 的进度。
+            // size_known=false（如 content:// 的 pipe provider）时 total 不可信，跳过。
+            if size_known && written > total {
+                return Err(AppError::Ssh(format!(
+                    "上传后大小与预期不一致：预期 {} 字节，实际 {} 字节，可能有程序正在更改此文件",
+                    total, written
+                )));
+            }
+
+            if throttle.should_emit(written) {
+                emit_event(
+                    app,
+                    "sftp-upload-progress",
+                    json!({ "uploadId": upload_id, "written": written, "total": total }),
+                );
+            }
         }
 
         tokio::select! {
@@ -1708,6 +1772,9 @@ pub async fn sftp_upload_folder_stream(
 
     let mut buf = vec![0u8; 131072];
     let mut written: u64 = 0;
+    // 同一套进度节流：这段循环每个 chunk 会发两条事件（进度 + 阶段状态），
+    // 一个 2GB 的包按 128KB 切是 3 万多次事件，全打给前端 store。
+    let mut throttle = ProgressThrottle::new();
 
     let upload_result: Result<(), AppError> = async {
         loop {
@@ -1732,6 +1799,10 @@ pub async fn sftp_upload_folder_stream(
             }
 
             written += n as u64;
+
+            if !throttle.should_emit(written) {
+                continue;
+            }
 
             emit_event(
                 &app,
