@@ -385,3 +385,146 @@ describe('Agent 说明', () => {
     expect(container.textContent ?? '').not.toContain('Agent 说明');
   });
 });
+
+/**
+ * 文件改动的审批必须看到 diff，而不是一坨参数 JSON。
+ *
+ * `local_edit_file`（本机编辑）在后端与远端 `edit_file` 共用同一份展示 metadata
+ * （`build_edit_display_metadata`），所以输入照远端那一行的形状造。曾经有两处会
+ * 让它掉回 JSON：catalog 把它标成普通呈现、弹窗把交给 `FileChangeView` 的
+ * toolName 写死成 `"edit_file"`。这里同时钉住「本机编辑走 diff」与「远端编辑没
+ * 被这次取名字的改动带坏」。
+ */
+describe('审批面板的 diff 视图', () => {
+  /** `edit_file` / `local_edit_file` 同形的参数与 metadata（后端同形，见上）。 */
+  const EDIT_ARGS = {
+    path: 'D:\\work\\app\\.env',
+    old_content: 'PORT=80\nDEBUG=false',
+    new_content: 'PORT=8080\nDEBUG=false',
+    replace_all: false,
+  };
+  const EDIT_META = {
+    path: 'D:\\work\\app\\.env',
+    occurrences: 1,
+    old_bytes: 20,
+    new_bytes: 22,
+    line_position: 1,
+    line_count: 2,
+    match_line_positions: [1],
+    before: 'PORT=80\nDEBUG=false\n',
+    after: 'PORT=8080\nDEBUG=false\n',
+    file_content: 'PORT=8080\nDEBUG=false\n',
+  };
+
+  const localEditCall: ToolCallInfo = {
+    id: 'call-local-edit',
+    name: 'local_edit_file',
+    arguments: { ...EDIT_ARGS },
+    disposition: 'Approval',
+    metadata: EDIT_META,
+  };
+
+  it('本机编辑（local_edit_file）渲染改动行，而不是参数 JSON', () => {
+    render(true, true, localEditCall);
+
+    const text = container.textContent ?? '';
+    // 改动两侧都在：旧行（红）与新行（绿）
+    expect(text).toContain('DEBUG=false');
+    expect(text).toContain('PORT=8080');
+    // 参数 JSON 分支才会出现参数字段名 —— 出现它说明又退回 JSON 了
+    expect(text).not.toContain('old_content');
+    expect(text).not.toContain('new_content');
+    // 确认走的是 FileChangeView 的全文件对照 diff（data-match 是它的改动锚点）
+    expect(container.querySelector('[data-match]')).not.toBeNull();
+  });
+
+  it('远端 edit_file 照旧走 diff（取名字改成从调用解析没有回退它）', () => {
+    render(true, true, { ...localEditCall, id: 'call-remote-edit', name: 'edit_file' });
+
+    const text = container.textContent ?? '';
+    expect(text).toContain('PORT=8080');
+    expect(text).not.toContain('old_content');
+  });
+});
+
+/**
+ * 超长正文不许把「批准 / 拒绝」挤出视口。
+ *
+ * 背景：外层是 `fixed inset-0 flex items-center justify-center`（不可滚），面板
+ * 一旦高于视口，多出来的部分没有任何滚动条能到达 —— 按钮被顶到屏幕外，而
+ * **Enter 恰好 = 批准**（Esc 只是收起）：按钮点不到的时候，键盘上那个「批准」
+ * 还活着，用户可能在没看清内容的情况下批下去。
+ *
+ * 断开的是模型给的长文本（`description` / `reasons` / 参数 JSON 都无上限）。
+ * jsdom 不做排版，所以这里钉的是「结构护栏」：面板限高 + 自己滚，且承载两个
+ * 答案的底栏是 sticky —— 结构在，任何长度的正文都推不走它。
+ */
+describe('ApprovalDialog 的超长正文', () => {
+  const LONG_TEXT = '这是一段很长的说明。'.repeat(400);
+
+  /** 命令类工具（local_bash）：`description` 是模型自述，走「Agent 说明」那一支。 */
+  const longCommandCall: ToolCallInfo = {
+    id: 'call-long-cmd',
+    name: 'local_bash',
+    arguments: { command: 'Get-ChildItem -Recurse C:\\', description: LONG_TEXT },
+    disposition: 'ForceApproval',
+  };
+
+  /** 派发本机子 agent：`description` + `prompt` 都是长正文。 */
+  const longSubagentCall: ToolCallInfo = {
+    id: 'call-long-subagent',
+    name: 'local_subagent',
+    arguments: { description: LONG_TEXT, prompt: LONG_TEXT, mode: 'plan' },
+    disposition: 'ForceApproval',
+  };
+
+  function panel(): HTMLElement {
+    const el = container.querySelector<HTMLElement>('.modal-panel-enter');
+    if (!el) throw new Error('找不到审批面板');
+    return el;
+  }
+
+  /** 往上找到承载答案的 sticky 底栏。 */
+  function stickyFooterOf(el: Element): HTMLElement | null {
+    let cur: Element | null = el;
+    while (cur && cur !== document.body) {
+      if (
+        cur instanceof HTMLElement &&
+        cur.className.includes('sticky') &&
+        cur.className.includes('bottom-0')
+      ) {
+        return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
+  it.each([
+    ['命令说明', longCommandCall],
+    ['本机子 agent 的指令正文', longSubagentCall],
+  ])('%s 再长也整段可见（检查点不许截断）', (_label, toolCall) => {
+    render(true, true, toolCall);
+    // 正文完整渲染：审批面板是用户唯一的检查点，不能为了好看截断
+    expect(container.textContent ?? '').toContain(LONG_TEXT);
+  });
+
+  it.each([
+    ['命令说明', longCommandCall],
+    ['本机子 agent 的指令正文', longSubagentCall],
+  ])('%s 超长时：面板限高自己滚，批准 / 拒绝钉在底栏', (_label, toolCall) => {
+    render(true, true, toolCall);
+
+    const p = panel();
+    // 限高 + 滚动都必须在面板这一层：外层容器不可滚
+    expect(p.className).toContain('max-h-[85vh]');
+    expect(p.className).toContain('overflow-y-auto');
+
+    const approveBtn = button('批准');
+    const footer = stickyFooterOf(approveBtn);
+    expect(footer, '批准按钮必须在一个 sticky 底栏里').not.toBeNull();
+    expect(p.contains(footer as HTMLElement)).toBe(true);
+    // 拒绝也在同一条底栏里 —— 两个答案要在一起，不能只钉住一个
+    expect((footer as HTMLElement).contains(button('拒绝'))).toBe(true);
+  });
+});

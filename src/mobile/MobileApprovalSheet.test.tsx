@@ -146,6 +146,53 @@ describe('MobileApprovalSheet 的拒绝理由', () => {
 });
 
 /**
+ * 文件改动的审批必须看到 diff，而不是参数 JSON —— 与桌面端 `ApprovalDialog`
+ * 对称断言（双端呈现契约一致）。
+ *
+ * `local_edit_file`（本机编辑）与远端 `edit_file` 在后端共用同一份展示 metadata
+ * （`build_edit_display_metadata`），所以输入照远端那一行的形状造。
+ */
+describe('审批面板的 diff 视图（移动端）', () => {
+  const LOCAL_EDIT_CALL: ToolCallInfo = {
+    id: 'call-local-edit',
+    name: 'local_edit_file',
+    arguments: {
+      path: 'D:\\work\\app\\.env',
+      old_content: 'PORT=80\nDEBUG=false',
+      new_content: 'PORT=8080\nDEBUG=false',
+      replace_all: false,
+    },
+    disposition: 'Approval',
+    metadata: {
+      path: 'D:\\work\\app\\.env',
+      occurrences: 1,
+      old_bytes: 20,
+      new_bytes: 22,
+      line_position: 1,
+      line_count: 2,
+      match_line_positions: [1],
+      before: 'PORT=80\nDEBUG=false\n',
+      after: 'PORT=8080\nDEBUG=false\n',
+      file_content: 'PORT=8080\nDEBUG=false\n',
+    },
+  };
+
+  it('本机编辑（local_edit_file）渲染改动行，而不是参数 JSON', () => {
+    render(true, LOCAL_EDIT_CALL);
+
+    const text = document.body.textContent ?? '';
+    // 改动两侧都在：旧行（红）与新行（绿）
+    expect(text).toContain('DEBUG=false');
+    expect(text).toContain('PORT=8080');
+    // 参数 JSON 分支才会出现参数字段名 —— 出现它说明又退回 JSON 了
+    expect(text).not.toContain('old_content');
+    expect(text).not.toContain('new_content');
+    // 确认走的是 FileChangeView 的全文件对照 diff（data-match 是它的改动锚点）
+    expect(document.body.querySelector('[data-match]')).not.toBeNull();
+  });
+});
+
+/**
  * 命令说明（bash 的必填 description）—— 与桌面端 ApprovalDialog 对称断言。
  * 双端共用 `cleanExecuteCommandArgs`，但渲染是各写一份，所以两边都要钉。
  */
