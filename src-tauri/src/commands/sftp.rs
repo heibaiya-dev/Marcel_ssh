@@ -829,6 +829,16 @@ pub(crate) async fn stream_remote_to_local_file(
         _ = cancel_rx.changed() => return Err(AppError::Ssh("下载已取消".into())),
     }
 
+    // 落盘：.part 接着要被 rename 成目标文件，先把数据 sync 到磁盘，
+    // 避免断电/崩溃后在目标路径留下「文件在但内容空/半截」的假象
+    // （content:// 路径同样需要这道保险）。
+    tokio::select! {
+        result = local.sync_all() => {
+            result.map_err(|e| AppError::Ssh(format!("同步本地文件失败: {}", e)))?;
+        }
+        _ = cancel_rx.changed() => return Err(AppError::Ssh("下载已取消".into())),
+    }
+
     Ok(written)
 }
 
@@ -944,6 +954,37 @@ pub async fn sftp_download_stream(
     .await
 }
 
+/// 清掉同一目标路径的历史 `.marcel-download-*.part` / `.backup` 残留。
+/// 下载 id 每次唯一，进程被杀（或崩溃）后这些文件再无人认领，会永久占盘；
+/// 新传输开始时顺手扫掉同目标、同命名模式的残留即可（只匹配本应用生成的
+/// 名字，绝不碰目标文件本身）。同一目标的并发下载本来就会互相覆盖目标文件，
+/// 这里不做额外保护。
+async fn cleanup_stale_download_temp_files(local_path: &str, current_id: &str) {
+    let target = Path::new(local_path);
+    let (Some(parent), Some(file_name)) =
+        (target.parent(), target.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let prefix = format!("{}.marcel-download-", file_name);
+    let current_prefix = format!("{}.marcel-download-{}.", file_name, current_id);
+
+    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(&prefix) || name.starts_with(&current_prefix) {
+            continue;
+        }
+        let rest = &name[prefix.len()..];
+        if !(rest.ends_with(".part") || rest.ends_with(".backup")) {
+            continue;
+        }
+        let _ = tokio::fs::remove_file(entry.path()).await;
+    }
+}
+
 /// 单文件流式下载的**共享实现**：远端 → 本地 .part 临时文件 → 原子替换。
 /// 用户 SFTP 面板（sftp_download_stream）与 Agent 传输工具共用，避免两套实现。
 ///
@@ -963,6 +1004,8 @@ pub(crate) async fn stream_download_single_file(
 ) -> Result<(), AppError> {
     let temp_local_path = format!("{}.marcel-download-{}.part", local_path, download_id);
     let backup_local_path = format!("{}.marcel-download-{}.backup", local_path, download_id);
+
+    cleanup_stale_download_temp_files(local_path, download_id).await;
 
     let mut local = tokio::fs::File::create(&temp_local_path)
         .await
@@ -1019,7 +1062,24 @@ pub(crate) async fn stream_download_single_file(
 
     if let Err(e) = tokio::fs::rename(&temp_local_path, local_path).await {
         if had_existing {
-            let _ = tokio::fs::rename(&backup_local_path, local_path).await;
+            // 「备份 → 替换」之间失败：目标此刻是空的，恢复失败就等于把用户
+            // 原文件藏进了 .backup。重试一次（重命名失败常常是瞬时占用），
+            // 仍失败就把备份路径写进错误文案，并保留备份文件不删。
+            let mut restored = tokio::fs::rename(&backup_local_path, local_path)
+                .await
+                .is_ok();
+            if !restored {
+                restored = tokio::fs::rename(&backup_local_path, local_path)
+                    .await
+                    .is_ok();
+            }
+            if !restored {
+                let _ = tokio::fs::remove_file(&temp_local_path).await;
+                return Err(AppError::Ssh(format!(
+                    "保存下载文件失败: {}；原文件已备份到 {}，请手动改回原文件名",
+                    e, backup_local_path
+                )));
+            }
         }
         let _ = tokio::fs::remove_file(&temp_local_path).await;
         return Err(AppError::Ssh(format!("保存下载文件失败: {}", e)));
@@ -1686,6 +1746,31 @@ pub async fn sftp_upload_folder_stream(
     }
 
     check_cancelled(&cancel_rx, "上传已取消")?;
+
+    // 空文件夹特判：zip 对空目录只能写出 22 字节的空归档，远端 unzip 大概率
+    // 非 0 退出，整条 `&&` 链当场断掉——连目标目录都不会建（用户看到「上传失败」
+    // 却也不知道其实什么都没传）。这里直接跳过 zip / 上传 / 解压：
+    // 非 flat 模式只需在远端建出这个空目录；flat 模式目标目录已存在，无事可做。
+    if collect_local_top_level_names(local)?.is_empty() {
+        if !flat {
+            // 用 OK 标记判定成功：exec_simple 对非零退出码也返回 Ok(output)，
+            // 只看是否 Err 会把「权限不足」当成功。
+            let cmd = format!("mkdir -p {} && echo OK", shell_escape(&remote_path));
+            let output = state
+                .command_exec
+                .exec_simple(&app, &session_id, &cmd, CommandSource::SystemTask)
+                .await?;
+            if !command_reported_ok(&output) {
+                return Err(AppError::Ssh(format!(
+                    "创建远端目录失败: {}",
+                    output.trim()
+                )));
+            }
+        }
+        emit_event(&app, "sftp-upload-done", json!({ "uploadId": &upload_id }));
+        return Ok(());
+    }
+
     emit_folder_upload_status(&app, &upload_id, "zipping", 0, 1);
 
     let compression_level = state
@@ -1828,48 +1913,54 @@ pub async fn sftp_upload_folder_stream(
 
     let _ = tokio::fs::remove_file(&zip_path).await;
 
-    if upload_result.is_err() {
-        // Attempt to clean up remote temp file on error/cancel
-        if let Ok(sftp) = state.ssh_manager.open_sftp(&session_id).await {
-            let _ = sftp.remove_file(&tmp_remote).await;
+    // 收尾：上传之后的每条出口（上传失败/取消、字节数不符、解压失败、超时、
+    // 成功）都必须删掉远端临时压缩包。原实现只在「上传失败」时删，成功或
+    // 解压失败都会把整包 zip 永远留在 /tmp。
+    let outcome: Result<(), AppError> = async {
+        if upload_result.is_err() {
+            return upload_result;
         }
-        return upload_result;
+
+        if written != total {
+            return Err(AppError::Ssh(format!(
+                "上传不完整：预期 {} 字节，实际上传 {} 字节",
+                total, written
+            )));
+        }
+
+        check_cancelled(&cancel_rx, "上传已取消")?;
+        emit_folder_upload_status(&app, &upload_id, "extracting", 0, 1);
+
+        let exec_cmd = crate::ssh::sftp_extract::build_extract_cmd(&tmp_remote, &remote_path);
+        // 解压大文件夹可能远超命令执行默认 120s，显式放宽到远端长任务超时
+        // （与压缩路径一致），避免上传完成后卡在解压阶段被误报超时。
+        let output = state
+            .command_exec
+            .exec_simple_with_timeout(
+                &app,
+                &session_id,
+                &exec_cmd,
+                CommandSource::SystemTask,
+                REMOTE_TASK_TIMEOUT,
+            )
+            .await?;
+
+        if !command_reported_ok(&output) {
+            return Err(AppError::Ssh(extract_failure_message(&output)));
+        }
+
+        emit_event(&app, "sftp-upload-done", json!({ "uploadId": &upload_id }));
+
+        Ok(())
+    }
+    .await;
+
+    if let Ok(sftp) = state.ssh_manager.open_sftp(&session_id).await {
+        let _ = sftp.remove_file(&tmp_remote).await;
     }
 
-    if written != total {
-        return Err(AppError::Ssh(format!(
-            "上传不完整：预期 {} 字节，实际上传 {} 字节",
-            total, written
-        )));
-    }
-
-    check_cancelled(&cancel_rx, "上传已取消")?;
-    emit_folder_upload_status(&app, &upload_id, "extracting", 0, 1);
-
-    let exec_cmd = crate::ssh::sftp_extract::build_extract_cmd(&tmp_remote, &remote_path);
-    // 解压大文件夹可能远超命令执行默认 120s，显式放宽到远端长任务超时
-    // （与压缩路径一致），避免上传完成后卡在解压阶段被误报超时。
-    let output = state
-        .command_exec
-        .exec_simple_with_timeout(
-            &app,
-            &session_id,
-            &exec_cmd,
-            CommandSource::SystemTask,
-            REMOTE_TASK_TIMEOUT,
-        )
-        .await?;
-
-    if !output.trim().contains("OK") {
-        return Err(AppError::Ssh(format!("解压失败: {}", output.trim())));
-    }
-
-    emit_event(&app, "sftp-upload-done", json!({ "uploadId": &upload_id }));
-
-    Ok(())
+    outcome
 }
-
-const MAX_DRAG_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), AppError> {
     std::fs::create_dir_all(dest)
