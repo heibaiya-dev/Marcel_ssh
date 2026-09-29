@@ -6,12 +6,20 @@
 //! 应用内的安装包下载此前是单连接顺序流，因此只能跑到浏览器单连接的水平。
 //!
 //! **设计约束**（宁可慢也不能下坏）：
-//! - 先探测目标是否支持 Range（`Range: bytes=0-0` → 期望 `206`）与真实大小；
-//!   不支持或大小未知 → 退回单连接顺序流，与旧实现同语义；
+//! - 先探测**每个**候选源是否支持 Range（`Range: bytes=0-0` → 期望 `206`）与
+//!   真实大小；不支持或大小未知 → 退回单连接顺序流，与旧实现同语义。Range
+//!   能力是「按源」的属性：只支持整包 GET 的镜像不会被塞 Range 请求（那必然
+//!   失败），而是留给分段全挂之后的整包兜底轮 —— 镜像兜底恰好在主源出问题时
+//!   才用得上，不能在那时候失效；
 //! - 分段写入同一个 `.part` 文件：**每段各自 open 一个独立句柄**再 seek 写，
 //!   不用 `File::try_clone` —— Windows 上克隆出的句柄共享文件指针，并发写会互踩；
 //! - 任一段失败先重试该段（最多 [`SEGMENT_ATTEMPTS`] 次，仍不行再换候选源），
 //!   全都不行才整次失败（不留半成品，与旧实现一致）；
+//! - 每个响应都要能对上「请求的区间」与「应有的长度」：206 必须带与请求逐字节
+//!   一致的 `Content-Range`，整包响应必须写满已知总大小。少了这两道校验，中间层
+//!   按自己的块边界返回、或 close-delimited 响应被悄悄截断，都会干净地写进文件，
+//!   最后只以一句「更新包校验失败（内容不完整或被篡改）」收场 —— 重试无效，还
+//!   把中间层的问题栽给用户；
 //! - 取消由调用方以闭包传入，每个 chunk 检查一次；取消后删 `.part` 并返回
 //!   [`DownloadOutcome::Cancelled`]（不是失败，调用方不该弹红色错误）；
 //! - **不做校验**：分段下载无法边下边算整体 sha256，由调用方在下载完成后对文件
@@ -107,8 +115,20 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
     value.rsplit('/').next()?.trim().parse::<u64>().ok()
 }
 
+/// 从 `Content-Range: bytes 123-456/9748248` 里取出区间 `(123, 456)`。
+///
+/// 只认 `bytes` 单位与「起-止/…」这一种形态；解析不出来一律返回 `None`，调用方
+/// 据此拒绝这次响应 —— 「大概是这一个区间吧」那种猜测会让别人区间的字节写进文件。
+fn parse_content_range_span(value: &str) -> Option<(u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let span = rest.split('/').next()?.trim();
+    let (start, end) = span.split_once('-')?;
+    Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
+}
+
 pub struct SegmentedDownload<'a> {
-    /// 候选下载源：探测出第一个可用且支持 Range 的作为主源，其余在该源反复失败时兜底。
+    /// 候选下载源，按优先级排列：支持 Range 的源先做分段并发（主源优先），全挂
+    /// 或都不支持分段时退到整包单连接，逐个用它们兜底。
     pub urls: Vec<String>,
     /// 半成品落盘位置。
     pub part_path: PathBuf,
@@ -131,57 +151,95 @@ impl SegmentedDownload<'_> {
             .build()
             .map_err(|e| format!("无法创建下载客户端: {}", e))?;
 
-        let probe = self.probe(&client).await?;
-        let total = if probe.size > 0 {
-            probe.size
-        } else {
-            self.expected_size
-        };
+        // 探测**全部**候选源，而不只是第一个可达的：Range 能力是「按源」的属性，
+        // 只按第一个可达源定策略的话，主源支持分段、镜像只支持整包时，镜像会一直
+        // 收到满足不了的 Range 请求 —— 「镜像兜底」恰好在最需要它的时候失效。
+        let probes = self.probe_all(&client).await?;
+        let total = probes
+            .iter()
+            .map(|p| p.size)
+            .find(|size| *size > 0)
+            .unwrap_or(self.expected_size);
         if total == 0 {
             return Err("更新包大小未知".into());
         }
-
-        // 预分配：分段并发写要求文件先有最终长度（各段 seek 到自己的偏移写）
-        {
-            let file = std::fs::File::create(&self.part_path)
-                .map_err(|e| format!("无法写入临时文件: {}", e))?;
-            file.set_len(total)
-                .map_err(|e| format!("无法预分配空间: {}", e))?;
-        }
-
-        let ranges = if probe.accepts_ranges {
-            plan_segments(total, MAX_SEGMENTS)
-        } else {
-            // 服务端不支持 Range：退回单连接顺序流（不送 Range 头）
-            log::info!("下载源不支持分段（HTTP Range），改用单连接顺序下载");
-            vec![(0, total - 1)]
-        };
-        let segmented = ranges.len() > 1;
-        log::info!(
-            "开始下载：{} 字节，{} 段{}",
-            total,
-            ranges.len(),
-            if segmented { "（并发）" } else { "（单连接）" }
-        );
+        let ranged_sources: Vec<String> = probes
+            .iter()
+            .filter(|p| p.accepts_ranges)
+            .map(|p| p.url.clone())
+            .collect();
 
         let downloaded = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let last_emit = Mutex::new(Instant::now() - PROGRESS_INTERVAL);
+        // 预分配：分段并发写要求文件先有最终长度（各段 seek 到自己的偏移写）
+        self.reset_part_file(total, &downloaded, &cancelled, &last_emit)?;
 
-        let result = self
+        let mut segmented_error: Option<String> = None;
+        if ranged_sources.is_empty() {
+            log::info!("候选源均不支持分段（HTTP Range），改用单连接顺序下载");
+        } else {
+            // 第一轮：支持 Range 的源上分段并发（只切出一段时即普通单连接 GET）。
+            let ranges = plan_segments(total, MAX_SEGMENTS);
+            let segmented = ranges.len() > 1;
+            log::info!(
+                "开始下载：{} 字节，{} 段{}",
+                total,
+                ranges.len(),
+                if segmented {
+                    "（并发）"
+                } else {
+                    "（单连接）"
+                }
+            );
+            match self
+                .fetch_all(
+                    &client,
+                    &ranged_sources,
+                    &ranges,
+                    segmented,
+                    total,
+                    &downloaded,
+                    &cancelled,
+                    &last_emit,
+                )
+                .await
+            {
+                Ok(()) => {
+                    (self.progress)(downloaded.load(Ordering::Relaxed), total);
+                    return Ok(DownloadOutcome::Done);
+                }
+                Err(FetchError::Cancelled) => {
+                    let _ = std::fs::remove_file(&self.part_path);
+                    return Ok(DownloadOutcome::Cancelled);
+                }
+                Err(FetchError::Failed { message, .. }) => {
+                    log::warn!("分段下载失败（{}），改用整包单连接重试", message);
+                    segmented_error = Some(message);
+                }
+            }
+        }
+
+        // 第二轮：整包单连接（不送 Range 头）。走到这里有两种原因：候选源都不支持
+        // 分段；或分段全部失败 —— 后一种情形下，只支持整包 GET 的镜像正是唯一还能
+        // 把包拿回来的路。候选按配置优先级排列，探测阶段就被判不可达的源也再给一次
+        // 机会（探测用的 Range 请求本身可能被拒）。
+        log::info!("整包单连接下载（候选源 {} 个）", self.urls.len());
+        self.reset_part_file(total, &downloaded, &cancelled, &last_emit)?;
+        let ranges = [(0u64, total - 1)];
+        match self
             .fetch_all(
                 &client,
-                probe.url,
+                &self.urls,
                 &ranges,
-                segmented,
+                false,
                 total,
                 &downloaded,
                 &cancelled,
                 &last_emit,
             )
-            .await;
-
-        match result {
+            .await
+        {
             Ok(()) => {
                 (self.progress)(downloaded.load(Ordering::Relaxed), total);
                 Ok(DownloadOutcome::Done)
@@ -192,58 +250,102 @@ impl SegmentedDownload<'_> {
             }
             Err(FetchError::Failed { message, .. }) => {
                 let _ = std::fs::remove_file(&self.part_path);
-                Err(message)
+                Err(match segmented_error {
+                    Some(seg) => format!("{}；改用整包下载后仍失败: {}", seg, message),
+                    None => message,
+                })
             }
         }
     }
 
-    /// 探测：挑一个可用源，并确定它是否支持分段与真实大小。
-    async fn probe(&self, client: &reqwest::Client) -> Result<Probe, String> {
+    /// 把 `.part` 复位成「长度 = total 的空文件」并清空进度/取消标志：第一轮开始
+    /// 前做一次（分段并发写要求文件先有最终长度），整包兜底轮开始前再做一次（把上
+    /// 一轮写进去的数据整体丢弃，避免新旧字节混在一起）。
+    fn reset_part_file(
+        &self,
+        total: u64,
+        downloaded: &AtomicU64,
+        cancelled: &AtomicBool,
+        last_emit: &Mutex<Instant>,
+    ) -> Result<(), String> {
+        let file = std::fs::File::create(&self.part_path)
+            .map_err(|e| format!("无法写入临时文件: {}", e))?;
+        file.set_len(total)
+            .map_err(|e| format!("无法预分配空间: {}", e))?;
+        downloaded.store(0, Ordering::Relaxed);
+        cancelled.store(false, Ordering::Relaxed);
+        if let Ok(mut last) = last_emit.lock() {
+            *last = Instant::now() - PROGRESS_INTERVAL;
+        }
+        Ok(())
+    }
+
+    /// 探测所有候选源：返回**按给定优先级排列的可达源**（各自带 Range 能力与大
+    /// 小），探测失败的源不进这个列表（它们仍会出现在整包兜底轮的候选里）。
+    ///
+    /// 并发探测：串行的话，一个黑洞镜像会把「开始下载」拖到几十秒之后（每个不可达
+    /// 源各付一次连接超时），而它本来就只在主源失败时才用得上。
+    async fn probe_all(&self, client: &reqwest::Client) -> Result<Vec<Probe>, String> {
+        let results = join_all(self.urls.iter().map(|url| self.probe_one(client, url))).await;
         let mut last_err = "所有下载源均不可达".to_string();
-        for url in &self.urls {
-            match client.get(url).header(RANGE, "bytes=0-0").send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status == reqwest::StatusCode::PARTIAL_CONTENT {
-                        let size = resp
-                            .headers()
-                            .get(CONTENT_RANGE)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(parse_content_range_total)
-                            .unwrap_or(self.expected_size);
-                        return Ok(Probe {
-                            url: url.clone(),
-                            size,
-                            accepts_ranges: true,
-                        });
-                    }
-                    if status.is_success() {
-                        // 服务器忽略了 Range（返回整包）：能用，但只能单连接
-                        let size = resp.content_length().unwrap_or(self.expected_size);
-                        return Ok(Probe {
-                            url: url.clone(),
-                            size,
-                            accepts_ranges: false,
-                        });
-                    }
-                    log::warn!("下载源返回 {} {}，尝试下一个", status, url);
-                    last_err = format!("下载服务器返回 {}", status);
-                }
+        let mut probes = Vec::new();
+        for (url, result) in self.urls.iter().zip(results) {
+            match result {
+                Ok(probe) => probes.push(probe),
                 Err(e) => {
-                    log::warn!("下载源不可达 {}：{}，尝试下一个", url, e);
-                    last_err = format!("下载请求失败: {}", e);
+                    log::warn!("下载源不可用 {}：{}，尝试下一个", url, e);
+                    last_err = e;
                 }
             }
         }
-        Err(last_err)
+        if probes.is_empty() {
+            Err(last_err)
+        } else {
+            Ok(probes)
+        }
     }
 
-    /// 并发跑完所有分段（`join_all` 在同一任务上并发 poll，网络等待天然重叠）。
+    /// 探测单个源：`Range: bytes=0-0` 得到 206 说明支持分段；200（忽略了 Range，
+    /// 返回整包）说明只能单连接；其他状态码 / 网络错误视为该源当前不可用。
+    async fn probe_one(&self, client: &reqwest::Client, url: &str) -> Result<Probe, String> {
+        let resp = client
+            .get(url)
+            .header(RANGE, "bytes=0-0")
+            .send()
+            .await
+            .map_err(|e| format!("下载请求失败: {}", e))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let size = resp
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_range_total)
+                .unwrap_or(self.expected_size);
+            return Ok(Probe {
+                url: url.to_string(),
+                size,
+                accepts_ranges: true,
+            });
+        }
+        if status.is_success() {
+            // 服务器忽略了 Range（返回整包）：能用，但只能单连接
+            return Ok(Probe {
+                url: url.to_string(),
+                size: resp.content_length().unwrap_or(self.expected_size),
+                accepts_ranges: false,
+            });
+        }
+        Err(format!("下载服务器返回 {}", status))
+    }
+
+    /// 跑完计划里的所有分段（`join_all` 在同一任务上并发 poll，网络等待天然重叠）。
+    /// `sources` 就是这一轮允许使用的候选源，每段按顺序重试与换源。
     #[allow(clippy::too_many_arguments)]
     async fn fetch_all(
         &self,
         client: &reqwest::Client,
-        primary: String,
+        sources: &[String],
         ranges: &[(u64, u64)],
         segmented: bool,
         total: u64,
@@ -251,26 +353,14 @@ impl SegmentedDownload<'_> {
         cancelled: &AtomicBool,
         last_emit: &Mutex<Instant>,
     ) -> Result<(), FetchError> {
-        let mut sources: Vec<String> = vec![primary.clone()];
-        sources.extend(
-            self.urls
-                .iter()
-                .filter(|u| **u != primary)
-                .cloned(),
-        );
-
         let futures = ranges.iter().enumerate().map(|(index, (start, end))| {
-            let range = if segmented { Some((*start, *end)) } else { None };
+            let range = if segmented {
+                Some((*start, *end))
+            } else {
+                None
+            };
             self.fetch_segment(
-                client,
-                &sources,
-                index,
-                range,
-                *start,
-                total,
-                downloaded,
-                cancelled,
-                last_emit,
+                client, sources, index, range, *start, total, downloaded, cancelled, last_emit,
             )
         });
 
@@ -360,15 +450,36 @@ impl SegmentedDownload<'_> {
             Ok(r) => r,
             Err(e) => return Err(FetchError::failed(format!("下载请求失败: {}", e))),
         };
-        if range.is_some() && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            // 探测时支持、真正取分段时又不支持（中间层改写）：明确报出来，
-            // 不静默写坏文件
-            return Err(FetchError::failed(format!(
-                "下载源未按分段返回（HTTP {}）",
-                resp.status()
-            )));
-        }
-        if range.is_none() && !resp.status().is_success() {
+        if let Some((start, end)) = range {
+            if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                // 探测时支持、真正取分段时又不支持（中间层改写）：明确报出来，
+                // 不静默写坏文件
+                return Err(FetchError::failed(format!(
+                    "下载源未按分段返回（HTTP {}）",
+                    resp.status()
+                )));
+            }
+            // 206 必须带 Content-Range，且区间要与请求的**逐字节一致**：只看
+            // 「206 + 收到的字节数」的话，中间层/镜像按自己的块边界返回（或整体
+            // 偏移一段）时，长度校验照样通过，写进去的却是别人区间的字节 —— 一路
+            // 到最后才以「更新包校验失败（内容不完整或被篡改）」暴露，重试无效且
+            // 把中间层的问题栽给用户。这里在写盘之前就拒掉：可重试、可换源，报错
+            // 也直指区间不一致。
+            let got = resp
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_range_span);
+            if got != Some((start, end)) {
+                return Err(FetchError::failed(format!(
+                    "下载源返回的分段区间与请求不一致（请求 {}-{}，实际 {}）",
+                    start,
+                    end,
+                    got.map(|(s, e)| format!("{}-{}", s, e))
+                        .unwrap_or_else(|| "缺失或无法解析".to_string())
+                )));
+            }
+        } else if !resp.status().is_success() {
             return Err(FetchError::failed(format!(
                 "下载服务器返回 {}",
                 resp.status()
@@ -427,16 +538,24 @@ impl SegmentedDownload<'_> {
         }
         file.flush().ok();
 
-        // 分片被提前掐断（服务端/中间层截断）时立刻报错并重试这一段；否则残留的
-        // 是预分配出来的零字节，最后只会以一句含糊的「校验失败」暴露出来。
-        if let Some((start, end)) = range {
-            let want = end - start + 1;
-            if written != want {
-                return Err(FetchError::Failed {
-                    message: format!("分段长度不足（期望 {} 字节，实收 {}）", want, written),
-                    written,
-                });
-            }
+        // 写够了才算这一段成功，**两种请求都要校验**：只校验分段区间的话，整包
+        // 响应被提前掐断时（close-delimited、无 Content-Length、无 chunked）会干净
+        // 地 EOF 并被当成「下载完成」—— 重试没了、流量白费，残留的预分配零字节与
+        // 真数据混在一起，最后只留下一句含糊的「校验失败（内容不完整或被篡改）」。
+        // 有 Range：期望区间长度；无 Range（整包）：期望已知总大小。
+        let want = match range {
+            Some((start, end)) => end - start + 1,
+            None => total,
+        };
+        if written != want {
+            return Err(FetchError::Failed {
+                message: if range.is_some() {
+                    format!("分段长度不足（期望 {} 字节，实收 {}）", want, written)
+                } else {
+                    format!("下载被截断（期望 {} 字节，实收 {}）", want, written)
+                },
+                written,
+            });
         }
         Ok(())
     }
@@ -541,6 +660,20 @@ mod tests {
         assert_eq!(parse_content_range_total("garbage"), None);
     }
 
+    #[test]
+    fn parse_content_range_span_reads_interval() {
+        assert_eq!(
+            parse_content_range_span("bytes 123-456/9748248"),
+            Some((123, 456))
+        );
+        assert_eq!(parse_content_range_span("bytes 0-0/*"), Some((0, 0)));
+        // 解析不出来（缺失 / 单位不对 / 半个区间）一律 None：调用方据此拒绝响应
+        assert_eq!(parse_content_range_span(""), None);
+        assert_eq!(parse_content_range_span("bytes */9748248"), None);
+        assert_eq!(parse_content_range_span("items 1-2/3"), None);
+        assert_eq!(parse_content_range_span("bytes 1-/3"), None);
+    }
+
     // ── 端到端：本地起一个最小 HTTP 服务，验证真的下出来是对的 ──────────
     //
     // 分段写盘最容易出的错是「偏移算错 / 并发写互相踩」，而这类错误不会报错，
@@ -635,6 +768,145 @@ mod tests {
         (format!("http://{}", addr), hits)
     }
 
+    /// 一个「只认 Range 语法、按自己的块边界返回」的服务：请求多少字节就回多少
+    /// 字节，但 Content-Range 与内容**永远从 0 起**（模拟中间层/镜像改写区间）。
+    /// 不带 Range 的请求一律 500 —— 把整包兜底轮也堵死，好让「区间不一致」这个
+    /// 失败原因浮到最外层（否则整包轮成功，就看不出分段校验起没起作用）。
+    async fn spawn_shifted_range_server(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = std::sync::Arc::new(body);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let span = req
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                        .and_then(|l| l.split('=').nth(1))
+                        .and_then(|v| {
+                            let mut it = v.trim().split('-');
+                            let s = it.next()?.parse::<usize>().ok()?;
+                            let e = it.next()?.parse::<usize>().ok()?;
+                            Some(e - s + 1)
+                        });
+                    let Some(want) = span else {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        let _ = socket.shutdown().await;
+                        return;
+                    };
+                    let want = want.min(body.len());
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+                        want,
+                        want - 1,
+                        body.len()
+                    );
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = socket.write_all(&body[..want]).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// 一个「close-delimited 且提前掐断」的服务：响应不带 Content-Length，写完
+    /// `cut_at` 字节就直接关连接。客户端读到的是干净的 EOF —— 只有拿实际写入量
+    /// 与已知总大小对照才能发现被截断。
+    async fn spawn_truncating_server(body: Vec<u8>, cut_at: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = std::sync::Arc::new(body);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    let head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = socket.write_all(&body[..cut_at.min(body.len())]).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// 一个「探测能过、真取分段就挂」的源：只有 `Range: bytes=0-0` 回正确 206，
+    /// 其余一律 500。用于验证「分段全挂后，整包兜底轮把只支持整包 GET 的镜像
+    /// 当救兵」这条路径。
+    async fn spawn_probe_only_server(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = std::sync::Arc::new(body);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let probe = req
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                        .map(|l| l.split('=').nth(1).unwrap_or("").trim() == "0-0")
+                        .unwrap_or(false);
+                    let head = if probe {
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/{}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    };
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if probe {
+                        let _ = socket.write_all(&body[..1]).await;
+                    }
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{}", addr)
+    }
+
     fn tmp_part(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("marcel-dl-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -692,10 +964,104 @@ mod tests {
             progress: &no_progress,
         };
         assert_eq!(dl.run().await.unwrap(), DownloadOutcome::Done);
-        assert!(std::fs::read(&part).unwrap() == source, "单连接回落也要下对");
+        assert!(
+            std::fs::read(&part).unwrap() == source,
+            "单连接回落也要下对"
+        );
         // 探测 1 次 + 单连接整包 1 次
-        assert_eq!(hits.load(Ordering::Relaxed), 2, "不支持 Range 时只该有两次请求");
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            2,
+            "不支持 Range 时只该有两次请求"
+        );
         let _ = std::fs::remove_file(&part);
+    }
+
+    /// 回归：206 的 Content-Range 与请求不一致（中间层按自己的块边界返回）必须
+    /// 当场拒绝、可按段重试与换源，而不是把别人的字节写进文件、最后报成「包被
+    /// 篡改」——那条路重试无效，还会把中间层的问题栽给用户。
+    #[tokio::test]
+    async fn rejects_206_with_mismatched_content_range() {
+        let source = payload(2 * 1024 * 1024);
+        let url = spawn_shifted_range_server(source.clone()).await;
+        // 独享临时目录：下面的用例都在并发跑，落盘位置不与其他用例共享
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("shifted-range.part");
+
+        let no_cancel = || false;
+        let no_progress = |_: u64, _: u64| {};
+        let dl = SegmentedDownload {
+            urls: vec![url],
+            part_path: part.clone(),
+            expected_size: source.len() as u64,
+            cancel: &no_cancel,
+            progress: &no_progress,
+        };
+
+        let err = dl.run().await.expect_err("区间不一致必须失败");
+        assert!(
+            err.contains("区间与请求不一致"),
+            "错误文案要直指区间问题: {}",
+            err
+        );
+        assert!(
+            !err.contains("篡改"),
+            "不得把区间问题归因成内容被篡改: {}",
+            err
+        );
+        assert!(!part.exists(), "失败后不得留下 .part");
+    }
+
+    /// 回归：close-delimited（无 Content-Length、无 chunked）响应被提前掐断时
+    /// 会干净地 EOF，必须靠「实际写入量 vs 已知总大小」发现，不能当下载完成。
+    #[tokio::test]
+    async fn rejects_truncated_close_delimited_response() {
+        let source = payload(1024 * 1024);
+        let url = spawn_truncating_server(source.clone(), source.len() / 2).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("truncated.part");
+
+        let no_cancel = || false;
+        let no_progress = |_: u64, _: u64| {};
+        let dl = SegmentedDownload {
+            urls: vec![url],
+            part_path: part.clone(),
+            expected_size: source.len() as u64,
+            cancel: &no_cancel,
+            progress: &no_progress,
+        };
+
+        let err = dl.run().await.expect_err("被截断的响应必须失败");
+        assert!(err.contains("截断"), "错误文案要指出截断: {}", err);
+        assert!(!part.exists(), "失败后不得留下 .part");
+    }
+
+    /// 回归：主源支持分段但分段请求全挂，镜像只支持整包 GET —— 修复前每段都带着
+    /// Range 头打到镜像上必然失败（「未按分段返回」），镜像兜底恰好在最需要它的
+    /// 时候失效；修复后分段全挂会退回整包单连接，由镜像把包拿回来。
+    #[tokio::test]
+    async fn range_incapable_mirror_recovers_whole_file() {
+        let source = payload(3 * 1024 * 1024);
+        let primary = spawn_probe_only_server(source.clone()).await;
+        let mirror = spawn_server(source.clone(), false, 0).await.0;
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("mirror-fallback.part");
+
+        let no_cancel = || false;
+        let no_progress = |_: u64, _: u64| {};
+        let dl = SegmentedDownload {
+            urls: vec![primary, mirror],
+            part_path: part.clone(),
+            expected_size: source.len() as u64,
+            cancel: &no_cancel,
+            progress: &no_progress,
+        };
+
+        assert_eq!(dl.run().await.unwrap(), DownloadOutcome::Done);
+        assert!(
+            std::fs::read(&part).unwrap() == source,
+            "整包兜底也要与原文件逐字节一致"
+        );
     }
 
     #[tokio::test]
