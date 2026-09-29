@@ -14,7 +14,7 @@ import {
   sftpOpenWithSystem,
 } from '@/lib/tauri';
 import type { SftpFileEntry } from '@/lib/types';
-import { formatSize, modeToString, getErrorMessage, isPreviewableImage } from '@/lib/sftp-helpers';
+import { formatSize, modeToString, getErrorMessage, isDialogCancelled, isPreviewableImage } from '@/lib/sftp-helpers';
 import { MAX_EDITOR_FILE_SIZE, MAX_PREVIEW_IMAGE_SIZE, BINARY_EXTENSIONS, isArchiveFile, archiveStem } from '@/lib/constants';
 import PathBreadcrumb from './PathBreadcrumb';
 import FileTreeSidebar from './FileTreeSidebar';
@@ -84,6 +84,9 @@ export default function FileManagerPanel({ sessionId, connectionKey }: FileManag
   const panelRef = useRef<HTMLDivElement>(null);
   const treeRegionRef = useRef<HTMLDivElement>(null);
   const loadSeqRef = useRef(0);
+  /** 当前目录的最新值：传输完成等**迟到回调**要据此判断自己捕获的路径是否还有效。 */
+  const currentPathRef = useRef(currentPath);
+  currentPathRef.current = currentPath;
   const toolbarWidth = useContainerWidth(toolbarRef);
   const panelWidth = useContainerWidth(panelRef);
   const mode = toolbarWidth >= 870 ? 'full' : toolbarWidth >= 750 ? 'compact' : 'icon-only';
@@ -133,21 +136,26 @@ export default function FileManagerPanel({ sessionId, connectionKey }: FileManag
   }, []);
 
   const loadDirectory = useCallback(async (path: string) => {
+    // 迟到的请求不许套在新目录上：传输完成回调捕获的是**发起上传时**的 currentPath，
+    // 传大文件夹期间用户可能已经切走。此前只有 loadSeqRef 防乱序，旧路径的刷新是最
+    // 后一次请求，于是「路径栏显示新目录、列表却是旧目录内容」——之后按
+    // `currentPath + name` 拼路径的删除/重命名会作用到错误的同名条目上（删错文件）。
+    if (currentPathRef.current !== path) return;
     const seq = ++loadSeqRef.current;
     setLoading(true);
     setEntries([]);
     setError(null);
     try {
       const items = await sftpListDir(sessionId, path);
-      if (seq !== loadSeqRef.current) return;
+      if (seq !== loadSeqRef.current || currentPathRef.current !== path) return;
       setEntries(items);
       // Seed tree: expand of this path needs no second listDir.
       seedTreeFromListing(path, items);
     } catch (err) {
-      if (seq !== loadSeqRef.current) return;
+      if (seq !== loadSeqRef.current || currentPathRef.current !== path) return;
       setError(`加载失败：${getErrorMessage(err)}`);
     } finally {
-      if (seq === loadSeqRef.current) {
+      if (seq === loadSeqRef.current && currentPathRef.current === path) {
         setLoading(false);
       }
     }
@@ -273,11 +281,18 @@ export default function FileManagerPanel({ sessionId, connectionKey }: FileManag
     setMenuPos({ x: e.clientX, y: e.clientY });
   };
 
-  const handleDownload = (entry: SftpFileEntry) => {
+  const handleDownload = async (entry: SftpFileEntry) => {
     setMenuEntry(null);
     setMenuTargets([]);
     const entryPath = currentPath === '/' ? `/${entry.name}` : `${currentPath}/${entry.name}`;
-    startDownload(entry, entryPath);
+    try {
+      await startDownload(entry, entryPath);
+    } catch (err) {
+      // Android 上取消保存对话框是 reject 而非返回 null（桌面是返回 null），不当作错误。
+      // 此前这里没人接管 promise：保存对话框报错时只有一条未捕获 rejection，界面毫无反馈。
+      if (isDialogCancelled(err)) return;
+      setError(`下载失败：${getErrorMessage(err)}`);
+    }
   };
 
   const handleOpenWithSystem = async (entry: SftpFileEntry) => {
@@ -463,6 +478,7 @@ export default function FileManagerPanel({ sessionId, connectionKey }: FileManag
       },
       () => {
         void sftpCleanupTempDir(preparedDir).catch(() => {});
+        // 用户可能已切到别的目录：loadDirectory 只刷新仍是当前目录的请求
         void loadDirectory(currentPath);
       },
     );
