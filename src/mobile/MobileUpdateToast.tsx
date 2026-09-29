@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ArrowUpCircle, DownloadCloud, Loader2, TriangleAlert } from 'lucide-react';
+import { getErrorMessage } from '@/lib/errors';
 import { openExternalLink } from '@/lib/externalLinks';
 import { useUpdateStore, isUpdateVisible } from '@/stores/updateStore';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -58,7 +59,9 @@ export default function MobileUpdateToast() {
       await installNow();
       // 成功即切到系统安装界面，无需收尾
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // 必须走 getErrorMessage：Tauri 命令失败是结构化 { kind, message }，
+      // String(e) 会把它渲染成 "[object Object]"
+      setError(getErrorMessage(e));
     } finally {
       setBusy(null);
     }
@@ -70,7 +73,7 @@ export default function MobileUpdateToast() {
     try {
       await download();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(getErrorMessage(e));
     } finally {
       setBusy(null);
     }
