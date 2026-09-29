@@ -55,6 +55,12 @@ export default function FileManagerPanel({ sessionId, connectionKey }: FileManag
   const [entries, setEntries] = useState<SftpFileEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * 拖拽打包上传的**部分失败**提示。单独一份状态、不被 loadDirectory 的
+   * `setError(null)` 清掉：上传完成后的刷新若把它抹了，用户就再也看不到
+   * 「哪几项没传上去」，只会看到传输中心一句「上传完成」。
+   */
+  const [dropWarning, setDropWarning] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(storeSettings.fileManagerShowHidden ?? false);
   const [menuEntry, setMenuEntry] = useState<SftpFileEntry | null>(null);
   const [menuTargets, setMenuTargets] = useState<SftpFileEntry[]>([]);
@@ -409,13 +415,34 @@ export default function FileManagerPanel({ sessionId, connectionKey }: FileManag
     const { sftpPrepareDragUpload, sftpCleanupTempDir } = await import('@/lib/tauri');
     const { enqueueTransfer, createTransferId } = await import('@/stores/transferScheduler');
 
-    let tempDir: string | null = null;
+    setDropWarning(null);
+    let tempDir: string;
+    let failures: string[];
     try {
-      // 1. 后端创建临时目录并复制文件
-      tempDir = await sftpPrepareDragUpload(paths);
+      // 1. 后端创建临时目录并复制文件；复制失败的条目在 failures 里（`路径: 原因`）
+      ({ tempDir, failures } = await sftpPrepareDragUpload(paths));
     } catch (err) {
       setError(`打包上传失败：${getErrorMessage(err)}`);
       return;
+    }
+
+    /** failures 可能很长，横幅里最多列 3 条，其余用计数收口。 */
+    const brief = (list: string[]) =>
+      `${list.slice(0, 3).join('；')}${list.length > 3 ? ` 等 ${list.length} 项` : ''}`;
+
+    if (failures.length >= paths.length) {
+      // 一条都没复制进去：没有可上传的内容，中止并说清原因（顺手清掉空临时目录）
+      void sftpCleanupTempDir(tempDir).catch(() => {});
+      setError(`打包上传失败：${paths.length} 项全部复制失败（${brief(failures)}）`);
+      return;
+    }
+
+    if (failures.length > 0) {
+      // 部分失败仍继续上传，但必须显眼告知缺了哪些条目 —— 否则界面只显示
+      // 「上传完成」，用户会以为全传上去了。用常驻（需手动关闭）的提示承载。
+      setDropWarning(
+        `以下 ${failures.length}/${paths.length} 项复制失败，未包含在本次上传中：${brief(failures)}`,
+      );
     }
 
     // 2. 入队打包上传（解压到当前目录），完成后清理临时目录并刷新
@@ -425,7 +452,7 @@ export default function FileManagerPanel({ sessionId, connectionKey }: FileManag
         id: createTransferId(),
         kind: 'folder-upload',
         sessionId,
-        fileName: `拖拽上传 (${paths.length} 项)`,
+        fileName: `拖拽上传 (${paths.length - failures.length} 项)`,
         localPath: preparedDir,
         remotePath: currentPath,
         flat: true,
@@ -802,6 +829,13 @@ export default function FileManagerPanel({ sessionId, connectionKey }: FileManag
         <div className="flex items-center justify-between px-3 py-2 bg-red-500/10 border-b border-red-500/20 text-xs text-red-300 flex-shrink-0">
           <span>{error}</span>
           <button type="button" onClick={() => setError(null)} className="ml-2 text-red-400 hover:text-red-200 transition-colors">✕</button>
+        </div>
+      )}
+
+      {dropWarning && (
+        <div className="flex items-center justify-between px-3 py-2 bg-amber-500/10 border-b border-amber-500/20 text-xs text-amber-300 flex-shrink-0">
+          <span>{dropWarning}</span>
+          <button type="button" onClick={() => setDropWarning(null)} className="ml-2 text-amber-400 hover:text-amber-200 transition-colors">✕</button>
         </div>
       )}
 

@@ -1146,10 +1146,21 @@ export async function sftpUploadFolderStream(
   });
 }
 
+/**
+ * 拖拽上传预备：后端把拖入的本地文件/目录复制进临时目录。
+ *
+ * 返回临时目录与**复制失败清单**（每条形如 `路径: 原因`）。部分失败不算命令失败——
+ * 调用方要继续上传能复制的那部分，同时把 failures 显眼地告诉用户，不能显示成
+ * 「上传完成」了事。兼容旧后端（直接返回 tempDir 字符串）：failures 视为空。
+ */
 export async function sftpPrepareDragUpload(
   filePaths: string[],
-): Promise<string> {
-  return invoke<string>("sftp_prepare_drag_upload", { filePaths });
+): Promise<{ tempDir: string; failures: string[] }> {
+  const result = await invoke<
+    string | { tempDir: string; failures?: string[] }
+  >("sftp_prepare_drag_upload", { filePaths });
+  if (typeof result === "string") return { tempDir: result, failures: [] };
+  return { tempDir: result.tempDir, failures: result.failures ?? [] };
 }
 
 export async function sftpCleanupTempDir(tempDir: string): Promise<void> {

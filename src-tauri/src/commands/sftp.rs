@@ -1898,27 +1898,38 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn dir_size(path: &Path) -> Result<u64, AppError> {
-    let mut total: u64 = 0;
-    for entry in std::fs::read_dir(path)
-        .map_err(|e| AppError::Ssh(format!("读取目录失败 {}: {}", path.display(), e)))?
-    {
-        let entry = entry.map_err(|e| AppError::Ssh(format!("读取目录条目失败: {}", e)))?;
-        let path = entry.path();
-        if path.is_symlink() {
-            continue;
-        }
-        if path.is_dir() {
-            total += dir_size(&path)?;
-        } else if path.is_file() {
-            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
-        }
+/// 取 AppError 的「人话」部分：`thiserror` 的 Display 会带 `SSH error: ` 之类
+/// 前缀，拼进给用户看的 failures 列表里是噪声，这里只取内层文案。
+fn error_text(err: &AppError) -> String {
+    match err {
+        AppError::Ssh(message)
+        | AppError::Agent(message)
+        | AppError::Llm(message)
+        | AppError::Config(message)
+        | AppError::Update(message)
+        | AppError::Network(message)
+        | AppError::Cancelled(message)
+        | AppError::Other(message) => message.clone(),
+        AppError::Sftp { message, .. } => message.clone(),
+        AppError::KeyAuth { message, .. } => message.clone(),
+        other => other.to_string(),
     }
-    Ok(total)
+}
+
+/// 拖拽上传的准备结果。复制失败的文件通过 `failures`（"路径: 原因"）显式回传，
+/// 前端必须展示出来——原来只 `log::warn` 就返回临时目录，用户看到的是
+/// 「上传完成」，但少了的文件无人知晓。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DragUploadPrepare {
+    pub temp_dir: String,
+    pub failures: Vec<String>,
 }
 
 #[tauri::command]
-pub async fn sftp_prepare_drag_upload(file_paths: Vec<String>) -> Result<String, AppError> {
+pub async fn sftp_prepare_drag_upload(
+    file_paths: Vec<String>,
+) -> Result<DragUploadPrepare, AppError> {
     if file_paths.is_empty() {
         return Err(AppError::Ssh("没有提供文件路径".into()));
     }
@@ -1934,7 +1945,7 @@ pub async fn sftp_prepare_drag_upload(file_paths: Vec<String>) -> Result<String,
         let validated = match validate_local_path(path_str) {
             Ok(p) => p,
             Err(e) => {
-                errors.push(format!("{}: {}", path_str, e));
+                errors.push(format!("{}: {}", path_str, error_text(&e)));
                 continue;
             }
         };
@@ -1967,24 +1978,18 @@ pub async fn sftp_prepare_drag_upload(file_paths: Vec<String>) -> Result<String,
         };
 
         if let Err(e) = result {
-            errors.push(format!("{}: {}", path_str, e));
+            errors.push(format!("{}: {}", path_str, error_text(&e)));
         }
-    }
-
-    let total_size = dir_size(&temp_dir).unwrap_or(0);
-    if total_size > MAX_DRAG_UPLOAD_BYTES {
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        return Err(AppError::Ssh(format!(
-            "文件过大 ({} MB)，拖拽上传限制为 2 GB",
-            total_size as f64 / 1_048_576.0
-        )));
     }
 
     if !errors.is_empty() {
         log::warn!("拖拽上传部分文件复制失败: {:?}", errors);
     }
 
-    Ok(temp_dir.to_string_lossy().to_string())
+    Ok(DragUploadPrepare {
+        temp_dir: temp_dir.to_string_lossy().to_string(),
+        failures: errors,
+    })
 }
 
 #[tauri::command]
