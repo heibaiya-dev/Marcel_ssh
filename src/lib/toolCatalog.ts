@@ -266,6 +266,9 @@ export const TOOL_CATALOG: readonly ToolPresentation[] = [
     iconPaths: ICON_TERMINAL,
     payload: 'command',
     streamsOutput: true,
+    // 远端流式命令的中断文案：「已停止等待输出并关闭 SSH 通道，但远端进程不保证
+    // 已终止…」。这是**远端专属**说辞（本机命令有它自己那套，见 local_bash）。
+    interruptNotice: 'remote-stream',
     preview: (args) => {
       const cmd = asArgString(args.command);
       return cmd ? `$ ${clip(cmd)}` : '';
@@ -580,11 +583,14 @@ export function fileChangeToolName(toolName: string): FileChangeToolName | null 
 }
 
 /**
- * 该工具的输出是否流式到达前端（决定用户中断时的文案）。
- * 旧名 `execute_command` 与 `bash` 同一行，所以历史消息的判定也一致。
+ * 用户中断时卡片该追加哪套说明（远端流式 / 本机 / 通用）。
+ *
+ * 缺省 `'generic'`：**不从 `streamsOutput` 推导**。推导会把「输出怎么到达前端」
+ * 与「用户按下停止那一刻进程实际处于什么状态」绑死，而 `local_bash` 恰是两者
+ * 不同的例子（详见 `ToolPresentation.interruptNotice`）。
  */
-export function isStreamingTool(toolName: string): boolean {
-  return toolSpec(toolName)?.streamsOutput === true;
+export function interruptNoticeKind(toolName: string): InterruptNoticeKind {
+  return toolSpec(toolName)?.interruptNotice ?? 'generic';
 }
 
 /** 该工具的流式部分参数预览字段；没有声明则 `undefined`（不发预览）。 */

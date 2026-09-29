@@ -2,12 +2,16 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_ICON_PATHS,
   FILE_CHANGE_TOOL_NAMES,
+  LOCAL_SESSION_SENTINEL,
   SKILL_TOOL_PREFIX,
   TOOL_CATALOG,
+  fileChangeToolName,
+  interruptNoticeKind,
   isExplorationTool,
+  isLocalExecutionTool,
+  isLocalSessionId,
   isPlanTool,
   isSkillTool,
-  isStreamingTool,
   isSubagentTool,
   toolDisplayName,
   toolIconPaths,
@@ -82,6 +86,22 @@ describe('toolPreview', () => {
     expect(toolPreview('read_file', { path: '' })).toBe('');
   });
 
+  it('本机族与远端同名工具同一条预览口径（只是名字不同）', () => {
+    expect(toolPreview('local_bash', { command: 'Get-ChildItem' })).toBe('$ Get-ChildItem');
+    expect(toolPreview('local_read_file', { path: '/Users/me/notes.txt' })).toBe(
+      '/Users/me/notes.txt',
+    );
+    expect(toolPreview('local_list_directory', {})).toBe('/');
+    expect(toolPreview('local_list_directory', { path: '' })).toBe('/');
+    expect(toolPreview('local_subagent', { description: '盘点本机磁盘占用' })).toBe(
+      '盘点本机磁盘占用',
+    );
+    // 与远端 subagent 同一条回退：没 description 就用 prompt
+    expect(toolPreview('local_subagent', { prompt: '读本机日志目录里的报错' })).toBe(
+      '读本机日志目录里的报错',
+    );
+  });
+
   it('unwraps {value}/{text} argument wrappers the model sometimes emits', () => {
     expect(toolPreview('bash', { command: { value: 'uptime' } })).toBe('$ uptime');
   });
@@ -150,6 +170,41 @@ describe('toolCatalog 表结构', () => {
       .sort();
     expect(declared).toEqual([...FILE_CHANGE_TOOL_NAMES].sort());
   });
+
+  it('approvalView: diff 的行必须同时声明 payload: file-change', () => {
+    // 两个审批弹窗都靠 `fileChangeToolName(toolCall.name)` 解析交给
+    // `FileChangeView` 的工具名（见 catalog 里该函数的说明）—— 它同时要求
+    // `payload === 'file-change'` 且名字在 FILE_CHANGE_TOOL_NAMES 里。只声明
+    // approvalView 而漏了 payload 时，弹窗会**静默**退回原始 JSON：不崩，但
+    // 「批准前能看见完整改动」这个安全前提没了，而且只有肉眼能发现。
+    const diffRows = TOOL_CATALOG.filter((s) => s.approvalView === 'diff');
+    expect(diffRows.length).toBeGreaterThan(0);
+    for (const spec of diffRows) {
+      expect(spec.payload, `${spec.name} 声明了审批 diff 却没标 file-change`).toBe(
+        'file-change',
+      );
+      expect(fileChangeToolName(spec.name), spec.name).toBe(spec.name);
+    }
+  });
+
+  it('声明了 streamsOutput 的行必须同时声明 interruptNotice（两件事绑不得）', () => {
+    // 曾经中断文案是从「流式与否」推导的：本机命令（local_bash）接上 streaming
+    // 之后就只剩两条错路 —— 说「已关闭 SSH 通道」（本机没有通道）或者说「工具
+    // 可能已执行完成」（与「本机进程可能还在跑」相反）。现在两件事分开声明，
+    // 传输事实照实写、文案各自认领。这条守卫挡住「接了 streaming 却忘了想文案」
+    // 的下一行：漏了它，`interruptNoticeKind` 会静默回落到 generic。
+    for (const spec of TOOL_CATALOG) {
+      if (spec.streamsOutput === true) {
+        expect(spec.interruptNotice, `${spec.name} 接了流式但没声明中断文案`).toBeDefined();
+      }
+    }
+    // 缺省（没声明）= generic：不认识 / 没接流式的工具只能说通用那套
+    expect(interruptNoticeKind('read_file')).toBe('generic');
+    expect(interruptNoticeKind('local_read_file')).toBe('generic');
+    expect(interruptNoticeKind('subagent')).toBe('generic');
+    expect(interruptNoticeKind('unknown_tool')).toBe('generic');
+    expect(interruptNoticeKind('')).toBe('generic');
+  });
 });
 
 describe('toolDisplayName / 分组判定', () => {
@@ -195,11 +250,24 @@ describe('toolDisplayName / 分组判定', () => {
   });
 
   it('探索分组只收声明过的工具（bash 的旧名 execute_command 不在其中）', () => {
-    for (const name of ['web_search', 'http_get', 'read_file', 'search_files', 'list_directory', 'system_info']) {
+    for (const name of [
+      'web_search',
+      'http_get',
+      'read_file',
+      'search_files',
+      'list_directory',
+      'system_info',
+      'local_read_file',
+      'local_list_directory',
+    ]) {
       expect(isExplorationTool(name), name).toBe(true);
     }
     expect(isExplorationTool('write_file')).toBe(false);
     expect(isExplorationTool('execute_command')).toBe(false);
+    // 本机族的写/执行/派发不进探索组（与远端同名工具一致）
+    expect(isExplorationTool('local_write_file')).toBe(false);
+    expect(isExplorationTool('local_bash')).toBe(false);
+    expect(isExplorationTool('local_subagent')).toBe(false);
   });
 
   it('plan 分组与 subagent 判定', () => {
@@ -212,11 +280,15 @@ describe('toolDisplayName / 分组判定', () => {
     expect(isSubagentTool('bash')).toBe(false);
   });
 
-  it('流式输出判定（决定用户中断时的文案：已停止等待并关闭通道 vs 可能已完成）', () => {
-    expect(isStreamingTool('bash')).toBe(true);
-    expect(isStreamingTool('execute_command')).toBe(true);
-    expect(isStreamingTool('read_file')).toBe(false);
-    expect(isStreamingTool('subagent')).toBe(false);
+  it('流式输出的**传输事实**照实声明（决定后续有没有实时部分输出可看）', () => {
+    // 真值在后端 `ticket.streaming(...)` 调用点：bash 与 local_bash 都接了。
+    // 这条断言的是前端声明与后端事实一致，与「中断文案走哪套」是两件事
+    // （后者见 interruptNoticeKind 的用例）。
+    expect(toolSpec('bash')?.streamsOutput).toBe(true);
+    expect(toolSpec('execute_command')?.streamsOutput).toBe(true);
+    expect(toolSpec('local_bash')?.streamsOutput).toBe(true);
+    expect(toolSpec('read_file')?.streamsOutput).toBeUndefined();
+    expect(toolSpec('subagent')?.streamsOutput).toBeUndefined();
   });
 
   it('流式部分参数预览字段只登记给需要的工具', () => {
@@ -243,6 +315,111 @@ describe('toolDisplayName / 分组判定', () => {
     expect(toolSpec('write_file')?.payload).toBe('file-change');
     expect(toolSpec('edit_file')?.payload).toBe('file-change');
     expect(toolSpec('read_file')?.payload).toBeUndefined();
+  });
+});
+
+describe('本机工具族（local_*）', () => {
+  const LOCAL_TOOLS = [
+    'local_subagent',
+    'local_bash',
+    'local_read_file',
+    'local_write_file',
+    'local_edit_file',
+    'local_list_directory',
+  ];
+
+  it('六个本机工具都声明了 localExecution（审批面板据此打「本机」横幅）', () => {
+    for (const name of LOCAL_TOOLS) {
+      expect(isLocalExecutionTool(name), name).toBe(true);
+    }
+    // 远端同名工具不声明 —— 否则审批面板会给「在服务器上执行」的调用打本机横幅
+    for (const name of ['subagent', 'bash', 'read_file', 'write_file', 'edit_file', 'list_directory']) {
+      expect(isLocalExecutionTool(name), name).toBe(false);
+    }
+    expect(isLocalExecutionTool('unknown_tool')).toBe(false);
+  });
+
+  it('local_bash 复用命令参数形态（command/description 与 bash 同键）+ 本机中断文案', () => {
+    expect(toolSpec('local_bash')?.payload).toBe('command');
+    // 后端 local_bash 的前台执行与远端 bash 同构：挂了 `ticket.streaming(...)`
+    // （`src-tauri/src/agent/tools/local_bash.rs`），输出逐块发到前端 —— 传输
+    // 事实照实声明（旧断言写的是 undefined，那时后端还没接上）。
+    expect(toolSpec('local_bash')?.streamsOutput).toBe(true);
+    // 但**中断文案不能跟着传输事实走**：「已停止等待输出并关闭 SSH 通道…」是
+    // 远端专属说辞（本机没有 SSH 通道、进程也不在服务器上），而「工具可能已
+    // 执行完成」又与本机「只停止等待、进程可能还在跑」相反。所以本机命令显式
+    // 声明自己那一套。
+    expect(toolSpec('local_bash')?.interruptNotice).toBe('local');
+    expect(interruptNoticeKind('local_bash')).toBe('local');
+    // 反面对照：远端 bash 是远端流式那套（同一份传输事实，两套说辞）
+    expect(interruptNoticeKind('bash')).toBe('remote-stream');
+    expect(interruptNoticeKind('execute_command')).toBe('remote-stream');
+  });
+
+  it('本机编辑与远端编辑走同一个 diff 视图（参数键与 metadata 同形）', () => {
+    // 后端两侧共用一份实现（`local_file_ops.rs` 直接调远端的 resolve_edit_text /
+    // apply_edit / build_edit_display_metadata）：参数键同为 old_content /
+    // new_content / replace_all，展示 metadata 同为
+    // before/after/hunks/match_line_positions…。原先本机编辑刻意只当普通 JSON，
+    // 前提是「后端没有审批预览 + FileChangeView 不认本机名」，两个前提都已消除，
+    // 所以声明照远端那一行标。
+    expect(toolSpec('local_edit_file')?.payload).toBe('file-change');
+    expect(toolSpec('local_edit_file')?.approvalView).toBe('diff');
+    // 审批弹窗靠这个解析交给 FileChangeView 的名字（不是写死 edit_file）
+    expect(fileChangeToolName('local_edit_file')).toBe('local_edit_file');
+    // 反面对照：远端 edit_file 的声明不变
+    expect(toolSpec('edit_file')?.payload).toBe('file-change');
+    expect(toolSpec('edit_file')?.approvalView).toBe('diff');
+  });
+
+  it('local_write_file 仍是普通 JSON 呈现（后端没有本机写的审批预览）', () => {
+    // 远端 write_file 的审批面板本来就显示原始 JSON（见 catalog 里 approvalView
+    // 的说明）；本机写侧没有审批前预演，没有理由比远端多一个视图。等后端给出
+    // 预览、并确认要改这个行为时，才把这里改成 file-change（同时扩
+    // FileChangeView 的分支，那里有穷尽检查）。
+    expect(toolSpec('local_write_file')?.payload).toBeUndefined();
+    expect(fileChangeToolName('local_write_file')).toBeNull();
+    expect(toolSpec('local_write_file')?.approvalView).toBeUndefined();
+    // 反面对照：远端 write_file 仍是 file-change 内容视图，但审批不加宽、不出 diff
+    expect(toolSpec('write_file')?.payload).toBe('file-change');
+    expect(toolSpec('write_file')?.approvalView).toBeUndefined();
+  });
+
+  it('local_subagent 是子 agent（卡片入口/模式标注照旧）+ prompt 审批视图', () => {
+    expect(isSubagentTool('local_subagent')).toBe(true);
+    expect(toolSpec('local_subagent')?.approvalView).toBe('prompt');
+    // 远端子 agent 的审批面板没有长文本正文块（保持既有行为）
+    expect(toolSpec('subagent')?.approvalView).toBeUndefined();
+    // label 不能与远端 subagent 相同：本机/云端要在卡片标题行就能分开
+    expect(toolLabel('local_subagent')).toBe('本机子agent');
+    expect(toolLabel('subagent')).toBe('子agent');
+  });
+
+  it('图标与远端同名工具一致（同类动作共用一副长相）', () => {
+    expect(toolIconPaths('local_bash')).toBe(toolIconPaths('bash'));
+    expect(toolIconPaths('local_read_file')).toBe(toolIconPaths('read_file'));
+    expect(toolIconPaths('local_write_file')).toBe(toolIconPaths('write_file'));
+    expect(toolIconPaths('local_edit_file')).toBe(toolIconPaths('edit_file'));
+    expect(toolIconPaths('local_list_directory')).toBe(toolIconPaths('list_directory'));
+    expect(toolIconPaths('local_subagent')).toBe(toolIconPaths('subagent'));
+  });
+
+  it('本机子任务的会话哨兵值必须非空、且不像真会话 id', () => {
+    // 空串会被 `taskStore` 当成「重启恢复的占位 task」：本机子任务正在跑却被
+    // 判成占位 → 状态环不亮、对话不忙、回合被折叠。
+    expect(LOCAL_SESSION_SENTINEL.length).toBeGreaterThan(0);
+    // 真会话 id 两侧都是 UUID；哨兵值要是 UUID 形状就会与真会话撞名。
+    expect(LOCAL_SESSION_SENTINEL).not.toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
+  });
+
+  it('isLocalSessionId 只认哨兵：空串（占位 task）与真会话都不算本机', () => {
+    expect(isLocalSessionId(LOCAL_SESSION_SENTINEL)).toBe(true);
+    expect(isLocalSessionId('')).toBe(false);
+    expect(isLocalSessionId('3f2b1a4c-0000-4000-8000-000000000000')).toBe(false);
+    expect(isLocalSessionId(undefined)).toBe(false);
+    expect(isLocalSessionId(null)).toBe(false);
   });
 });
 
@@ -378,6 +555,14 @@ describe('已登记的消费方不再自带工具名判定（白名单制，见�
     'render_html',
     'upload_file',
     'download_file',
+    // 本机工具族（桌面专属，后端 `#[cfg(desktop)]` 注册；Android 没有本机路径
+    // 语义，走 SAF）：与远端同名工具一一对应，前端全部登记（无留白）。
+    'local_subagent',
+    'local_bash',
+    'local_read_file',
+    'local_write_file',
+    'local_edit_file',
+    'local_list_directory',
   ];
 
   /** 后端有、catalog 刻意不登记的工具（走中性默认：齿轮 + 原名 + 无预览）。 */

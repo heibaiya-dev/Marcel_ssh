@@ -17,7 +17,7 @@ import { useTaskStore } from './taskStore';
 import { useTurnFoldStore } from './turnFoldStore';
 import { useSettingsStore } from './settingsStore';
 import { effectiveModelId } from '@/lib/llmRegistry';
-import { isStreamingTool } from '@/lib/toolCatalog';
+import { interruptNoticeKind, type InterruptNoticeKind } from '@/lib/toolCatalog';
 import { isTaskBusy } from '@/lib/agentStatus';
 import { withTailTurnState } from '@/lib/agentTurnFold';
 import { attachStreamListener, cleanupTaskListeners } from './agentStreamManager';
@@ -288,8 +288,33 @@ const earlierLoadsInFlight: Set<string> = new Set();
 let activeSelectionGeneration = 0;
 
 /**
+ * 用户中断时卡片追加的说明，按**工具声称的收尾语义**分三套
+ * （`toolCatalog.interruptNoticeKind`）。选了哪一套由工具呈现表声明，这里只管
+ * 文本 —— 文案是纪律，不允许推导（见下）。
+ *
+ * ⚠️ 三段与后端 `agent_loop.rs` 的 `interruption_notice` **逐字节一致**：同一件
+ * 事，前后端任何路径触发都不能让用户看到两套说辞。改任何一段之前先改后端那
+ * 份，再回来同步这里（两边都有断言钉着）。
+ *
+ * 本机那段必须守住两条（与 `local_bash.rs` 的超时文案同一纪律）：只说「停止
+ * 等待、关闭我们这侧的读端」，**绝不能说「已终止进程」**；并指路本机自己的收尾
+ * 手段（本机没有 sshd 替用户回收进程）。
+ */
+const INTERRUPT_NOTICE_SUFFIX: Record<InterruptNoticeKind, string> = {
+  'remote-stream':
+    '\n\n[用户中断：已停止等待输出并关闭 SSH 通道，但远端进程不保证已终止——只有它之后还往 stdout/stderr 写东西时，才可能因管道断开（SIGPIPE）退出；静默运行、重定向了输出、被 nohup/setsid/& 脱离的命令会继续在服务器上运行。必要时用 ps/pgrep 确认并按需 kill 清理。]',
+  local:
+    '\n\n[用户中断：已停止等待输出并关闭我们这侧的读端，但本机进程不保证已结束——只有它之后还往 stdout/stderr 写东西时，才可能因管道断开而退出；静默运行、重定向了输出、被 Start-Process / nohup / & 脱离的命令会继续在这台电脑上运行。要收尾就自己查了再结束：Windows 用 `Get-Process` / `tasklist` 找到它、`Stop-Process -Id <pid>` 结束；macOS/Linux 用 `ps` / `pgrep` 找到它、`kill <pid>` 结束。]',
+  generic: '\n\n[用户手动中断，已停止等待结果；工具可能已执行完成]',
+};
+
+/**
  * 该对话下是否存在正在运行的任务（主 agent 或子 agent）。
  * sessionId 非空排除重启恢复的占位 task。
+ *
+ * 本机子任务（`local_subagent`）的 sessionId 是哨兵值：**这里要它算真任务** ——
+ * 它正在跑，它那条子对话就不该被写入（哨兵值恰恰为此非空）。只有空串（重启
+ * 恢复的占位 task）才不算。
  */
 export function conversationHasRunningTask(conversationId: string): boolean {
   return Object.values(useTaskStore.getState().tasks).some(
@@ -1416,11 +1441,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     // 用户点停止时调用。把所有正在执行的 tool 卡片标记为「已中断」：
     // - isExecuting=false, modelApproval 清除
     // - wasAborted=true
-    // - 流式工具（bash，前端通过 toolOutput 事件已累积部分 result）：
-    //   追加「用户中断：已停止等待输出并关闭 SSH 通道…」提示
-    // - 非流式工具（前端 result 为空）：用「工具可能已执行完成」提示
+    // - 文案按**工具声称的收尾语义**挑（`interruptNoticeKind`，不是「流式与否」）：
+    //   远端流式命令（bash）说「已停止等待输出并关闭 SSH 通道…」；本机命令
+    //   （local_bash）说「已停止等待本机命令…本机进程不保证已结束…」；其余说
+    //   「工具可能已执行完成」。
     // 文案与后端 agent_loop 检查点4 的中断保持逐字节一致（同一份语义，
-    // 前后端任何路径触发都不能让用户看到两套说辞）。
+    // 前后端任何路径触发都不能让用户看到两套说辞）。⚠️ 本机那套文案后端目前
+    // **还没有**（`agent_loop.rs` 的收尾分支只认 `bash`，local_bash 会落到
+    // 「工具可能已执行完成」）—— 后端补上同一段字节前，前端这条是本机视角的
+    // 唯一正确说法，后端那条要跟着改。
     // 注意：非流式工具后端有完整 output 但前端不可能收到（listener 已卸载），
     // 这里只反映用户视角的 UI 状态；LLM 历史由后端持久化保证完整。
     // conversationId 参数：子agent存在后，停止某个任务只标记该任务所属对话的
@@ -1432,14 +1461,11 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           !conversationId || convId === conversationId
             ? msgs.map((m) => {
                 if (m.role !== 'tool' || !(m.isExecuting || m.modelApproval)) return m;
-                const isStreaming = isStreamingTool(m.toolResult?.toolName ?? '');
-                const STREAMING_SUFFIX = '\n\n[用户中断：已停止等待输出并关闭 SSH 通道，但远端进程不保证已终止——只有它之后还往 stdout/stderr 写东西时，才可能因管道断开（SIGPIPE）退出；静默运行、重定向了输出、被 nohup/setsid/& 脱离的命令会继续在服务器上运行。必要时用 ps/pgrep 确认并按需 kill 清理。]';
-                const NON_STREAMING_SUFFIX = '\n\n[用户手动中断，已停止等待结果；工具可能已执行完成]';
+                const suffix =
+                  INTERRUPT_NOTICE_SUFFIX[interruptNoticeKind(m.toolResult?.toolName ?? '')];
                 const existing = m.toolResult?.result ?? '';
                 // 已有流式输出时追加，否则整体替换为提示
-                const result = isStreaming
-                  ? (existing ? existing + STREAMING_SUFFIX : STREAMING_SUFFIX.trimStart())
-                  : (existing ? existing + NON_STREAMING_SUFFIX : NON_STREAMING_SUFFIX.trimStart());
+                const result = existing ? existing + suffix : suffix.trimStart();
                 return {
                   ...m,
                   isExecuting: false,

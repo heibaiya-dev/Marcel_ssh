@@ -534,6 +534,55 @@ describe('conversationStore', () => {
       expect(m.toolResult?.result).not.toContain('远端命令');
     });
 
+    it('本机命令（local_bash）中断：停的是「等待」，本机进程不保证已结束', () => {
+      // 本机命令的输出同样是流式到达前端的（后端 local_bash 挂了
+      // `ticket.streaming`），但文案**不能**跟着流式走：没有 SSH 通道可关、
+      // 进程也不在服务器上。旧实现按「流式与否」二选一，本机命令只能拿到假的
+      // 那套（「已关闭 SSH 通道」）或反的那套（「工具可能已执行完成」）。
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({
+              id: 'm-local',
+              role: 'tool',
+              content: '',
+              isExecuting: true,
+              toolResult: {
+                toolName: 'local_bash',
+                summary: '',
+                result: 'partial stdout',
+                success: true,
+                blocked: false,
+              },
+            }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().markAbortedToolFlags();
+
+      const m = useConversationStore.getState().messages['conv-1'][0];
+      expect(m.toolResult?.wasAborted).toBe(true);
+      expect(m.toolResult?.success).toBe(false);
+      const result = m.toolResult?.result ?? '';
+      expect(result).toContain('partial stdout');
+      expect(result).toContain('用户中断');
+      // 文案必须与后端 `agent_loop.rs` 的 `interruption_notice("local_bash")` 逐字节
+      // 一致（同一件事不能有两套说辞），所以这里钉的是后端那句的开头。
+      expect(result).toContain('已停止等待输出并关闭我们这侧的读端');
+      expect(result).toContain('本机进程不保证已结束');
+      // 指路本机自己的收尾手段（本机没有 sshd 替用户回收进程）
+      expect(result).toContain('Get-Process');
+      expect(result).toContain('Stop-Process -Id');
+      expect(result).toContain('pgrep');
+      // 三句都不许出现：关 SSH 通道（本机没有）、远端进程（不在服务器上）、
+      // 工具可能已执行完成（与本机「进程可能还在跑」相反）
+      expect(result).not.toContain('SSH 通道');
+      expect(result).not.toContain('远端进程');
+      expect(result).not.toContain('工具可能已执行完成');
+    });
+
     it('clears modelApproval in addition to isExecuting', () => {
       useConversationStore.setState({
         activeConversationId: 'conv-1',

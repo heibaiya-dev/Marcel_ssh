@@ -1088,8 +1088,38 @@ fn owner_conversation_for(state: &AppState, task_id: &str, fallback: &str) -> St
     fallback.to_string()
 }
 
+/// 用户中断时追到工具输出末尾的收尾说明。
+///
+/// 按工具分流，因为**收尾语义相同、收尾手段不同**，说错会把模型和用户引到
+/// 错误的机器上：
+/// - `bash`：SSH 通道上的远端命令，指路服务器上的 `ps/pgrep` + `kill`；
+/// - `local_bash`：本机子进程，已停止等待并关闭我们这侧的读端（与
+///   `command_exec::local_transport` 的收尾语义、以及 `local_bash.rs` 的超时
+///   文案同一口径），指路本机的 `Get-Process` / `Stop-Process -Id`（Windows）
+///   与 `ps` / `pgrep` + `kill <pid>`（macOS/Linux）；
+/// - 其余工具：可能已执行完成，只用中性说明。
+///
+/// 两端都**不许**出现「已终止 / 已杀掉进程」的表述：取消只停止等待，进程
+/// （远端或本机）都可能在继续跑。
+fn interruption_notice(tool_name: &str) -> String {
+    match tool_name {
+        "bash" => {
+            "[用户中断：已停止等待输出并关闭 SSH 通道，但远端进程不保证已终止——只有它之后还往 stdout/stderr 写东西时，才可能因管道断开（SIGPIPE）退出；静默运行、重定向了输出、被 nohup/setsid/& 脱离的命令会继续在服务器上运行。必要时用 ps/pgrep 确认并按需 kill 清理。]".to_string()
+        }
+        "local_bash" => {
+            "[用户中断：已停止等待输出并关闭我们这侧的读端，但本机进程不保证已结束——只有它之后还往 stdout/stderr 写东西时，才可能因管道断开而退出；静默运行、重定向了输出、被 Start-Process / nohup / & 脱离的命令会继续在这台电脑上运行。要收尾就自己查了再结束：Windows 用 `Get-Process` / `tasklist` 找到它、`Stop-Process -Id <pid>` 结束；macOS/Linux 用 `ps` / `pgrep` 找到它、`kill <pid>` 结束。]".to_string()
+        }
+        _ => "[用户手动中断，已停止等待结果；工具可能已执行完成]".to_string(),
+    }
+}
+
 /// Executes a single tool call with context assembly, cancellation checks, plan override,
 /// and frontend event emission.
+///
+/// `local_side` = 本机子 agent（`LoopContext::local_side`）：ctx 的目标是用户自己这台电脑。
+/// `agent_settings` = 本任务启动时的设置快照（与 dispatcher 手里同一份），注入 ctx
+/// 供需要重算审批结论的工具使用（见 [`ToolContext::with_agent_mode_settings`]）。
+#[allow(clippy::too_many_arguments)]
 async fn execute_single_tool(
     index: usize,
     tc: &ToolCall,
@@ -1190,21 +1220,12 @@ async fn execute_single_tool(
             tc.name
         );
         exec.was_aborted = true;
-        if tc.name == "bash" {
-            if !exec.output.is_empty() {
-                exec.output.push_str(
-                    "\n\n[用户中断：已停止等待输出并关闭 SSH 通道，但远端进程不保证已终止——只有它之后还往 stdout/stderr 写东西时，才可能因管道断开（SIGPIPE）退出；静默运行、重定向了输出、被 nohup/setsid/& 脱离的命令会继续在服务器上运行。必要时用 ps/pgrep 确认并按需 kill 清理。]",
-                );
-            } else {
-                exec.output = String::from(
-                    "[用户中断：已停止等待输出并关闭 SSH 通道，但远端进程不保证已终止——只有它之后还往 stdout/stderr 写东西时，才可能因管道断开（SIGPIPE）退出；静默运行、重定向了输出、被 nohup/setsid/& 脱离的命令会继续在服务器上运行。必要时用 ps/pgrep 确认并按需 kill 清理。]",
-                );
-            }
-        } else if !exec.output.is_empty() {
-            exec.output
-                .push_str("\n\n[用户手动中断，已停止等待结果；工具可能已执行完成]");
+        let notice = interruption_notice(&tc.name);
+        if exec.output.is_empty() {
+            exec.output = notice;
         } else {
-            exec.output = String::from("[用户手动中断，已停止等待结果；工具可能已执行完成]");
+            exec.output.push_str("\n\n");
+            exec.output.push_str(&notice);
         }
         exec.success = false;
         exec.summary = format!("{} (aborted)", tc.name);
@@ -1277,8 +1298,8 @@ async fn execute_single_tool(
 mod tests {
     use super::{
         build_job_settlement_notice, classify_text_reply, group_tool_calls_into_batches,
-        round_context_snapshot, PersistedAssistantToolCall, PersistedToolResult, TextReply,
-        MAX_CONCURRENT_TOOL_EXECUTIONS,
+        interruption_notice, round_context_snapshot, PersistedAssistantToolCall,
+        PersistedToolResult, TextReply, MAX_CONCURRENT_TOOL_EXECUTIONS,
     };
     use crate::agent::risk::Disposition;
     use crate::agent::tools::{AgentTool, ToolContext, ToolOutput, ToolRegistry};
@@ -1614,6 +1635,52 @@ mod tests {
         assert_eq!(cleaned, "被截断的正文");
     }
 
+    /// 中断文案必须落到**跑命令的那台机器**上：远端 `bash` 指 ps/pgrep，本机
+    /// `local_bash` 指 Get-Process / Stop-Process -Id；两端都不许声称进程已经
+    /// 终止（超时 / 取消只停止等待，见 `command_exec::local_transport`）。
+    #[test]
+    fn interruption_notice_matches_the_machine_the_command_ran_on() {
+        let remote = interruption_notice("bash");
+        assert!(remote.contains("SSH 通道"));
+        assert!(remote.contains("远端进程不保证已终止"));
+        assert!(remote.contains("ps/pgrep"));
+        assert!(
+            !remote.contains("Get-Process"),
+            "远端命令不该指路本机手段：{remote}"
+        );
+
+        let local = interruption_notice("local_bash");
+        assert!(local.contains("关闭我们这侧的读端"), "{local}");
+        assert!(local.contains("本机进程不保证已结束"), "{local}");
+        assert!(
+            local.contains("Get-Process") && local.contains("tasklist"),
+            "本机命令要指路本机确认手段：{local}"
+        );
+        assert!(
+            local.contains("Stop-Process -Id"),
+            "本机命令要指路本机结束手段：{local}"
+        );
+        assert!(
+            local.contains("pgrep") && local.contains("kill <pid>"),
+            "其它平台的本机收尾手段也要说：{local}"
+        );
+        assert!(
+            !local.contains("SSH 通道"),
+            "本机命令不经 SSH，别把用户引到远端：{local}"
+        );
+        for text in [&remote, &local] {
+            assert!(
+                !text.contains("已终止进程") && !text.contains("已杀掉"),
+                "取消只停止等待，不得声称进程已结束：{text}"
+            );
+        }
+
+        // 其余工具（read_file / web_search / …）走中性文案：本机 / 远端都不占。
+        let other = interruption_notice("read_file");
+        assert!(other.contains("工具可能已执行完成"), "{other}");
+        assert!(!other.contains("Get-Process") && !other.contains("SSH 通道"));
+    }
+
     #[test]
     fn job_settlement_notice_lists_completed_jobs_and_collection_hint() {
         let jobs = vec![
@@ -1655,7 +1722,11 @@ mod tests {
         assert!(notice.contains("执行失败"));
     }
 
-    fn breakdown(system: usize, tools: usize, messages: usize) -> crate::agent::context::meter::ContextBreakdown {
+    fn breakdown(
+        system: usize,
+        tools: usize,
+        messages: usize,
+    ) -> crate::agent::context::meter::ContextBreakdown {
         crate::agent::context::meter::ContextBreakdown {
             system,
             tools,
