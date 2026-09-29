@@ -11,6 +11,7 @@ use super::checker::{
 use super::disposition::Assessment;
 use super::model::base_assessment;
 use super::parser::{parse_segment, split_command_chain, ParseError, ParsedSegment};
+use super::windows::windows_verdict;
 
 /// 命令风险评估的策略输入 —— 只有用户真的能配的东西，其余一律写在代码里。
 ///
@@ -107,7 +108,8 @@ impl RiskAssessor {
     /// 三个来源按严取一：
     ///   1. 灾难模式 + 「该淘汰的写法」（递归删系统关键目录、写块设备、
     ///      按名字批量杀进程、管道进 shell、`source`/藏变量执行）→ [`Disposition::Deny`]
-    ///   2. 系统级命令 / 磁盘工具 / 受保护路径 → [`Disposition::ForceApproval`]
+    ///   2. 系统级命令 / 磁盘工具 / 受保护路径 / Windows 形态的高危模式
+    ///      （见 [`super::windows`]）→ [`Disposition::ForceApproval`]
     ///   3. `sudo` 包装保底 → [`Disposition::Approval`]（Auto 跳过，普通模式要确认）
     ///   4. 其余 → [`Disposition::Allow`]，由调用方按命令名单决定要不要审批
     ///
@@ -173,6 +175,14 @@ impl RiskAssessor {
             }
 
             worst = worst.worst(base_assessment(&parsed));
+
+            // Windows（PowerShell / cmd）形态的高危模式 —— 见 [`super::windows`]。
+            // 纯文本、与上面几条同层：只把「明确的毁灭性写法」抬到强制审批（Auto 也拦），
+            // 不新增拒绝、不降任何已有档位（`worst` 只会取更严的那个）。规则本身一条也不
+            // 写在这里 —— 那是 `windows` 模块的唯一权威来源。
+            if let Some(verdict) = windows_verdict(&parsed) {
+                worst = worst.worst(verdict);
+            }
 
             if let Some(path) = self.protected_path_hit(&parsed) {
                 worst = worst.worst(Assessment::forced(format!(

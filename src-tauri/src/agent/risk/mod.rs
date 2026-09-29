@@ -12,6 +12,7 @@ mod disposition;
 mod model;
 mod parser;
 mod policy;
+mod windows;
 
 pub use disposition::{Assessment, Disposition};
 pub use policy::{RiskAssessor, SecurityPolicy};
