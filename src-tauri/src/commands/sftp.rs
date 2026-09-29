@@ -40,6 +40,15 @@ const SYSOPEN_BUFFER_BYTES: usize = 131_072;
 /// Keep below common 255-byte component limits and leave room for editor temp suffixes.
 const SYSOPEN_LOCAL_FILENAME_MAX_BYTES: usize = 240;
 
+/// 远端命令的「成功标记」判定：`echo OK` 必须**独占一行**。
+///
+/// 不能用 `contains("OK")`：命令输出里任何含 "OK" 的路径/文件名（解压冲突时的
+/// `CONFLICT: OK.txt`、远端报错里的目录名）都会被误判成成功 —— 解压其实没做，
+/// 界面却报完成。压缩 / 解压 / 建目录三条路径统一走这里。
+fn command_reported_ok(output: &str) -> bool {
+    output.lines().any(|line| line.trim() == "OK")
+}
+
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
         return value;
@@ -285,6 +294,45 @@ pub async fn sftp_rename(
     Ok(())
 }
 
+/// 把解压命令的输出翻成给用户的错误文案。
+/// - 冲突标记 `CONFLICT: <rel>` 是远端给机器看的，原样拼出来是
+///   「解压失败: CONFLICT: foo.txt」，这里翻成可读句；
+/// - 其余失败透传远端输出（空输出给个兜底），保留诊断信息；
+/// - 本函数不加「解压失败：」前缀，前缀由前端统一加一次。
+fn extract_failure_message(output: &str) -> String {
+    let trimmed = output.trim();
+    if let Some(rel) = trimmed
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("CONFLICT:"))
+    {
+        return format!(
+            "目标目录已存在同名条目「{}」，已取消解压以免覆盖",
+            rel.trim()
+        );
+    }
+    if trimmed.is_empty() {
+        "解压命令未返回预期结果".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 按需在文本前加 UTF-8 BOM：读端剥掉 BOM 后用 `hasBom` 单独回传，
+/// 写端按参数还原，避免「打开-保存」静默改掉原文件字节。
+pub(crate) fn encode_file_content(content: &str, bom: bool) -> Vec<u8> {
+    if !bom {
+        return content.as_bytes().to_vec();
+    }
+    let mut bytes = Vec::with_capacity(content.len() + 3);
+    bytes.extend_from_slice(b"\xEF\xBB\xBF");
+    bytes.extend_from_slice(content.as_bytes());
+    bytes
+}
+
+pub(crate) fn has_utf8_bom(data: &[u8]) -> bool {
+    data.starts_with(b"\xEF\xBB\xBF")
+}
+
 #[tauri::command]
 pub async fn sftp_extract_archive(
     app: AppHandle,
@@ -339,14 +387,18 @@ pub async fn sftp_extract_archive(
         )
         .await?;
 
-    if !output.trim().contains("OK") {
-        return Err(AppError::Ssh(format!("解压失败: {}", output.trim())));
+    if !command_reported_ok(&output) {
+        return Err(AppError::Ssh(extract_failure_message(&output)));
     }
 
     Ok(())
 }
 
 /// 系统目录黑名单：禁止压缩这些目录，防止意外打包整个系统或敏感数据。
+/// 本表按「前缀匹配」生效（连同子目录一起挡），适合 /usr、/var/log 这类
+/// 整棵子树都不该被单独打包的目录。
+/// `/opt` 保持前缀匹配：它是系统级第三方应用安装区，打包其中任意子目录
+/// 都属于本次修复不打算放宽的范围（最小修正只补家目录等缺口）。
 const SYSTEM_PATH_BLACKLIST: &[&str] = &[
     "/",
     "/usr",
@@ -369,11 +421,19 @@ const SYSTEM_PATH_BLACKLIST: &[&str] = &[
     "/opt",
 ];
 
+/// 仅精确匹配的黑名单：这些根目录本身被整体打包时是「打包所有人/整个服务数据」的
+/// 危险操作，但它们的子目录正是用户日常要压缩的对象（如 /home/user/docs），
+/// 前缀匹配会把功能整个挡死，所以只挡根本身。
+const SYSTEM_PATH_EXACT_BLACKLIST: &[&str] = &["/home", "/root", "/srv", "/mnt", "/media"];
+
 /// 检查路径是否在系统目录黑名单内（精确匹配或前缀匹配）。
 fn is_system_path(path: &str) -> bool {
     let normalized = path.trim_end_matches('/');
     if normalized.is_empty() {
         return true; // 根目录
+    }
+    if SYSTEM_PATH_EXACT_BLACKLIST.contains(&normalized) {
+        return true;
     }
     SYSTEM_PATH_BLACKLIST
         .iter()
@@ -488,8 +548,8 @@ pub async fn sftp_compress_archive(
 
     match state.command_exec.submit(&app, ticket).await {
         SubmitOutcome::Completed { output, .. } => {
-            // 检查 OK/FAILED 标记
-            if output.lines().any(|line| line.trim() == "OK") {
+            // 检查 OK/FAILED 标记（整行匹配，判据只有 `command_reported_ok` 一处）
+            if command_reported_ok(&output) {
                 emit_event(&app, "ssh-long-done", &json!({ "taskId": &task_id }));
                 Ok(())
             } else {

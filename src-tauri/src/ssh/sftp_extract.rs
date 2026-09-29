@@ -47,8 +47,17 @@ pub(crate) fn build_extract_to_dir_cmd(
         ArchiveType::TarXz => format!("tar xJf {arc} -C \"$tmp\""),
         ArchiveType::Tar => format!("tar xf {arc} -C \"$tmp\""),
     };
+    // 冲突检测：把解压结果留在临时目录，逐条比对目标目录里是否已有同名条目，
+    // 命中即中止（解压「绝不覆盖」的承诺靠它）。三个细节都不能省：
+    // 1. `-print0` + `read -r -d ''`：文件名可以含换行，按行读会把一个名字拆成
+    //    两个 —— 既漏判真冲突（覆盖用户已有文件），也误报假冲突；
+    // 2. `-e` 会跟随符号链接，目标侧是「悬空软链」时它为假，只判 `-e` 会放过冲突：
+    //    随后 `cp` 至少会中途报错并留下半份已拷入的文件（GNU cp 拒绝写穿悬空软链，
+    //    跟随目标软链的实现则直接写到目标目录之外），故补判 `-L`；
+    // 3. `cp -a -n` 兜底：检测与复制之间仍有竞态窗口（TOCTOU），`-n` 保证任何
+    //    情况下都不覆盖已存在的目标条目。
     format!(
-        "tmp={tmp} && trap 'rm -rf \"$tmp\"' EXIT && {extract} && mkdir -p {dir} && cd \"$tmp\" && conflict_file=\"$tmp/.marcel-conflict\" && find . -mindepth 1 -print | while IFS= read -r p; do rel=${{p#./}}; if [ -e {dir}/\"$rel\" ]; then echo CONFLICT: \"$rel\" > \"$conflict_file\"; break; fi; done && if [ -s \"$conflict_file\" ]; then cat \"$conflict_file\"; exit 1; fi && cp -a \"$tmp\"/. {dir}/ && echo OK"
+        "tmp={tmp} && trap 'rm -rf \"$tmp\"' EXIT && {extract} && mkdir -p {dir} && cd \"$tmp\" && conflict_file=\"$tmp/.marcel-conflict\" && find . -mindepth 1 -print0 | while IFS= read -r -d '' p; do rel=${{p#./}}; if [ -e {dir}/\"$rel\" ] || [ -L {dir}/\"$rel\" ]; then echo CONFLICT: \"$rel\" > \"$conflict_file\"; break; fi; done && if [ -s \"$conflict_file\" ]; then cat \"$conflict_file\"; exit 1; fi && cp -a -n \"$tmp\"/. {dir}/ && echo OK"
     )
 }
 
@@ -67,11 +76,14 @@ pub(crate) fn build_zip_check_cmd() -> &'static str {
 /// Build a shell command to compress a directory into an archive.
 ///
 /// `source_dir` must be an absolute path. It is split into parent + basename
-/// so that `tar -C <parent> <basename>` / `zip` produces an archive containing
-/// the directory itself (not its contents flattened).
+/// so that `tar -C <parent> -- <basename>` / `zip ... -- <basename>` produces an
+/// archive containing the directory itself (not its contents flattened).
 ///
 /// Returns "OK" on success, "FAILED" on non-zero exit. The caller checks for
 /// the "OK" marker to determine success (same convention as extract).
+///
+/// 已存在的 `target_path` 会先被删除再重建：覆盖 = 整包重写，而不是增量更新
+/// （zip 的 add/update 不会清理源目录中已删除的旧成员）。
 pub(crate) fn build_compress_to_archive_cmd(
     source_dir: &str,
     target_path: &str,
@@ -100,17 +112,35 @@ pub(crate) fn build_compress_to_archive_cmd(
 
     let compress = match kind {
         ArchiveType::TarGz => {
-            format!("tar -czf {target_esc} -C {parent_esc} {dirname_esc}")
+            // `--` 结束选项解析：目录名以 '-' 开头时（Linux 上合法），否则 tar
+            // 会把它当选项（GNU tar: invalid option -- 'e'）。`--` 在 `-C <parent>`
+            // 之后、目录名之前，位置合法。
+            format!("tar -czf {target_esc} -C {parent_esc} -- {dirname_esc}")
         }
         ArchiveType::Zip => {
             // zip needs to chdir to parent first; -r recursive, -q quiet (we
             // still want stderr for errors), -y store symlinks as-is.
-            format!("cd {parent_esc} && zip -rqy {target_esc} {dirname_esc}")
+            // `--` 同样用于结束选项解析：Info-ZIP zip 3.0（fileio.c 的 get_option，
+            // doubledash_ends_options 默认开启）规定 `--` 之后的参数一律按文件名
+            // 处理，且 `--` 只能出现在归档名之后（zip.c: "can't use -- before
+            // archive name"）—— 本命令把它们放在归档名之后，满足该约束。
+            format!("cd {parent_esc} && zip -rqy {target_esc} -- {dirname_esc}")
         }
         _ => return Err("压缩仅支持 tar.gz 和 zip"),
     };
 
-    Ok(format!("{compress} && echo OK || echo FAILED"))
+    // 压缩前先删掉目标：zip 是「新增/更新」语义 —— zip 3.0 手册：对已存在的包，
+    // 「zip will replace identically named entries ... or add entries for new names」，
+    // 例子里的 foo/file2 「unchanged from before」——即源目录里已经删掉（含敏感的）
+    // 文件会作为旧成员留在包里。tar 是截断重写，本不受影响，这里统一处理以保持
+    // 两种格式行为一致（也顺手换掉同名目录/软链这类无法直接写入的目标，避免写穿
+    // 软链）。不 overwrite 时调用方已用 `test -e` 拦下「目标已存在」，故此处无条件
+    // 删除是安全的。
+    let remove_target = format!("rm -f -- {target_esc}");
+
+    Ok(format!(
+        "{remove_target} && {compress} && echo OK || echo FAILED"
+    ))
 }
 
 pub(crate) fn has_tool(check_output: &str) -> bool {
@@ -153,6 +183,11 @@ mod tests {
         assert!(!has_unzip("MISSING_UNZIP\n"));
         assert!(!has_unzip(""));
         assert!(!has_unzip("NOT_OK\n"));
+        // 工具检查的判据是「整行恰好 OK」：其它输出里出现的 OK 子串不算命中
+        // （解压路径的调用方用的是子串 contains("OK")，见模块外的 sftp.rs）。
+        assert!(!has_unzip("CONFLICT: OK.txt\n"));
+        assert!(!has_tool("zip warning: OK\n"));
+        assert!(has_tool("  OK  \n")); // 前后空白 trim 后仍是整行 OK
     }
 
     #[test]
@@ -195,6 +230,35 @@ mod tests {
         assert!(cmd.contains("cp -a"));
     }
 
+    /// 解压的冲突检测必须扛得住：文件名含换行、目标侧悬空软链、以及检测与复制
+    /// 之间的竞态（cp -a -n 兜底）。对全部归档类型都要成立。
+    #[test]
+    fn extract_cmd_conflict_check_is_robust() {
+        for kind in [
+            ArchiveType::Zip,
+            ArchiveType::TarGz,
+            ArchiveType::TarBz2,
+            ArchiveType::TarXz,
+            ArchiveType::Tar,
+        ] {
+            let cmd = build_extract_to_dir_cmd("/tmp/a.zip", "/home/user", kind);
+            // 文件名可含换行：NUL 分隔遍历，不能按行读
+            assert!(cmd.contains("-print0"), "{kind:?}");
+            assert!(cmd.contains("read -r -d ''"), "{kind:?}");
+            // 悬空软链：-e 跟随链接为假，必须补判 -L，否则冲突漏判（GNU cp 会中途
+            // 报错并留下部分拷贝，跟随目标软链的实现会写到目录之外）
+            assert!(
+                cmd.contains("[ -e '/home/user'/\"$rel\" ] || [ -L '/home/user'/\"$rel\" ]"),
+                "{kind:?}"
+            );
+            // 兜底：检测与复制之间存在竞态窗口，-n 保证绝不覆盖
+            assert!(
+                cmd.contains("&& cp -a -n \"$tmp\"/. '/home/user'/ && echo OK"),
+                "{kind:?}"
+            );
+        }
+    }
+
     #[test]
     fn zip_check_command_works() {
         let cmd = build_zip_check_cmd();
@@ -223,6 +287,49 @@ mod tests {
         assert!(cmd.contains("zip -rqy"));
         assert!(cmd.contains("'/tmp/foo.zip'"));
         assert!(cmd.contains("'foo'"));
+    }
+
+    /// 覆盖 = 整包重写：zip 是 add/update 语义（不会删掉源目录中已消失的旧成员），
+    /// tar 虽为截断重写也统一处理，所以两种格式都必须先删目标再压缩。
+    #[test]
+    fn compress_cmd_removes_existing_target_before_writing() {
+        for (kind, target, tool) in [
+            (ArchiveType::TarGz, "/tmp/foo.tar.gz", "tar -czf"),
+            (ArchiveType::Zip, "/tmp/foo.zip", "zip -rqy"),
+        ] {
+            let cmd = build_compress_to_archive_cmd("/home/user/foo", target, kind).unwrap();
+            assert!(
+                cmd.starts_with(&format!("rm -f -- '{target}' && ")),
+                "{kind:?}: {cmd}"
+            );
+            // 删除必须发生在打包之前，否则旧成员会被 zip 保留下来
+            let rm_at = cmd.find("rm -f --").unwrap();
+            let write_at = cmd.find(tool).unwrap();
+            assert!(rm_at < write_at, "{kind:?}: {cmd}");
+        }
+    }
+
+    /// 以 '-' 开头的目录名是合法的，但会被 tar/zip 当成选项：两条命令都必须用
+    /// `--` 结束选项解析。tar 用 `-C <parent> -- <name>`，zip 的 `--` 必须在
+    /// 归档名之后（Info-ZIP zip 3.0 的硬约束）。
+    #[test]
+    fn compress_cmd_ends_options_before_dirname() {
+        let tar =
+            build_compress_to_archive_cmd("/home/user/-weird", "/tmp/o.tar.gz", ArchiveType::TarGz)
+                .unwrap();
+        assert!(tar.contains("-C '/home/user' -- '-weird'"), "{tar}");
+
+        let zip =
+            build_compress_to_archive_cmd("/home/user/-weird", "/tmp/o.zip", ArchiveType::Zip)
+                .unwrap();
+        assert!(zip.contains("zip -rqy '/tmp/o.zip' -- '-weird'"), "{zip}");
+
+        // 普通名字同样带 `--`（位置固定在归档名之后，不随名字变化）
+        let plain = build_compress_to_archive_cmd("/home/user/foo", "/tmp/o.zip", ArchiveType::Zip)
+            .unwrap();
+        assert!(plain.contains("zip -rqy '/tmp/o.zip' -- 'foo'"), "{plain}");
+        // `--` 不能出现在归档名之前：zip 会直接报 "can't use -- before archive name"
+        assert!(plain.find("-- 'foo'").unwrap() > plain.find("'/tmp/o.zip'").unwrap());
     }
 
     #[test]
