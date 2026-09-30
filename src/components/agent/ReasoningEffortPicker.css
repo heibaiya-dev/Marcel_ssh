@@ -366,15 +366,9 @@ input[type='range'].reasoning-effort-slider:disabled {
 }
 .reasoning-effort-model-list {
   max-height: 210px;
-  margin-top: 4px;
+  margin-top: 0;
   overflow-y: auto;
-  border-top: 1px solid rgb(63 63 70 / 80%);
-  padding-top: 5px;
-}
-.reasoning-effort-model-list-title {
-  padding: 2px 5px 5px;
-  color: #a1a1aa;
-  font-size: 10px;
+  padding-top: 0;
 }
 .reasoning-effort-model-channel {
   padding: 5px 5px 2px;

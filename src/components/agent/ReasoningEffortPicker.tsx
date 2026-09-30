@@ -86,7 +86,10 @@ export function ReasoningEffortPicker({
       : effectiveDefaultModel(registry))
     : undefined;
   const resolvedModelName = modelName || modelLabel(effectiveModel) || '当前模型';
-  const isUltra = options[index] === 'ultra';
+  // Treat the last available effort as the full-power state too. Some models
+  // expose `max` as their final level without declaring an `ultra` option, but
+  // the slider should still get the same completion animation there.
+  const isUltra = options[index] === 'ultra' || index === efforts.length;
   const progress = efforts.length > 0 ? index / efforts.length : 0;
   const locked = disabled || saving || !isOpen;
 
@@ -108,7 +111,9 @@ export function ReasoningEffortPicker({
     }
     setPreviewIndex(nextIndex);
     setError(false);
-    if (options[nextIndex] === 'ultra') setUltraBurst((current) => current + 1);
+    if (options[nextIndex] === 'ultra' || nextIndex === efforts.length) {
+      setUltraBurst((current) => current + 1);
+    }
     savingRef.current = true;
     setSaving(true);
     try {
@@ -258,7 +263,7 @@ export function ReasoningEffortPicker({
           }`}
         >
           <div className="reasoning-effort-heading">
-            <h3 className="reasoning-effort-value" title={modelListOpen ? '选择模型' : label}>{modelListOpen ? '选择模型' : label}</h3>
+            {!modelListOpen && <h3 className="reasoning-effort-value" title={label}>{label}</h3>}
             {!modelListOpen && <button
               type="button"
               id={`${id}-model`}
@@ -286,7 +291,6 @@ export function ReasoningEffortPicker({
           </button>}
           {modelListOpen && registry && onModelChange ? (
             <div className="reasoning-effort-model-list" role="listbox" aria-label="选择模型">
-              <div className="reasoning-effort-model-list-title">选择模型</div>
               {registry.channels.map((channel) => {
                 const models = registry.models.filter((model) => model.channelId === channel.id);
                 if (models.length === 0) return null;
