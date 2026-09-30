@@ -692,6 +692,7 @@ pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     tauri::Builder::default()
+        .manage(commands::debug::DebugBackendState::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -850,7 +851,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(commands::debug::with_backend_gate(tauri::generate_handler![
             commands::app_ready,
             commands::app_bootstrap::app_get_bootstrap,
             commands::mobile_set_app_foreground,
@@ -914,6 +915,7 @@ pub fn run() {
             commands::connections::config_save_connection,
             commands::connections::config_apply_connection_order,
             commands::connections::config_delete_connection,
+            commands::debug::debug_shutdown_backend,
             commands::settings::config_get_settings,
             commands::settings::config_save_settings,
             commands::settings::config_validate_custom_protected_paths,
@@ -1013,7 +1015,7 @@ pub fn run() {
             commands::plugin_fs::plugin_fs_write,
             commands::plugin_http::plugin_http_request,
             commands::plugin_notification::plugin_send_notification,
-        ])
+        ]))
         .build(tauri::generate_context!())
         .expect("Fatal: failed to start Tauri application")
         .run(|app, event| {

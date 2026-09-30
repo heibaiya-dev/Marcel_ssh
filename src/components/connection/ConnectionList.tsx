@@ -18,6 +18,7 @@ import {
 } from '@/lib/connectionOrder';
 import type { SavedConnection, ConnectionConfig } from '@/lib/types';
 import * as tauri from '@/lib/tauri';
+import { isDebugConnection } from '@/lib/debugServer';
 import Modal from '@/components/ui/Modal';
 import ListPanel from '@/components/ui/ListPanel';
 import ContextMenu from '@/components/ui/ContextMenu';
@@ -797,6 +798,11 @@ export default function ConnectionList() {
    */
   const handleConnect = async (connection: SavedConnection) => {
     setLocalError(null);
+    if (isDebugConnection(connection.id)) {
+      useSessionStore.getState().connectDebugServer();
+      setActiveConnection(connection.id);
+      return;
+    }
     if (connection.authMethod === 'Password') {
       try {
         const stored = await tauri.hasPassword(connection.id);
@@ -969,10 +975,10 @@ export default function ConnectionList() {
           label: '连接',
           onClick: () => handleConnect(contextMenu.connection),
         },
-        {
+        ...(!isDebugConnection(contextMenu.connection.id) ? [{
           label: '编辑',
           onClick: () => openEditForm(contextMenu.connection),
-        },
+        }] : []),
         ...(shiftable.up
           ? [
               {

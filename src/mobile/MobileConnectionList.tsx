@@ -30,6 +30,7 @@ import { isPasswordRejected, isPassphraseProblem, keyNeedsPassphrase } from '@/l
 import { formatConnLabel } from '@/lib/privacy';
 import type { ConnectionConfig, SavedConnection } from '@/lib/types';
 import * as tauri from '@/lib/tauri';
+import { isDebugConnection } from '@/lib/debugServer';
 import {
   UNGROUPED_NAME,
   groupNameOf,
@@ -281,6 +282,12 @@ export default function MobileConnectionList({
 
   const handleConnect = async (connection: SavedConnection) => {
     setLocalError(null);
+    if (isDebugConnection(connection.id)) {
+      useSessionStore.getState().connectDebugServer();
+      useConnectionStore.getState().setActiveConnection(connection.id);
+      onBack?.();
+      return;
+    }
     if (connection.authMethod === 'Password') {
       try {
         const stored = await tauri.hasPassword(connection.id);
@@ -587,7 +594,7 @@ export default function MobileConnectionList({
                       </div>
                     </div>
                   </button>
-                  <button
+                  {!isDebugConnection(conn.id) && <button
                     type="button"
                     data-nodrag
                     onClick={() => openEditForm(conn)}
@@ -595,7 +602,7 @@ export default function MobileConnectionList({
                     aria-label={`编辑 ${conn.name}`}
                   >
                     <Pencil className="h-4 w-4" />
-                  </button>
+                  </button>}
                   <button
                     type="button"
                     data-nodrag

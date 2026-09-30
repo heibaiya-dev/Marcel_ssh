@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { isDebugSession } from "@/lib/debugServer";
 import { getErrorMessage } from "./errors";
 import type {
   ActiveMessagesResult,
@@ -53,6 +54,7 @@ export async function sshSendInput(
   sessionId: string,
   data: string,
 ): Promise<void> {
+  if (isDebugSession(sessionId)) return;
   return invoke("ssh_send_input", { sessionId, data });
 }
 
@@ -61,6 +63,7 @@ export async function sshResize(
   cols: number,
   rows: number,
 ): Promise<void> {
+  if (isDebugSession(sessionId)) return;
   return invoke("ssh_resize", { sessionId, cols, rows });
 }
 
@@ -894,6 +897,11 @@ export async function getBootstrapData(): Promise<AppBootstrapData> {
 
 export async function appReady(): Promise<void> {
   return invoke("app_ready");
+}
+
+/** Exit the application, or simulate unavailable application IPC while retaining the UI. */
+export async function debugShutdownBackend(keepFrontendOpen: boolean): Promise<void> {
+  return invoke("debug_shutdown_backend", { keepFrontendOpen });
 }
 
 // Update check
