@@ -31,8 +31,8 @@ import { formatConnLabel } from '@/lib/privacy';
 import type { ConnectionConfig, SavedConnection } from '@/lib/types';
 import * as tauri from '@/lib/tauri';
 import {
-  UNGROUPED_NAME,
   groupNameOf,
+  groupConnections,
   toOrderEntries,
 } from '@/lib/connectionOrder';
 import { useLongPressDrag } from './useLongPressDrag';
@@ -69,6 +69,7 @@ export default function MobileConnectionList({
   const fetchConnections = useConnectionStore((s) => s.fetchConnections);
   const addConnection = useConnectionStore((s) => s.addConnection);
   const removeConnection = useConnectionStore((s) => s.removeConnection);
+  const renameGroup = useConnectionStore((s) => s.renameGroup);
   const connect = useSessionStore((s) => s.connect);
   const connectWithSavedPassword = useSessionStore(
     (s) => s.connectWithSavedPassword,
@@ -104,6 +105,17 @@ export default function MobileConnectionList({
   const [deleteTarget, setDeleteTarget] = useState<SavedConnection | null>(
     null,
   );
+  const [renamingGroup, setRenamingGroup] = useState<string | null>(null);
+  const [renameInput, setRenameInput] = useState('');
+  // 折叠状态（key = 分组名）
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
+    try {
+      const stored = localStorage.getItem('marcel-collapsed-connection-groups');
+      return stored ? new Set(JSON.parse(stored)) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
   // 后台保活提示：仅在连接列表页（未连上）显示
   const keepAliveEnabled = useSettingsStore(
     (s) => s.settings.mobileBackgroundSettings.keepAliveEnabled,
@@ -142,6 +154,24 @@ export default function MobileConnectionList({
   const handleKeepAliveNeverShow = () => {
     dismissKeepAliveTipPermanently();
     setKeepAliveDismissedForever(true);
+  };
+
+  /** 切换分组的折叠状态（点击标题时）。 */
+  const toggleGroupCollapse = (groupName: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupName)) {
+        next.delete(groupName);
+      } else {
+        next.add(groupName);
+      }
+      try {
+        localStorage.setItem('marcel-collapsed-connection-groups', JSON.stringify([...next]));
+      } catch {
+        // localStorage 失败不阻止切换
+      }
+      return next;
+    });
   };
 
   useEffect(() => {
@@ -464,6 +494,33 @@ export default function MobileConnectionList({
     setDeleteTarget(null);
   };
 
+  const handleStartRenameGroup = (groupName: string) => {
+    setRenamingGroup(groupName);
+    setRenameInput(groupName);
+  };
+
+  const handleConfirmRenameGroup = async () => {
+    if (!renamingGroup) return;
+    const trimmed = renameInput.trim();
+    if (trimmed !== renamingGroup) {
+      setLocalError(null);
+      await renameGroup(renamingGroup, trimmed);
+      // 重命名后更新折叠状态的 key（旧名字的折叠状态丢弃）
+      setCollapsedGroups((prev) => {
+        const next = new Set(prev);
+        next.delete(renamingGroup);
+        return next;
+      });
+    }
+    setRenamingGroup(null);
+    setRenameInput('');
+  };
+
+  const handleCancelRenameGroup = () => {
+    setRenamingGroup(null);
+    setRenameInput('');
+  };
+
   const displayError = localError ?? error;
 
   /** 删除确认里的连接称谓：名字优先，没名字就退到脱敏口径的 user@host:port。 */
@@ -538,78 +595,155 @@ export default function MobileConnectionList({
           </div>
         )}
 
-        <ul className="flex flex-col gap-2">
-          {connections.map((conn) => {
-            const busy = connectingId === conn.id;
-            const groupName = groupNameOf(conn);
-            const dragging = drag.draggingId === conn.id;
-            return (
-              <li
-                key={conn.id}
-                ref={drag.registerItem(conn.id)}
-                onTouchStart={drag.onTouchStart(conn.id)}
-                onTouchMove={drag.onTouchMovePending}
-                onTouchEnd={drag.onTouchEndPending}
-                onTouchCancel={drag.onTouchEndPending}
-                style={{ transform: drag.translateFor(conn.id) }}
-                className={
-                  // 被拖的行必须零过渡（跟手 1:1）；其余行保留过渡，拖拽时才有让位动画
-                  dragging
-                    ? 'relative z-10 shadow-xl shadow-black/40'
-                    : `transition-transform ${drag.isDragging ? 'duration-150' : ''}`
-                }
+        {groupConnections(connections).map((group) => {
+          const isCollapsed = collapsedGroups.has(group.name);
+          return (
+            <div key={group.name} className="mb-4">
+              <div
+                className="mb-2 flex w-full items-center gap-2 px-1 py-1"
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  handleStartRenameGroup(group.name);
+                }}
               >
-                <div className="flex w-full items-center rounded-xl border border-zinc-800 bg-zinc-900 pr-1">
-                  <button
-                    type="button"
-                    disabled={busy || connectingId != null}
-                    onClick={() => {
-                      // 长按拖拽松手后的合成点击要忽略，否则一拖就顺带连上了
-                      if (drag.shouldSuppressClick()) return;
-                      void handleConnect(conn);
+                <button
+                  type="button"
+                  onClick={() => toggleGroupCollapse(group.name)}
+                  className="flex items-center gap-2 active:opacity-70"
+                >
+                  <svg
+                    className={`h-4 w-4 flex-shrink-0 text-zinc-500 transition-transform duration-[280ms] ${isCollapsed ? '' : 'rotate-90'}`}
+                    style={{ transitionTimingFunction: 'cubic-bezier(0.32, 0.72, 0, 1)' }}
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                  </svg>
+                </button>
+                {renamingGroup === group.name ? (
+                  <input
+                    type="text"
+                    value={renameInput}
+                    onChange={(e) => setRenameInput(e.target.value)}
+                    onBlur={handleConfirmRenameGroup}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        void handleConfirmRenameGroup();
+                      } else if (e.key === 'Escape') {
+                        handleCancelRenameGroup();
+                      }
                     }}
-                    className="flex min-w-0 flex-1 items-center gap-3 rounded-l-xl px-3 py-3 text-left active:scale-[0.99] disabled:opacity-60"
-                  >
-                    <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-lg bg-zinc-800 text-indigo-400">
-                      {busy ? (
-                        <Loader2 className="h-5 w-5 animate-spin" />
-                      ) : (
-                        <Server className="h-5 w-5" />
-                      )}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm font-medium text-zinc-100">
-                        {conn.name || formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}
-                      </div>
-                      <div className="truncate text-xs text-zinc-500">
-                        {formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}
-                        {groupName !== UNGROUPED_NAME && ` · ${groupName}`}
-                      </div>
-                    </div>
-                  </button>
+                    autoFocus
+                    className="flex-1 bg-zinc-800 text-zinc-200 px-2 py-1 rounded text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                ) : (
                   <button
                     type="button"
-                    data-nodrag
-                    onClick={() => openEditForm(conn)}
-                    className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg text-zinc-400 active:bg-zinc-800"
-                    aria-label={`编辑 ${conn.name}`}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      handleStartRenameGroup(group.name);
+                    }}
+                    className="flex flex-1 items-center gap-2 text-left"
                   >
-                    <Pencil className="h-4 w-4" />
+                    <span className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+                      {group.name}
+                    </span>
+                    <span className="text-xs text-zinc-600">({group.items.length})</span>
                   </button>
-                  <button
-                    type="button"
-                    data-nodrag
-                    onClick={() => setDeleteTarget(conn)}
-                    className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg text-zinc-500 active:bg-zinc-800 active:text-red-400"
-                    aria-label={`删除 ${conn.name}`}
+                )}
+              </div>
+
+              <div
+                className={`grid transition-all duration-[280ms] ${
+                  isCollapsed ? 'grid-rows-[0fr]' : 'grid-rows-[1fr]'
+                }`}
+                style={{ transitionTimingFunction: 'cubic-bezier(0.32, 0.72, 0, 1)' }}
+              >
+                <div className="overflow-hidden">
+                  <ul
+                    className={`flex flex-col gap-2 transition-all duration-[220ms] ${
+                      isCollapsed ? '-translate-y-1 opacity-0' : 'translate-y-0 opacity-100'
+                    }`}
+                    style={{ 
+                      transitionTimingFunction: 'cubic-bezier(0.32, 0.72, 0, 1)',
+                      transitionDelay: isCollapsed ? '0ms' : '50ms'
+                    }}
                   >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
+                    {group.items.map((conn) => {
+                    const busy = connectingId === conn.id;
+                    const dragging = drag.draggingId === conn.id;
+                    return (
+                      <li
+                        key={conn.id}
+                        ref={drag.registerItem(conn.id)}
+                        onTouchStart={drag.onTouchStart(conn.id)}
+                        onTouchMove={drag.onTouchMovePending}
+                        onTouchEnd={drag.onTouchEndPending}
+                        onTouchCancel={drag.onTouchEndPending}
+                        style={{ transform: drag.translateFor(conn.id) }}
+                        className={
+                          // 被拖的行必须零过渡（跟手 1:1）；其余行保留过渡，拖拽时才有让位动画
+                          dragging
+                            ? 'relative z-10 shadow-xl shadow-black/40'
+                            : `transition-transform ${drag.isDragging ? 'duration-150' : ''}`
+                        }
+                      >
+                        <div className="flex w-full items-center rounded-xl border border-zinc-800 bg-zinc-900 pr-1">
+                          <button
+                            type="button"
+                            disabled={busy || connectingId != null}
+                            onClick={() => {
+                              // 长按拖拽松手后的合成点击要忽略，否则一拖就顺带连上了
+                              if (drag.shouldSuppressClick()) return;
+                              void handleConnect(conn);
+                            }}
+                            className="flex min-w-0 flex-1 items-center gap-3 rounded-l-xl px-3 py-3 text-left active:scale-[0.99] disabled:opacity-60"
+                          >
+                            <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-lg bg-zinc-800 text-indigo-400">
+                              {busy ? (
+                                <Loader2 className="h-5 w-5 animate-spin" />
+                              ) : (
+                                <Server className="h-5 w-5" />
+                              )}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate text-sm font-medium text-zinc-100">
+                                {conn.name || formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}
+                              </div>
+                              <div className="truncate text-xs text-zinc-500">
+                                {formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}
+                              </div>
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            data-nodrag
+                            onClick={() => openEditForm(conn)}
+                            className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg text-zinc-400 active:bg-zinc-800"
+                            aria-label={`编辑 ${conn.name}`}
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            data-nodrag
+                            onClick={() => setDeleteTarget(conn)}
+                            className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg text-zinc-500 active:bg-zinc-800 active:text-red-400"
+                            aria-label={`删除 ${conn.name}`}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                  </ul>
                 </div>
-              </li>
-            );
-          })}
-        </ul>
+              </div>
+            </div>
+          );
+        })}
       </div>
 
       {showKeepAliveTip && (

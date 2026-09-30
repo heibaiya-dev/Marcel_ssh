@@ -3,6 +3,7 @@ import type { SavedConnection } from "@/lib/types";
 import * as tauri from "@/lib/tauri";
 import type { ConnectionOrderEntry } from "@/lib/tauri";
 import { getErrorMessage } from "@/lib/errors";
+import { groupNameOf, toOrderEntries } from "@/lib/connectionOrder";
 
 interface ConnectionState {
   connections: SavedConnection[];
@@ -15,6 +16,8 @@ interface ConnectionState {
   removeConnection: (id: string) => Promise<void>;
   /** 应用拖拽后的顺序（组内重排 / 跨组移入 / 拖动分组）：乐观更新，失败回滚。 */
   applyConnectionOrder: (entries: ConnectionOrderEntry[]) => Promise<void>;
+  /** 重命名分组：批量更新该组所有连接的 group 字段。 */
+  renameGroup: (oldName: string, newName: string) => Promise<void>;
   setActiveConnection: (id: string | null) => void;
 }
 
@@ -85,6 +88,30 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
     set({ connections: next, error: null });
     try {
       await tauri.applyConnectionOrder(entries);
+    } catch (err) {
+      set({ connections: prev, error: getErrorMessage(err) });
+    }
+  },
+
+  /**
+   * 重命名分组：批量更新该组所有连接的 group 字段。
+   * 乐观更新，失败回滚。空名字或纯空白当作「未分组」。
+   */
+  renameGroup: async (oldName: string, newName: string) => {
+    const trimmedNew = newName.trim();
+    if (trimmedNew === oldName) return; // 没改
+    
+    const prev = get().connections;
+    const next = prev.map((conn) => {
+      if (groupNameOf(conn) !== oldName) return conn;
+      // 新名字为空 = 移到「未分组」
+      const group = trimmedNew === '' ? undefined : trimmedNew;
+      return { ...conn, group };
+    });
+
+    set({ connections: next, error: null });
+    try {
+      await tauri.applyConnectionOrder(toOrderEntries(next));
     } catch (err) {
       set({ connections: prev, error: getErrorMessage(err) });
     }
