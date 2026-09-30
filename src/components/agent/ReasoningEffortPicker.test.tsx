@@ -329,6 +329,16 @@ describe('ReasoningEffortPicker', () => {
     expect(slider().getAttribute('aria-valuetext')).toBe('默认');
   });
 
+  it('keeps the full-power animation when max is the final level', async () => {
+    await renderPicker({ efforts: ['low', 'max'], initialValue: 'low' });
+    await click(trigger());
+
+    await dragTo(2);
+    expect(slider().getAttribute('aria-valuetext')).toBe('最高');
+    expect(dialog().classList.contains('reasoning-effort-ultra')).toBe(true);
+    expect(dialog().querySelector('.reasoning-effort-stars')).not.toBeNull();
+  });
+
   it('keeps the model-settings entry visible and opens model choices when efforts are unavailable', async () => {
     const onChange = await renderPicker({ efforts: [], modelName: '6 Astra' });
     // The registry is optional in the standalone picker; the parent passes it
@@ -353,7 +363,8 @@ describe('ReasoningEffortPicker', () => {
     });
     await click(trigger());
     expect(document.querySelector('input[type="range"]')).toBeNull();
-    expect(dialog().textContent).toContain('选择模型');
+    expect(dialog().textContent).not.toContain('选择模型');
+    expect(dialog().querySelector('[role="listbox"]')?.getAttribute('aria-label')).toBe('选择模型');
     expect(dialog().textContent).toContain('6 Astra');
     expect(onChange).not.toHaveBeenCalled();
   });
