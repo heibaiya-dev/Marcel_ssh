@@ -899,11 +899,6 @@ export async function appReady(): Promise<void> {
   return invoke("app_ready");
 }
 
-/** Exit the application, or simulate unavailable application IPC while retaining the UI. */
-export async function debugShutdownBackend(keepFrontendOpen: boolean): Promise<void> {
-  return invoke("debug_shutdown_backend", { keepFrontendOpen });
-}
-
 // Update check
 
 export async function checkUpdate(): Promise<UpdateCheckResult> {

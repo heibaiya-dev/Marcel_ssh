@@ -5,7 +5,6 @@ pub mod agent_lifecycle;
 pub mod agent_policy;
 pub mod app_bootstrap;
 pub mod connections;
-pub mod debug;
 pub mod job;
 pub mod keychain;
 pub mod market;
