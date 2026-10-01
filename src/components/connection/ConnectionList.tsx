@@ -107,6 +107,7 @@ export default function ConnectionList() {
   const addConnection = useConnectionStore((s) => s.addConnection);
   const removeConnection = useConnectionStore((s) => s.removeConnection);
   const applyConnectionOrder = useConnectionStore((s) => s.applyConnectionOrder);
+  const renameGroup = useConnectionStore((s) => s.renameGroup);
   const activeConnectionId = useConnectionStore((s) => s.activeConnectionId);
   const setActiveConnection = useConnectionStore((s) => s.setActiveConnection);
   const connect = useSessionStore((s) => s.connect);
@@ -121,6 +122,13 @@ export default function ConnectionList() {
     y: number;
     connection: SavedConnection;
   } | null>(null);
+  const [groupContextMenu, setGroupContextMenu] = useState<{
+    x: number;
+    y: number;
+    groupName: string;
+  } | null>(null);
+  const [renamingGroup, setRenamingGroup] = useState<string | null>(null);
+  const [renameInput, setRenameInput] = useState('');
   const [formOpen, setFormOpen] = useState(false);
   const [editingConnection, setEditingConnection] =
     useState<SavedConnection | undefined>(undefined);
@@ -132,6 +140,15 @@ export default function ConnectionList() {
    * 红条，桌面补齐成同一套。
    */
   const [localError, setLocalError] = useState<string | null>(null);
+  // 折叠状态（key = 分组名；搜索时忽略）
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
+    try {
+      const stored = localStorage.getItem('marcel-collapsed-connection-groups');
+      return stored ? new Set(JSON.parse(stored)) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
   // 拖拽排序状态：拖连接、拖分组各一套落点
   const [dragSubject, setDragSubject] = useState<DragSubject | null>(null);
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
@@ -943,6 +960,41 @@ export default function ConnectionList() {
 
   const closeContextMenu = () => setContextMenu(null);
 
+  const handleGroupContextMenu = (e: React.MouseEvent, groupName: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setGroupContextMenu({ x: e.clientX, y: e.clientY, groupName });
+  };
+
+  const closeGroupContextMenu = () => setGroupContextMenu(null);
+
+  const handleStartRenameGroup = (groupName: string) => {
+    setRenamingGroup(groupName);
+    setRenameInput(groupName);
+    closeGroupContextMenu();
+  };
+
+  const handleConfirmRenameGroup = async () => {
+    if (!renamingGroup) return;
+    const trimmed = renameInput.trim();
+    if (trimmed !== renamingGroup) {
+      await renameGroup(renamingGroup, trimmed);
+      // 重命名后更新折叠状态的 key（旧名字的折叠状态丢弃）
+      setCollapsedGroups((prev) => {
+        const next = new Set(prev);
+        next.delete(renamingGroup);
+        return next;
+      });
+    }
+    setRenamingGroup(null);
+    setRenameInput('');
+  };
+
+  const handleCancelRenameGroup = () => {
+    setRenamingGroup(null);
+    setRenameInput('');
+  };
+
   const handleSave = async (saved: SavedConnection) => {
     await addConnection(saved);
     setFormOpen(false);
@@ -968,6 +1020,25 @@ export default function ConnectionList() {
     const index = siblings.findIndex((c) => c.id === contextMenu.connection.id);
     return { up: index > 0, down: index >= 0 && index < siblings.length - 1 };
   }, [connections, contextMenu]);
+
+  /** 切换分组的折叠状态（点击标题时）。 */
+  const toggleGroupCollapse = useCallback((groupName: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupName)) {
+        next.delete(groupName);
+      } else {
+        next.add(groupName);
+      }
+      try {
+        localStorage.setItem('marcel-collapsed-connection-groups', JSON.stringify([...next]));
+      } catch {
+        // localStorage 失败不阻止切换
+      }
+      return next;
+    });
+  }, []);
+
 
   const contextMenuItems = contextMenu
     ? [
@@ -1070,6 +1141,7 @@ export default function ConnectionList() {
                   ? 'below'
                   : null
               : null;
+          const isCollapsed = !isFiltering && collapsedGroups.has(group.name);
           return (
             <Fragment key={group.name}>
               <div
@@ -1085,10 +1157,23 @@ export default function ConnectionList() {
                   data-group-name={group.name}
                   style={shiftStyle(headerOffset(group.name))}
                   onMouseDown={
-                    isFiltering ? undefined : startPointerDrag({ kind: 'group', name: group.name })
+                    isFiltering
+                      ? undefined
+                      : (e) => {
+                          // 拖拽与点击折叠用同一个按钮：记下起点，松手时位移没超过阈值才算点击
+                          startPointerDrag({ kind: 'group', name: group.name })(e);
+                        }
                   }
-                  title={isFiltering ? undefined : '拖动分组标题可调整分组顺序'}
-                  className={`text-xs font-semibold text-zinc-500 uppercase tracking-wider px-2 mb-1 ${
+                  onClick={(e) => {
+                    // 拖拽松手会产生合成点击，只有没拖动才算真点击
+                    if (Date.now() < suppressClickUntilRef.current) return;
+                    if (isFiltering) return;
+                    e.stopPropagation();
+                    toggleGroupCollapse(group.name);
+                  }}
+                  onContextMenu={(e) => handleGroupContextMenu(e, group.name)}
+                  title={isFiltering ? undefined : '点击折叠/展开；拖动调整分组顺序；右键重命名'}
+                  className={`flex items-center gap-1.5 text-xs font-semibold text-zinc-500 uppercase tracking-wider px-2 mb-1 ${
                     isFiltering ? '' : 'cursor-grab active:cursor-grabbing'
                   } ${
                     dragSubject?.kind === 'group' && dragSubject.name === group.name
@@ -1096,32 +1181,79 @@ export default function ConnectionList() {
                       : ''
                   } ${groupLine === 'above' ? LINE_ABOVE : ''}`}
                 >
-                  {group.name}
+                  {!isFiltering && (
+                    <svg
+                      className={`w-3 h-3 transition-transform duration-[280ms] ${isCollapsed ? '' : 'rotate-90'}`}
+                      style={{ transitionTimingFunction: 'cubic-bezier(0.32, 0.72, 0, 1)' }}
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                    </svg>
+                  )}
+                  {renamingGroup === group.name ? (
+                    <input
+                      type="text"
+                      value={renameInput}
+                      onChange={(e) => setRenameInput(e.target.value)}
+                      onBlur={handleConfirmRenameGroup}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          handleConfirmRenameGroup();
+                        } else if (e.key === 'Escape') {
+                          handleCancelRenameGroup();
+                        }
+                        e.stopPropagation();
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      autoFocus
+                      className="flex-1 bg-zinc-800 text-zinc-200 px-2 py-0.5 rounded normal-case tracking-normal text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                  ) : (
+                    <span>{group.name}</span>
+                  )}
                 </h3>
-                <div className="space-y-1">
-                  {group.items.map((conn, indexInGroup) => {
-                    const rowLine =
-                      dragSubject?.kind === 'row' && dropTarget?.group === group.name
-                        ? dropTarget.beforeId === conn.id
-                          ? 'above'
-                          : dropTarget.beforeId === null && indexInGroup === group.items.length - 1
-                            ? 'below'
-                            : null
-                        : null;
-                    const line = rowLine ?? (groupLine === 'below' && conn.id === lastItemId ? 'below' : null);
-                    return (
-                      <button
-                        key={conn.id}
-                        data-conn-id={conn.id}
-                        style={shiftStyle(rowOffset(conn))}
-                        onClick={() => {
-                          // 拖拽松手后的合成点击要忽略，否则一拖就顺带连上了
-                          if (Date.now() < suppressClickUntilRef.current) return;
-                          handleConnect(conn);
-                        }}
-                        onContextMenu={(e) => handleContextMenu(e, conn)}
-                        onMouseDown={startPointerDrag({ kind: 'row', id: conn.id })}
-                        className={`
+                <div
+                  className={`grid transition-all duration-[280ms] ${
+                    isCollapsed ? 'grid-rows-[0fr]' : 'grid-rows-[1fr]'
+                  }`}
+                  style={{ transitionTimingFunction: 'cubic-bezier(0.32, 0.72, 0, 1)' }}
+                >
+                  <div className="overflow-hidden">
+                    <div
+                      className={`space-y-1 transition-all duration-[220ms] ${
+                        isCollapsed ? '-translate-y-1 opacity-0' : 'translate-y-0 opacity-100'
+                      }`}
+                      style={{
+                        transitionTimingFunction: 'cubic-bezier(0.32, 0.72, 0, 1)',
+                        transitionDelay: isCollapsed ? '0ms' : '50ms'
+                      }}
+                    >
+                      {group.items.map((conn, indexInGroup) => {
+                      const rowLine =
+                        dragSubject?.kind === 'row' && dropTarget?.group === group.name
+                          ? dropTarget.beforeId === conn.id
+                            ? 'above'
+                            : dropTarget.beforeId === null && indexInGroup === group.items.length - 1
+                              ? 'below'
+                              : null
+                          : null;
+                      const line = rowLine ?? (groupLine === 'below' && conn.id === lastItemId ? 'below' : null);
+                      return (
+                        <button
+                          key={conn.id}
+                          data-conn-id={conn.id}
+                          style={shiftStyle(rowOffset(conn))}
+                          onClick={() => {
+                            // 拖拽松手后的合成点击要忽略，否则一拖就顺带连上了
+                            if (Date.now() < suppressClickUntilRef.current) return;
+                            handleConnect(conn);
+                          }}
+                          onContextMenu={(e) => handleContextMenu(e, conn)}
+                          onMouseDown={startPointerDrag({ kind: 'row', id: conn.id })}
+                          className={`
                     w-full text-left px-2 py-2 rounded-lg text-sm transition-colors border
                     ${
                       dragSubject?.kind === 'row' && dragSubject.id === conn.id
@@ -1135,21 +1267,23 @@ export default function ConnectionList() {
                         : 'bg-zinc-900/40 border-zinc-800 hover:border-zinc-700'
                     }
                   `}
-                      >
-                        <div className="font-medium text-zinc-200 truncate">
-                          {conn.name}
-                        </div>
-                        <div className="text-xs text-zinc-500 truncate">
-                          {formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}
-                        </div>
-                        {conn.lastConnected && (
-                          <div className="text-xs text-zinc-600 mt-0.5">
-                            上次连接：{new Date(conn.lastConnected).toLocaleDateString()}
+                        >
+                          <div className="font-medium text-zinc-200 truncate">
+                            {conn.name}
                           </div>
-                        )}
-                      </button>
-                    );
-                  })}
+                          <div className="text-xs text-zinc-500 truncate">
+                            {formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}
+                          </div>
+                          {conn.lastConnected && (
+                            <div className="text-xs text-zinc-600 mt-0.5">
+                              上次连接：{new Date(conn.lastConnected).toLocaleDateString()}
+                            </div>
+                          )}
+                        </button>
+                      );
+                    })}
+                    </div>
+                  </div>
                 </div>
               </div>
             </Fragment>
@@ -1164,6 +1298,21 @@ export default function ConnectionList() {
           y={contextMenu.y}
           items={contextMenuItems}
           onClose={closeContextMenu}
+        />
+      )}
+
+      {/* Group context menu */}
+      {groupContextMenu && (
+        <ContextMenu
+          x={groupContextMenu.x}
+          y={groupContextMenu.y}
+          items={[
+            {
+              label: '重命名分组',
+              onClick: () => handleStartRenameGroup(groupContextMenu.groupName),
+            },
+          ]}
+          onClose={closeGroupContextMenu}
         />
       )}
 
