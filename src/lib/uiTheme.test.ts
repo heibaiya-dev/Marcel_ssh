@@ -491,7 +491,7 @@ describe("系统外框同步（状态栏图标 / 窗口底色 / 冷启动底色�
     expect(seen).toHaveLength(2);
   });
 
-  it("揭开动画期间系统栏图标等圆扫过去再翻，不是切换瞬间", () => {
+  it("系统栏图标等揭开动画播完再翻，不是切换瞬间也不在动画中途", () => {
     vi.useFakeTimers();
     doc.startViewTransition = vi.fn(() => ({ ready: Promise.resolve() }));
     applyUiTheme(dark, false);
@@ -500,7 +500,9 @@ describe("系统外框同步（状态栏图标 / 窗口底色 / 冷启动底色�
     seen.length = 0;
     applyUiTheme(light, true);
     expect(seen).toEqual([]);
-    vi.advanceTimersByTime(1000);
+    vi.advanceTimersByTime(500); // 动画中途（750ms 时长）不翻
+    expect(seen).toEqual([]);
+    vi.advanceTimersByTime(500);
     expect(seen).toEqual(["light"]);
     off();
   });
@@ -515,7 +517,8 @@ describe("系统外框同步（状态栏图标 / 窗口底色 / 冷启动底色�
     applyUiTheme(light, true);
     applyUiTheme(dark, true);
     vi.advanceTimersByTime(1000);
-    expect(seen[seen.length - 1]).toBe("dark");
+    // 最终是 dark，且中途没有把 light 推出去（dark 与已通知的一致，不重复通知）
+    expect(seen).not.toContain("light");
     off();
   });
 

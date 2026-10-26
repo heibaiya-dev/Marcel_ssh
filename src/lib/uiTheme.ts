@@ -799,8 +799,9 @@ export interface UiThemeChrome {
 const chromeListeners = new Set<(chrome: UiThemeChrome) => void>();
 let lastChrome: UiThemeChrome | null = null;
 let chromeTimer: number | undefined;
-/** 揭开动画里系统栏图标翻色的时机（占总时长的比例）：栏在屏幕边缘，圆扫到那里大约过半。 */
-const CHROME_FLIP_AT = 0.5;
+/** 系统栏图标翻色放在揭开动画播完之后再多等这么久。原生那头设图标明暗、窗口与 WebView
+ *  底色会让系统重排一次窗口，放在动画中途就是肉眼可见的顿一下；等圆扫完再做，卡也卡在动画外。 */
+const CHROME_SETTLE_MS = 120;
 
 function resolveThemeChrome(theme: UiThemeSettings): UiThemeChrome {
   return {
@@ -821,6 +822,14 @@ function notifyChrome(
 }
 
 function publishChrome(chrome: UiThemeChrome): void {
+  // 底色与明暗都没变就别再通知：原生那头每次都要动系统窗口，拖自定义颜色时尤其频繁
+  if (
+    lastChrome &&
+    lastChrome.background === chrome.background &&
+    lastChrome.scheme === chrome.scheme
+  ) {
+    return;
+  }
   lastChrome = chrome;
   for (const listener of chromeListeners) notifyChrome(listener, chrome);
 }
@@ -971,11 +980,11 @@ export function applyUiTheme(theme: UiThemeSettings, animate = true): void {
     startRevealTransition(doc, () => {
       if (latestTheme) writeThemeToDom(latestTheme);
     });
-    // 系统栏图标等圆扫过去再翻：现在就翻会在栏还是旧底色时变得看不清。
+    // 系统栏图标等圆扫完再翻（见 CHROME_SETTLE_MS）：动画中途动系统窗口会顿一下。
     window.clearTimeout(chromeTimer);
     chromeTimer = window.setTimeout(() => {
       if (latestTheme) publishChrome(resolveThemeChrome(latestTheme));
-    }, REVEAL_MS * CHROME_FLIP_AT);
+    }, REVEAL_MS + CHROME_SETTLE_MS);
     return;
   }
   writeThemeToDom(theme);

@@ -312,14 +312,23 @@ class MainActivity : TauriActivity() {
       Log.w(TAG, "applySystemChrome: 无法解析底色 $background")
       null
     }
+    // 每一项只在真变了才动：设图标明暗、换窗口 / WebView 底色都会让系统重排一次窗口，
+    // 页面拖自定义颜色时会连着推，没变的不该白白触发（也是主题切换动画里的顿挫来源）。
+    val backgroundChanged = parsed != null && parsed != chromeBackground
+    val lightChanged = light != chromeLight
+    if (!backgroundChanged && !lightChanged) return
     if (parsed != null) chromeBackground = parsed
     chromeLight = light
 
-    val controller = WindowCompat.getInsetsController(window, window.decorView)
-    controller.isAppearanceLightStatusBars = light
-    controller.isAppearanceLightNavigationBars = light
-    window.setBackgroundDrawable(ColorDrawable(chromeBackground))
-    webViewRef?.setBackgroundColor(chromeBackground)
+    if (lightChanged) {
+      val controller = WindowCompat.getInsetsController(window, window.decorView)
+      controller.isAppearanceLightStatusBars = light
+      controller.isAppearanceLightNavigationBars = light
+    }
+    if (backgroundChanged) {
+      window.setBackgroundDrawable(ColorDrawable(chromeBackground))
+      webViewRef?.setBackgroundColor(chromeBackground)
+    }
 
     getSharedPreferences(CHROME_PREFS, MODE_PRIVATE).edit()
       .putInt(KEY_CHROME_BG, chromeBackground)

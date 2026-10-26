@@ -1,9 +1,14 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyUiTheme, getUiThemePreset } from "@/lib/uiTheme";
 import { bindSystemChromeToTheme, setSystemChrome } from "./mobileBridge";
 
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
 afterEach(() => {
+  vi.useRealTimers();
   delete window.AndroidBridge;
   localStorage.clear();
 });
@@ -50,6 +55,26 @@ describe("bindSystemChromeToTheme", () => {
     bindSystemChromeToTheme(); // 幂等
     const obsidian = getUiThemePreset("obsidian")!;
     applyUiTheme({ presetId: "obsidian", zones: { ...obsidian.zones } }, false);
+    vi.advanceTimersByTime(300);
     expect(native).toHaveBeenLastCalledWith(obsidian.zones.bg, false);
+  });
+
+  it("连续变化限流：间隔内只保留最后一个，拖颜色不会每帧都去动系统窗口", () => {
+    const native = vi.fn();
+    window.AndroidBridge = bridge(native);
+    vi.advanceTimersByTime(1000);
+    native.mockClear();
+    const daylight = getUiThemePreset("daylight")!;
+    const obsidian = getUiThemePreset("obsidian")!;
+    for (const bg of ["#101010", "#202020", "#303030"]) {
+      applyUiTheme(
+        { presetId: "custom", zones: { ...obsidian.zones, bg } },
+        false,
+      );
+    }
+    applyUiTheme({ presetId: "daylight", zones: { ...daylight.zones } }, false);
+    vi.advanceTimersByTime(1000);
+    expect(native.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(native).toHaveBeenLastCalledWith(daylight.zones.bg, true);
   });
 });

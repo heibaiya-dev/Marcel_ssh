@@ -78,11 +78,37 @@ export function setSystemChrome(chrome: UiThemeChrome): void {
   }
 }
 
+/** 两次推给原生的最短间隔：拖自定义颜色时外框底色每帧都在变，原生每次都要动系统窗口，
+ *  不限流会拖垮拖动的跟手度。首次立即推，间隔内的后续变化只保留最后一个。 */
+const CHROME_PUSH_MIN_INTERVAL_MS = 250;
+let chromeLastPushAt = 0;
+let chromePending: UiThemeChrome | null = null;
+let chromePushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function pushChromeThrottled(chrome: UiThemeChrome): void {
+  const wait = chromeLastPushAt + CHROME_PUSH_MIN_INTERVAL_MS - Date.now();
+  if (wait <= 0 && !chromePushTimer) {
+    chromeLastPushAt = Date.now();
+    setSystemChrome(chrome);
+    return;
+  }
+  chromePending = chrome;
+  if (chromePushTimer) return;
+  chromePushTimer = setTimeout(() => {
+    chromePushTimer = null;
+    const latest = chromePending;
+    chromePending = null;
+    if (!latest) return;
+    chromeLastPushAt = Date.now();
+    setSystemChrome(latest);
+  }, Math.max(wait, 0));
+}
+
 /** 订阅主题外框：此后每次主题落定都同步给原生（订阅时会回放当前的）。幂等。 */
 let chromeUnsubscribe: (() => void) | null = null;
 export function bindSystemChromeToTheme(): void {
   if (chromeUnsubscribe || !isAndroidBridgeAvailable()) return;
-  chromeUnsubscribe = onUiThemeChrome(setSystemChrome);
+  chromeUnsubscribe = onUiThemeChrome(pushChromeThrottled);
 }
 
 /** 启动前台保活服务。已运行则更新通知文案。 */
