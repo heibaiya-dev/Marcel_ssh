@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 
 interface Props<T> {
   /** 当前值；变化时播一遍「新内容自左向右扫过旧内容」的过渡。 */
@@ -29,7 +29,8 @@ export default function SweepTransition<T>({ value, render, className = '', styl
   // id 只增不减、结束后也保留：顶层 key 不变，扫完不会重挂载
   const [sweep, setSweep] = useState<{ from: T; id: number; active: boolean } | null>(null);
 
-  useEffect(() => {
+  // 用 layout effect：值变化的那一帧还没绘制就把扫光层挂上，否则会先闪一帧「已经是新内容」再从头扫
+  useLayoutEffect(() => {
     if (Object.is(shown.current, value)) return;
     const from = shown.current;
     shown.current = value;
@@ -47,7 +48,9 @@ export default function SweepTransition<T>({ value, render, className = '', styl
   return (
     <div aria-label={ariaLabel} className={`relative grid overflow-hidden ${className}`} style={style}>
       {active && sweep && (
-        <div className="col-start-1 row-start-1 sweep-hide" aria-hidden>
+        // key 与新层同步：连续换值时旧层必须跟新层一起从头起动画。旧层若复用上一轮的元素，
+        // 它的蒙版进度会比新层超前，两层之间就出现「谁都没显示」的空白带（快速连点字体时发生）
+        <div key={`hide-${sweep.id}`} className="col-start-1 row-start-1 sweep-hide" aria-hidden>
           {render(sweep.from)}
         </div>
       )}
