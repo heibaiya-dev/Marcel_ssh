@@ -1459,6 +1459,27 @@ export interface CommandCheckResult {
   hits: CommandRuleHit[];
 }
 
+/** 总览表一个格子的结论：问你 / 直接执行 / 拒绝（后端真实判定算出，前端不自己推）。 */
+export type OverviewVerdict = 'ask' | 'run' | 'deny';
+
+export interface OverviewCell {
+  verdict: OverviewVerdict;
+  /** 白名单下，名单内的命令在这一格的结论；缺省 = 与 verdict 一样。 */
+  listed?: OverviewVerdict | null;
+}
+
+/** 总览表的一行；`level` 为 `Allow` 表示「没命中任何规则」。 */
+export interface OverviewRow {
+  level: Disposition;
+  agent: OverviewCell;
+  plan: OverviewCell;
+  auto: OverviewCell;
+}
+
+export interface ApprovalOverview {
+  rows: OverviewRow[];
+}
+
 /** 说明模板里的一个占位：`{name}` 在命中时换成实际值。 */
 export interface ReasonVar {
   name: string;

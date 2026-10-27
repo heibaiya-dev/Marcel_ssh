@@ -30,6 +30,8 @@ import type {
   StoredKeyMeta,
   KeyOriginStatus,
   AppSettings,
+  AgentModeSettings,
+  ApprovalOverview,
   AgentConversation,
   StoredMessage,
   UserInputMetadata,
@@ -640,6 +642,18 @@ export async function agentCheckCommand(
   });
 }
 
+/**
+ * 「什么时候问你」总览表：命令类工具在当前审批设置下，每一档 × 每个模式会怎样。
+ * `draft` 是设置页里还没保存的审批设置，缺省用已保存的。
+ */
+export async function agentApprovalOverview(
+  draft?: AgentModeSettings,
+): Promise<ApprovalOverview> {
+  return invoke<ApprovalOverview>("agent_approval_overview", {
+    draft: draft ?? null,
+  });
+}
+
 /** 全部内置命令风险规则的目录（说明、默认档位、名单默认值）。用户的改动在 settings 里。 */
 export async function agentListRiskRules(): Promise<RiskRuleCatalog> {
   return invoke<RiskRuleCatalog>("agent_list_risk_rules");
@@ -653,6 +667,11 @@ export async function agentListApprovableTools(): Promise<string[]> {
 /** 内置的命令审批系统提示词（设置页默认值展示 / 「恢复默认」用，不在前端自带副本）。 */
 export async function agentDefaultApprovalPrompt(): Promise<string> {
   return invoke<string>("agent_default_approval_prompt");
+}
+
+/** 内置的 Jev 判据（设置页预填 / 「恢复默认」用，不在前端自带副本）。 */
+export async function agentDefaultJevPrompt(): Promise<string> {
+  return invoke<string>("agent_default_jev_prompt");
 }
 
 // Config commands

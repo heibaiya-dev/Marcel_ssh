@@ -192,7 +192,7 @@ export default function McpList() {
                     {server.trusted ? '已信任' : '默认需审批'}
                   </div>
                   {confirmEachCommand && server.trusted && (
-                    <p className="text-xs text-amber-400">已开启「每条都手动确认」，信任后仍需手动审批</p>
+                    <p className="text-xs text-amber-400">命令确认方式是「每条都确认」，信任后仍需手动审批</p>
                   )}
                   {tools.map((tool) => (
                     <div key={tool.name} className="border-t border-edge-subtle pt-1 first:border-t-0 first:pt-0">

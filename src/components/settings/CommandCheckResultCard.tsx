@@ -29,11 +29,17 @@ export function CommandCheckResultCard({
   results,
   onJump,
   compact,
+  modelApprovalOn,
 }: {
   results: { mode: CheckMode; result: CommandCheckResult }[];
   /** 点一条命中的规则：调用方负责跳到它（内置规则进二级页，自定义规则滚到主页面那一行）。 */
   onJump: (ruleId: string) => void;
   compact?: boolean;
+  /**
+   * 「执行前模型审批」开着：测试只模拟规则这一关，不会真去问模型，所以结论下面要提醒一句 ——
+   * 模型审批能把规则放行的命令拦下（任何模式），「直接执行」只是规则这一关的结论。
+   */
+  modelApprovalOn?: boolean;
 }) {
   const groups = groupOutcomes(results);
   // 档位与模式无关，各模式命中的规则一样；取 Agent 那份。
@@ -82,6 +88,11 @@ export function CommandCheckResultCard({
         </div>
       ) : (
         <p className="text-xs text-zinc-500">没有命中任何规则</p>
+      )}
+      {modelApprovalOn && (
+        <p className="text-xs leading-relaxed text-zinc-500">
+          这里只测规则这一关。你开了「执行前模型审批」，规则放行的命令实际执行前还会让模型再看一遍，可能被拦下。
+        </p>
       )}
     </div>
   );

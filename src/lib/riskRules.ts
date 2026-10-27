@@ -53,11 +53,17 @@ export const RULE_LEVEL_DOT: Record<Disposition, string> = {
   Deny: 'bg-red-400',
 };
 
-/** 每一档一句话的含义（档位下拉里每个选项下面的小字），必须与后端判定一致。 */
+/**
+ * 每一档一句话的含义（档位下拉里每个选项下面的小字），必须与后端判定一致。
+ *
+ * 「请求审批」与「强制审批」的区别只在 Auto：Auto 默认两档都不问，打开「Auto 模式强制审批」
+ * 后只有强制审批会问。Plan 默认也不问，打开「Plan 模式也需要审批」才跟 Agent 一样。
+ * 具体每个模式下怎样，以设置页顶部的「什么时候问你」表为准（那张表由后端算出）。
+ */
 export const LEVEL_HINT: Record<Disposition, string> = {
   Allow: '不拦',
-  Approval: 'Agent 模式下问一次',
-  ForceApproval: '必须你点头',
+  Approval: 'Agent 下问你；Plan 开了审批也问；Auto 不问',
+  ForceApproval: 'Agent 下问你；Auto 默认不问，开了强制审批才问',
   Deny: '不执行，让模型换写法',
 };
 

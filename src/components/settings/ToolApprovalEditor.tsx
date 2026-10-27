@@ -109,6 +109,10 @@ export function ToolApprovalEditor({
         </button>
       </div>
 
+      <p className="text-xs leading-relaxed text-zinc-500">
+        命令确认方式选了「每条都确认」时，自带审批的工具（如编辑文件、上传下载）即使把它从这里移掉，仍会问你。
+      </p>
+
       {editingName && (
         <ToolEditor
           // 换一个工具时重建，免得上一个的状态串过来。
