@@ -297,4 +297,33 @@ describe('审批面板的信息块（移动端）', () => {
     expect(text).not.toContain('"host"');
     expect(text.indexOf('在 db-02 上执行')).toBeLessThan(text.indexOf('rm -rf /srv/prod'));
   });
+
+  it('跳转查看始终可用：当前会话也给，来自其他会话另标「来自其他会话」', () => {
+    const navigate = vi.fn();
+    const renderWith = (isCurrentContext: boolean) =>
+      act(() => {
+        root.render(
+          <MobileApprovalSheet
+            toolCall={TOOL_CALL}
+            open={true}
+            onApprove={onApprove}
+            onReject={onReject}
+            sessionName="prod-web-01"
+            conversationTitle="清理旧日志"
+            isCurrentContext={isCurrentContext}
+            onNavigateToContext={navigate}
+          />,
+        );
+      });
+
+    renderWith(true);
+    expect(document.body.textContent ?? '').not.toContain('来自其他会话');
+    act(() => byLabel('跳转查看').click());
+    expect(navigate).toHaveBeenCalledTimes(1);
+
+    renderWith(false);
+    expect(document.body.textContent ?? '').toContain('来自其他会话');
+    act(() => byLabel('跳转查看').click());
+    expect(navigate).toHaveBeenCalledTimes(2);
+  });
 });

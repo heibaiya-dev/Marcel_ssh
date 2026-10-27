@@ -492,7 +492,7 @@ describe('审批弹窗的信息块', () => {
     expect(container.textContent ?? '').toContain('这台电脑');
   });
 
-  it('当前会话的审批只有一行灰字，没有「跳转」；来自其他会话才给跳转', () => {
+  it('跳转查看始终可用：当前会话也给（收起露出对话），来自其他会话另加「来自其他会话」', () => {
     const navigate = vi.fn();
     const renderWith = (isCurrentContext: boolean) =>
       act(() => {
@@ -513,12 +513,14 @@ describe('审批弹窗的信息块', () => {
 
     renderWith(true);
     expect(container.textContent ?? '').toContain('prod-web-01');
-    expect(container.textContent ?? '').not.toContain('跳转');
+    expect(container.textContent ?? '').not.toContain('来自其他会话');
+    act(() => button('跳转查看').click());
+    expect(navigate).toHaveBeenCalledTimes(1);
 
     renderWith(false);
     expect(container.textContent ?? '').toContain('来自其他会话');
-    act(() => button('跳转 ›').click());
-    expect(navigate).toHaveBeenCalledTimes(1);
+    act(() => button('跳转查看').click());
+    expect(navigate).toHaveBeenCalledTimes(2);
   });
 });
 
