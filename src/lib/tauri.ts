@@ -9,15 +9,14 @@ import {
   WINDOWS_PROBE_COMMAND,
   WINDOWS_PROBE_MARKER,
   WINDOWS_PROCESS_COMMAND,
-  WINDOWS_TERMINATED_MARKER,
   parsePosixInterfaces,
   parsePosixNetworkOutput,
   parsePosixProcessOutput,
+  parseWindowsKillFailure,
   parseWindowsNetworkOutput,
   parseWindowsProcessOutput,
   classifyRemotePlatform,
   windowsKillCommand,
-  type RemoteNetworkInterface,
   type RemoteNetworkSnapshot,
   type RemoteProcessInfo,
 } from "./remoteSystem";
@@ -119,10 +118,12 @@ const remoteOsCache = new Map<string, Promise<RemotePlatform | null>>();
 /**
  * Detect the remote platform.
  *
- * Windows OpenSSH always has Windows PowerShell 5.1, so a tiny PowerShell
- * marker is the most reliable positive test. If it is absent, `uname -s`
- * distinguishes Linux/macOS from other POSIX hosts. Returning null is
- * deliberate: a restricted shell or forced command must not be mislabeled.
+ * `uname -s` goes first: most hosts are POSIX, so they cost one round trip and
+ * leave no "powershell.exe: command not found" in the server's logs. Only when
+ * it yields nothing recognisable (cmd.exe / PowerShell have no `uname`) is the
+ * tiny PowerShell marker tried; Windows OpenSSH always has PowerShell 5.1.
+ * Returning null is deliberate: a restricted shell or forced command must not
+ * be mislabeled.
  */
 export function detectRemoteOs(
   sessionId: string,
@@ -132,15 +133,16 @@ export function detectRemoteOs(
 
   const pending = invoke<string>("ssh_exec", {
     sessionId,
-    command: WINDOWS_PROBE_COMMAND,
+    command: POSIX_UNAME_COMMAND,
   })
-    .then(async (output) => {
-      if (output.includes(WINDOWS_PROBE_MARKER)) return "windows" as const;
-      const uname = await invoke<string>("ssh_exec", {
+    .then(async (uname) => {
+      const posix = classifyRemotePlatform(uname);
+      if (posix) return posix;
+      const output = await invoke<string>("ssh_exec", {
         sessionId,
-        command: POSIX_UNAME_COMMAND,
+        command: WINDOWS_PROBE_COMMAND,
       });
-      return classifyRemotePlatform(uname);
+      return output.includes(WINDOWS_PROBE_MARKER) ? ("windows" as const) : null;
     })
     .then((platform) => {
       if (platform === null) remoteOsCache.delete(sessionId);
@@ -153,6 +155,11 @@ export function detectRemoteOs(
 
   remoteOsCache.set(sessionId, pending);
   return pending;
+}
+
+/** Drop the cached probe result when a session is closed or re-established. */
+export function forgetRemoteOs(sessionId: string): void {
+  remoteOsCache.delete(sessionId);
 }
 
 /**
@@ -208,22 +215,6 @@ export async function sshListNetwork(
   };
 }
 
-/** Kept as a small standalone helper for callers that only need interfaces. */
-export async function sshListInterfaces(
-  sessionId: string,
-): Promise<RemoteNetworkInterface[]> {
-  const os = await detectRemoteOs(sessionId);
-  if (os === "windows") {
-    const output = await sshExec(sessionId, WINDOWS_NETWORK_COMMAND);
-    const parsed = parseWindowsNetworkOutput(output);
-    if (parsed === null) throw new Error("Windows 网卡数据读取失败");
-    return parsed.interfaces;
-  }
-  return parsePosixInterfaces(
-    await sshExec(sessionId, POSIX_INTERFACES_COMMAND),
-  );
-}
-
 /**
  * Terminate a process inside a user-triggered panel action.
  *
@@ -238,10 +229,8 @@ export async function sshTerminateProcess(
   if (os === "windows") {
     const command = windowsKillCommand(pid);
     if (!command) throw new Error("无效的进程 PID");
-    const output = await sshExec(sessionId, command);
-    if (!output.includes(WINDOWS_TERMINATED_MARKER)) {
-      throw new Error(output.trim() || "终止进程失败");
-    }
+    const failure = parseWindowsKillFailure(await sshExec(sessionId, command));
+    if (failure !== null) throw new Error(failure);
     return;
   }
 

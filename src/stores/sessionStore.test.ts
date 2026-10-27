@@ -27,6 +27,7 @@ vi.mock('@/lib/tauri', () => ({
   connectWithSavedPassphrase,
   sshDisconnect: vi.fn(),
   detectRemoteOs: vi.fn().mockResolvedValue('linux'),
+  forgetRemoteOs: vi.fn(),
   // 连接成功后会拉一次会话快照做对齐，成功路径需要它
   sshListSessions: vi.fn().mockResolvedValue([]),
 }));

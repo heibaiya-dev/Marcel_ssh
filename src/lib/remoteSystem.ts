@@ -50,6 +50,7 @@ export const WINDOWS_PROBE_MARKER = '@@MARCEL_WINDOWS@@';
 export const WINDOWS_PROCESS_MARKER = '@@MARCEL_WINDOWS_PROCESS@@';
 export const WINDOWS_NETWORK_MARKER = '@@MARCEL_WINDOWS_NETWORK@@';
 export const WINDOWS_TERMINATED_MARKER = '@@MARCEL_PROCESS_TERMINATED@@';
+export const WINDOWS_KILL_FAILED_MARKER = '@@MARCEL_PROCESS_KILL_FAILED@@';
 
 const BASE64_ALPHABET =
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -128,7 +129,13 @@ $rows = foreach ($process in (Get-Process)) {
 
   $elapsed = ''
   if ($null -ne $process.StartTime) {
-    $elapsed = ((Get-Date) - $process.StartTime).ToString()
+    # Same shape as ps etime: [d-]hh:mm:ss (TimeSpan.ToString() would add ticks).
+    $span = (Get-Date) - $process.StartTime
+    if ($span.Days -gt 0) {
+      $elapsed = '{0}-{1:00}:{2:00}:{3:00}' -f $span.Days, $span.Hours, $span.Minutes, $span.Seconds
+    } else {
+      $elapsed = '{0:00}:{1:00}:{2:00}' -f $span.Hours, $span.Minutes, $span.Seconds
+    }
   }
 
   $commandLine = ''
@@ -225,11 +232,17 @@ $payload | ConvertTo-Json -Compress -Depth 5
 `;
 
 const WINDOWS_KILL_SCRIPT = String.raw`
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$ProgressPreference = 'SilentlyContinue'
+# An SSH exec channel without a pty may have no console handle, in which case
+# setting OutputEncoding throws; that must never stop the kill from running.
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
 $processId = __PID__
-Stop-Process -Id $processId -Force -ErrorAction Stop
-Write-Output '${WINDOWS_TERMINATED_MARKER}'
+try {
+  Stop-Process -Id $processId -Force -ErrorAction Stop
+  Write-Output '${WINDOWS_TERMINATED_MARKER}'
+} catch {
+  Write-Output ('${WINDOWS_KILL_FAILED_MARKER}' + $_.Exception.Message)
+}
 `;
 
 export const WINDOWS_PROBE_COMMAND = powershellCommand(WINDOWS_PROBE_SCRIPT);
@@ -266,6 +279,19 @@ export function windowsKillCommand(pid: string | number): string | null {
   const raw = String(pid).trim();
   if (!/^\d+$/.test(raw)) return null;
   return powershellCommand(WINDOWS_KILL_SCRIPT.replace('__PID__', raw));
+}
+
+/**
+ * Interpret the output of `windowsKillCommand`: `null` = terminated, otherwise
+ * the message to show. Only text after our own marker is surfaced, so
+ * PowerShell's CLIXML progress noise on stderr never reaches the UI.
+ */
+export function parseWindowsKillFailure(output: string): string | null {
+  if (output.includes(WINDOWS_TERMINATED_MARKER)) return null;
+  const index = output.indexOf(WINDOWS_KILL_FAILED_MARKER);
+  if (index < 0) return '未收到远端确认';
+  const message = output.slice(index + WINDOWS_KILL_FAILED_MARKER.length).trim();
+  return message || '远端未说明原因';
 }
 
 function parsePayloadAfterMarker(output: string, marker: string): unknown | null {

@@ -58,7 +58,6 @@ vi.mock('@/stores/sessionStore', () => ({
       connect: mocks.connect,
       connectWithSavedPassword: mocks.connectWithSavedPassword,
       connectWithSavedPassphrase: mocks.connectWithSavedPassphrase,
-      sessions: {},
     }),
 }));
 

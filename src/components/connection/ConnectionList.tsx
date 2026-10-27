@@ -103,7 +103,6 @@ export default function ConnectionList() {
   const renameGroup = useConnectionStore((s) => s.renameGroup);
   const activeConnectionId = useConnectionStore((s) => s.activeConnectionId);
   const setActiveConnection = useConnectionStore((s) => s.setActiveConnection);
-  const sessions = useSessionStore((s) => s.sessions);
   const connect = useSessionStore((s) => s.connect);
   const connectWithSavedPassword = useSessionStore((s) => s.connectWithSavedPassword);
   const connectWithSavedPassphrase = useSessionStore((s) => s.connectWithSavedPassphrase);
@@ -1055,14 +1054,7 @@ export default function ConnectionList() {
                             <div className="min-w-0 flex-1 truncate font-medium text-zinc-200">
                               {conn.name}
                             </div>
-                            <RemotePlatformBadge
-                              platform={
-                                conn.remotePlatform ??
-                                Object.values(sessions ?? {}).find(
-                                  (session) => session.configId === conn.id,
-                                )?.remotePlatform
-                              }
-                            />
+                            <RemotePlatformBadge platform={conn.remotePlatform} />
                           </div>
                           <div className="text-xs text-zinc-500 truncate">
                             {formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}

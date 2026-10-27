@@ -6,9 +6,13 @@ import {
   parsePosixInterfaces,
   parsePosixNetworkOutput,
   parsePosixProcessOutput,
+  parseWindowsKillFailure,
   parseWindowsNetworkOutput,
   parseWindowsProcessOutput,
   windowsKillCommand,
+  WINDOWS_KILL_FAILED_MARKER,
+  WINDOWS_PROCESS_COMMAND,
+  WINDOWS_TERMINATED_MARKER,
 } from '@/lib/remoteSystem';
 
 describe('remote system output parsers', () => {
@@ -186,5 +190,57 @@ describe('remote system output parsers', () => {
 
     expect(windowsKillCommand('42')).toContain('-EncodedCommand');
     expect(windowsKillCommand('42; Remove-Item C:\\')).toBeNull();
+  });
+});
+
+describe('Windows PowerShell commands', () => {
+  const decode = (command: string) =>
+    Buffer.from(command.split('-EncodedCommand ')[1], 'base64').toString('utf16le');
+
+  it('-EncodedCommand 是脚本的 UTF-16LE base64', () => {
+    const script = decode(windowsKillCommand('42')!);
+    expect(script).toContain('$processId = 42');
+    expect(script).not.toContain('__PID__');
+  });
+
+  it('命令行长度留在 cmd.exe 的 8191 上限内', () => {
+    expect(WINDOWS_PROCESS_COMMAND.length).toBeLessThan(8191);
+  });
+
+  it('终止脚本：编码设置失败不能挡住 Stop-Process，失败信息带自家标记', () => {
+    const script = decode(windowsKillCommand('42')!);
+    expect(script).toMatch(/try \{ \[Console\]::OutputEncoding[^\n]*\} catch \{\}/);
+    expect(script).not.toMatch(/\$ErrorActionPreference\s*=\s*'Stop'/);
+    expect(script).toContain(WINDOWS_KILL_FAILED_MARKER);
+  });
+
+  it('进程运行时长与 ps etime 同口径，不带 TimeSpan 的小数刻度', () => {
+    const script = decode(WINDOWS_PROCESS_COMMAND);
+    expect(script).not.toContain('StartTime).ToString()');
+    expect(script).toContain("'{0}-{1:00}:{2:00}:{3:00}' -f");
+  });
+});
+
+describe('parseWindowsKillFailure', () => {
+  it('成功标记 = 无失败', () => {
+    expect(parseWindowsKillFailure(`#< CLIXML
+${WINDOWS_TERMINATED_MARKER}
+`)).toBeNull();
+  });
+
+  it('只取自家标记之后的文本，丢掉 CLIXML 噪声', () => {
+    expect(
+      parseWindowsKillFailure(
+        `#< CLIXML
+<Objs />
+${WINDOWS_KILL_FAILED_MARKER}拒绝访问。
+`,
+      ),
+    ).toBe('拒绝访问。');
+  });
+
+  it('没有任何标记：给固定文案而不是回显原始输出', () => {
+    expect(parseWindowsKillFailure('#< CLIXML <Objs>garbage</Objs>')).toBe('未收到远端确认');
+    expect(parseWindowsKillFailure(WINDOWS_KILL_FAILED_MARKER)).toBe('远端未说明原因');
   });
 });

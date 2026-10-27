@@ -328,6 +328,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }));
     // Allow a new failure banner if reconnect fails; keep stdin disabled
     terminalInstanceManager.prepareReconnect(sessionId);
+    tauri.forgetRemoteOs(sessionId);
 
     try {
       await tauri.sshReconnect(sessionId, connectionId, trustNewHostKey);
@@ -383,6 +384,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       return { sessions: updated, activeSessionId: nextActiveId };
     });
     if (isDebugSession(sessionId)) return;
+    tauri.forgetRemoteOs(sessionId);
     try {
       await tauri.sshDisconnect(sessionId);
     } catch (err) {
