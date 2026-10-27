@@ -88,7 +88,8 @@
 //!     （它是纯约束描述、不含输出格式），不得再写第二份
 //!   - 用户在设置里填的「审批提示词」两个引擎都覆盖各自的上面那一份；
 //!     Plan 追加段始终生效
-//!   - 前端经 `agent_default_approval_prompt` 取用，不再自带副本
+//!   - 前端经 `agent_default_approval_prompt`（chat）/ `agent_default_jev_prompt`（Jev）取用，
+//!     不再自带副本
 //!
 //! 段落之间的分隔由本文件统一生成（见 `render_agent_prompt` 的 join），
 //! 模板文件首尾的空行没有语义，不必维护。

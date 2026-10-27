@@ -150,7 +150,7 @@ impl UnavailableApprover {
         Self {
             reason: format!(
                 "命令审批引擎（Jev）初始化失败，为避免命令在无人审批的情况下执行，本次任务的命令都会被拦下：{}。\
-                 请检查网络/代理设置后重新开始任务，或把「设置 → Agent → 命令模型审批」的引擎改回「跟随会话模型」。",
+                 请检查网络/代理设置后重新开始任务，或把「设置 → Agent → 命令执行策略 → 执行前模型审批」的审批引擎改回「跟随会话模型」。",
                 cause
             ),
         }
@@ -1105,6 +1105,33 @@ pub(crate) fn effective_approval_mode(mode: &AgentMode, settings: &AgentModeSett
     }
 }
 
+/// 命令文本评估出的档位 + 模式 + 命令名单 → 这条命令要不要确认（`decide_command` 的核心）。
+///
+/// 单独成函数是为了设置页的「什么时候问你」总览表（`agent_approval_overview`）：
+/// 表里的每个格子都是拿「某一档 × 某个模式」直接喂进这里再喂 `needs_human_confirmation`
+/// 算出来的，不另抄一份逻辑，所以这里一改表自动跟着变。`cmd` 只有档位是「放行 / 请求审批」
+/// 且走到命令名单时才用得上（白名单按基础命令名匹配）。
+pub(crate) fn command_requires_confirmation(
+    disposition: Disposition,
+    cmd: &str,
+    mode: &AgentMode,
+    settings: &AgentModeSettings,
+) -> bool {
+    match disposition {
+        Disposition::Deny => false,
+        // 强制审批不看模式、不看名单：命中了就是要人点头（Auto 下问不问由
+        // `needs_human_confirmation` 另算）。
+        Disposition::ForceApproval => true,
+        Disposition::Allow | Disposition::Approval => match effective_approval_mode(mode, settings)
+        {
+            AgentMode::Auto => false,
+            AgentMode::Plan | AgentMode::Agent => {
+                disposition == Disposition::Approval || command_list_requires_confirm(cmd, settings)
+            }
+        },
+    }
+}
+
 /// 给一条命令下结论：**风险评估 + 命令名单一起算，这是唯一一份实现**。
 ///
 /// dispatcher 用它决定要不要拦、要不要弹窗，设置页的「命令测试」也用它 —— 那两处
@@ -1164,13 +1191,8 @@ pub(crate) fn decide_command(
             // 与名单命中同样要确认；Auto 模式跳过这一档 —— 这正是它与强制审批的
             // 唯一差别。名单看的是剥壳后的 base（`sudo -n tail` 在它眼里就是
             // `sudo`），只有基础档知道"经 sudo 提权"这回事，所以理由优先用它的。
-            let needs_confirm = match mode {
-                AgentMode::Auto => false,
-                AgentMode::Plan | AgentMode::Agent => {
-                    assessment.disposition == Disposition::Approval
-                        || command_list_requires_confirm(cmd, settings)
-                }
-            };
+            let needs_confirm =
+                command_requires_confirmation(assessment.disposition, cmd, mode, settings);
             // 档位来自风险规则（sudo 保底等）时带上规则名；来自命令名单时没有规则。
             let from_rule = needs_confirm && assessment.reason.is_some();
             CommandDecision {

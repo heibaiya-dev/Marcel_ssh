@@ -6,7 +6,9 @@ use crate::agent::risk::{
     CUSTOM_REASON, CUSTOM_REASON_VARS, RULES,
 };
 use crate::agent::task::AgentMode;
-use crate::agent::tool_dispatcher::{decide_command, needs_human_confirmation};
+use crate::agent::tool_dispatcher::{
+    command_requires_confirmation, decide_command, needs_human_confirmation, CommandDecision,
+};
 use crate::config::settings::AgentModeSettings;
 use crate::error::AppError;
 use crate::AppState;
@@ -50,6 +52,13 @@ pub struct CheckCommandDraft {
 #[tauri::command]
 pub async fn agent_default_approval_prompt() -> String {
     crate::agent::templates::TemplateManager.render_approval_base()
+}
+
+/// 内置的 Jev 判据（`templates/approval/审批Jev.hbs`）。与上面那条同理：设置页把它预填在
+/// 「Jev 判据」输入框里、用它做「恢复默认」，前端不自带副本。
+#[tauri::command]
+pub async fn agent_default_jev_prompt() -> String {
+    crate::agent::templates::TemplateManager.render_approval_jev()
 }
 
 /// 设置页「测试命令」用的预演：这条命令在当前配置下会被怎么处置。
@@ -120,6 +129,135 @@ pub async fn agent_check_command(
         rule_id: decision.rule_id,
         hits,
     })
+}
+
+// ──────────────────────────── 审批总览 ────────────────────────────
+
+/// 总览表一个格子的结论：这一档的命令在这个模式下会怎样。
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OverviewVerdict {
+    /// 弹审批问你。
+    Ask,
+    /// 直接执行。
+    Run,
+    /// 不执行（直接拒绝，不征求意见）。
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OverviewCell {
+    pub verdict: OverviewVerdict,
+    /// 白名单模式下，**在名单里的**命令在这一格的结论；`None` = 与 `verdict` 一样。
+    /// 只有「没命中任何规则」那一行的 Agent / 开了审批的 Plan 会出现差别。
+    pub listed: Option<OverviewVerdict>,
+}
+
+/// 总览表的一行：某一档位的命令在 Agent / Plan / Auto 下各会怎样。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OverviewRow {
+    /// `Allow` 在这里表示「没命中任何规则」那一行。
+    pub level: Disposition,
+    pub agent: OverviewCell,
+    pub plan: OverviewCell,
+    pub auto: OverviewCell,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalOverview {
+    pub rows: Vec<OverviewRow>,
+}
+
+/// 探针命令名：只用来让白名单匹配（在 / 不在名单里），不会被风险评估，也不会被执行。
+const PROBE_LISTED: &str = "marcel-probe-listed";
+const PROBE_UNLISTED: &str = "marcel-probe-unlisted";
+
+fn overview_verdict(
+    level: Disposition,
+    cmd: &str,
+    mode: &AgentMode,
+    settings: &AgentModeSettings,
+) -> OverviewVerdict {
+    if level == Disposition::Deny {
+        return OverviewVerdict::Deny;
+    }
+    // 与 `decide_command` 一样的两步：先算命令这一层要不要确认，再交给真实执行时
+    // 用的 `needs_human_confirmation` 按模式定夺。
+    let requires_confirmation = command_requires_confirmation(level, cmd, mode, settings);
+    let disposition = match level {
+        Disposition::ForceApproval => Disposition::ForceApproval,
+        _ if requires_confirmation => Disposition::Approval,
+        _ => Disposition::Allow,
+    };
+    let decision = CommandDecision {
+        disposition,
+        reason: String::new(),
+        requires_confirmation,
+        rule_id: None,
+        rule_title: None,
+        hits: Vec::new(),
+    };
+    if needs_human_confirmation(mode, Some(&decision), disposition, false, settings, false) {
+        OverviewVerdict::Ask
+    } else {
+        OverviewVerdict::Run
+    }
+}
+
+fn overview_cell(
+    level: Disposition,
+    mode: &AgentMode,
+    settings: &AgentModeSettings,
+) -> OverviewCell {
+    let verdict = overview_verdict(level, PROBE_UNLISTED, mode, settings);
+    // 只有「没命中」一行会受白名单影响：名单内的命令可能与名单外的结论不同。
+    let listed = if level == Disposition::Allow {
+        let mut with_probe = settings.clone();
+        with_probe.allow_commands = vec![PROBE_LISTED.to_string()];
+        let listed = overview_verdict(level, PROBE_LISTED, mode, &with_probe);
+        (listed != verdict).then_some(listed)
+    } else {
+        None
+    };
+    OverviewCell { verdict, listed }
+}
+
+/// 总览表：**命令类工具**在当前审批设置下，每一档 × 每个模式会怎样。
+///
+/// 每个格子都走真实执行用的判定（[`command_requires_confirmation`] +
+/// [`needs_human_confirmation`]），不是前端抄的一张表，所以规则、开关一改它自动跟着变。
+/// 与风险规则无关——规则只决定一条命令落在哪一行，不影响行里的结论，所以入参只要
+/// 审批设置。非命令工具（上传下载、MCP 等）另有一套（工具自带档位 + 「每条都确认」），
+/// 不在这张表里。
+pub(crate) fn approval_overview(settings: &AgentModeSettings) -> ApprovalOverview {
+    let row = |level: Disposition| OverviewRow {
+        level,
+        agent: overview_cell(level, &AgentMode::Agent, settings),
+        plan: overview_cell(level, &AgentMode::Plan, settings),
+        auto: overview_cell(level, &AgentMode::Auto, settings),
+    };
+    ApprovalOverview {
+        rows: vec![
+            row(Disposition::Deny),
+            row(Disposition::ForceApproval),
+            row(Disposition::Approval),
+            row(Disposition::Allow),
+        ],
+    }
+}
+
+/// 设置页顶部「什么时候问你」总览表。`draft` 是设置页里还没保存的审批设置，缺省用已保存的。
+#[tauri::command]
+pub async fn agent_approval_overview(
+    state: State<'_, AppState>,
+    draft: Option<AgentModeSettings>,
+) -> Result<ApprovalOverview, AppError> {
+    let settings = state.settings.read().await;
+    let agent_settings = draft.as_ref().unwrap_or(&settings.agent_mode_settings);
+    Ok(approval_overview(agent_settings))
 }
 
 // ──────────────────────────── 规则目录 ────────────────────────────
@@ -220,5 +358,188 @@ pub async fn agent_list_risk_rules() -> RiskRuleCatalog {
             reason: CUSTOM_REASON,
             reason_vars: reason_vars(CUSTOM_REASON_VARS),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::CommandListMode;
+
+    /// 一行一条真实命令：总览表的每个格子必须等于「这条命令真跑起来会发生的事」
+    /// （`decide_command` + `needs_human_confirmation`，dispatch 读的就是它们）。
+    /// 规则或开关怎么改，只要表和真实判定对不上，这里就变红。
+    fn actual(cmd: &str, mode: &AgentMode, s: &AgentModeSettings) -> OverviewVerdict {
+        let d = decide_command(cmd, mode, s, None);
+        if d.disposition == Disposition::Deny {
+            return OverviewVerdict::Deny;
+        }
+        if needs_human_confirmation(mode, Some(&d), d.disposition, false, s, false) {
+            OverviewVerdict::Ask
+        } else {
+            OverviewVerdict::Run
+        }
+    }
+
+    fn every_settings_combo() -> Vec<AgentModeSettings> {
+        let mut out = Vec::new();
+        for allowlist in [false, true] {
+            for confirm_each in [false, true] {
+                for plan in [false, true] {
+                    for auto_force in [false, true] {
+                        out.push(AgentModeSettings {
+                            list_mode: if allowlist {
+                                CommandListMode::Allowlist
+                            } else {
+                                CommandListMode::Denylist
+                            },
+                            allow_commands: vec!["ls".to_string()],
+                            confirm_each_command: confirm_each,
+                            plan_mode_requires_approval: plan,
+                            auto_mode_force_approval: auto_force,
+                            ..AgentModeSettings::default()
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn cell_of(row: &OverviewRow, mode: &AgentMode) -> OverviewCell {
+        match mode {
+            AgentMode::Agent => row.agent,
+            AgentMode::Plan => row.plan,
+            AgentMode::Auto => row.auto,
+        }
+    }
+
+    #[test]
+    fn overview_cells_equal_what_real_commands_do() {
+        // (档位, 该档位的真实命令)；「没命中」另外在下面分名单内 / 名单外验。
+        let by_level = [
+            (Disposition::Deny, "rm -rf /etc"),
+            (Disposition::ForceApproval, "systemctl restart nginx"),
+            (
+                Disposition::Approval,
+                "sudo -n tail -n 20 /var/log/nginx/access.log",
+            ),
+        ];
+        for s in every_settings_combo() {
+            let overview = approval_overview(&s);
+            for mode in [AgentMode::Agent, AgentMode::Plan, AgentMode::Auto] {
+                for (level, cmd) in by_level {
+                    let row = overview.rows.iter().find(|r| r.level == level).unwrap();
+                    let cell = cell_of(row, &mode);
+                    assert_eq!(cell.listed, None, "{level:?} 这一行不受白名单影响");
+                    assert_eq!(
+                        cell.verdict,
+                        actual(cmd, &mode, &s),
+                        "{level:?} × {mode:?}，`{cmd}`，设置 {s:?}"
+                    );
+                }
+                let none = overview
+                    .rows
+                    .iter()
+                    .find(|r| r.level == Disposition::Allow)
+                    .unwrap();
+                let cell = cell_of(none, &mode);
+                // 名单外的命令（`uname` 不在名单里，也不命中任何规则）。
+                assert_eq!(
+                    cell.verdict,
+                    actual("uname -a", &mode, &s),
+                    "没命中 × {mode:?}（名单外），设置 {s:?}"
+                );
+                // 名单内的命令（`ls`）：`listed` 为 `None` 就是与名单外相同。
+                assert_eq!(
+                    cell.listed.unwrap_or(cell.verdict),
+                    actual("ls -la", &mode, &s),
+                    "没命中 × {mode:?}（名单内），设置 {s:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overview_defaults_match_the_documented_behaviour() {
+        use OverviewVerdict::{Ask, Deny, Run};
+        // 「按规则」：没命中规则的命令直接执行（出厂是「每条都确认」，那一行 Agent 下全是问你）。
+        let s = AgentModeSettings {
+            confirm_each_command: false,
+            ..AgentModeSettings::default()
+        };
+        let o = approval_overview(&s);
+        let verdicts = |level: Disposition| {
+            let r = o.rows.iter().find(|r| r.level == level).unwrap();
+            (r.agent.verdict, r.plan.verdict, r.auto.verdict)
+        };
+        assert_eq!(verdicts(Disposition::Deny), (Deny, Deny, Deny));
+        assert_eq!(verdicts(Disposition::ForceApproval), (Ask, Run, Run));
+        // 出厂状态下「请求审批」与「强制审批」行为一样，区别只在 Auto 的开关。
+        assert_eq!(verdicts(Disposition::Approval), (Ask, Run, Run));
+        assert_eq!(verdicts(Disposition::Allow), (Run, Run, Run));
+
+        // 出厂默认是「每条都确认」：没命中的命令在 Agent 下也问，Plan / Auto 照旧不问。
+        let factory = approval_overview(&AgentModeSettings::default());
+        let none = factory
+            .rows
+            .iter()
+            .find(|r| r.level == Disposition::Allow)
+            .unwrap();
+        assert_eq!(
+            (none.agent.verdict, none.plan.verdict, none.auto.verdict),
+            (Ask, Run, Run)
+        );
+    }
+
+    #[test]
+    fn auto_force_toggle_only_changes_the_auto_force_cell() {
+        use OverviewVerdict::{Ask, Run};
+        let s = AgentModeSettings {
+            auto_mode_force_approval: true,
+            ..AgentModeSettings::default()
+        };
+        let o = approval_overview(&s);
+        let get = |level: Disposition| {
+            o.rows
+                .iter()
+                .find(|r| r.level == level)
+                .unwrap()
+                .auto
+                .verdict
+        };
+        assert_eq!(get(Disposition::ForceApproval), Ask);
+        assert_eq!(
+            get(Disposition::Approval),
+            Run,
+            "请求审批在 Auto 下始终不问"
+        );
+        assert_eq!(get(Disposition::Allow), Run);
+    }
+
+    #[test]
+    fn allowlist_splits_the_unmatched_row_into_listed_and_unlisted() {
+        use OverviewVerdict::{Ask, Run};
+        let s = AgentModeSettings {
+            confirm_each_command: false,
+            list_mode: CommandListMode::Allowlist,
+            ..AgentModeSettings::default()
+        };
+        let o = approval_overview(&s);
+        let none = o
+            .rows
+            .iter()
+            .find(|r| r.level == Disposition::Allow)
+            .unwrap();
+        assert_eq!(none.agent.verdict, Ask, "名单外要问");
+        assert_eq!(none.agent.listed, Some(Run), "名单内直接执行");
+        // 规则与名单互不压制：请求审批档不因白名单而变。
+        let approval = o
+            .rows
+            .iter()
+            .find(|r| r.level == Disposition::Approval)
+            .unwrap();
+        assert_eq!(approval.agent.listed, None);
+        assert_eq!(approval.agent.verdict, Ask);
     }
 }

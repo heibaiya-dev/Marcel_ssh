@@ -163,7 +163,7 @@ impl CommandApprover for JevApprover {
         if !self.client.config().has_key() {
             return Err(AppError::Config(
                 "命令审批引擎选了 Jev，但未配置 TypeSafe API Key。\
-                 请到「设置 → Agent → 命令模型审批」填写，或把引擎改回「跟随会话模型」。"
+                 请到「设置 → Agent → 命令执行策略 → 执行前模型审批」填写，或把引擎改回「跟随会话模型」。"
                     .to_string(),
             ));
         }
