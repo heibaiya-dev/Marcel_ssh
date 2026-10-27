@@ -70,6 +70,15 @@ function byLabel(label: string): HTMLButtonElement {
   return el;
 }
 
+/** 「拒绝并停止任务」收在拒绝按钮旁的小箭头里：先展开菜单。 */
+function openRejectMenu() {
+  const caret = document.body.querySelector<HTMLButtonElement>(
+    'button[aria-label="更多拒绝方式"]',
+  );
+  if (!caret) throw new Error('找不到拒绝按钮旁的箭头');
+  act(() => caret.click());
+}
+
 function typeReason(text: string) {
   const input = document.body.querySelector<HTMLInputElement>('input[aria-label="拒绝原因"]');
   if (!input) throw new Error('找不到拒绝原因输入框');
@@ -112,6 +121,7 @@ describe('MobileApprovalSheet 的拒绝理由', () => {
   it('「拒绝并停止任务」走另一条路，不算普通拒绝', () => {
     render();
     typeReason('整条思路都不对');
+    openRejectMenu();
     act(() => byLabel('拒绝并停止任务').click());
 
     expect(onRejectAndStop).toHaveBeenCalledWith('整条思路都不对');
@@ -128,6 +138,7 @@ describe('MobileApprovalSheet 的拒绝理由', () => {
     expect(labels).toContain('拒绝');
     expect(labels).toContain('批准');
     expect(labels).not.toContain('拒绝并停止任务');
+    expect(document.body.querySelector('button[aria-label="更多拒绝方式"]')).toBeNull();
   });
 
   /// 与桌面端同一根因：队首前进时是同一个组件实例，理由必须跟着 `toolCall.id` 清空，
@@ -237,15 +248,13 @@ describe('Agent 说明（移动端）', () => {
     arguments: { command: 'rm -rf /srv/prod', description },
   });
 
-  it('有说明时显示，并排在命令前面', () => {
+  it('有说明时显示在命令下面，并标注是 agent 自述', () => {
     render(true, withDescription('清理生产环境的旧构建产物'));
 
     const text = document.body.textContent ?? '';
-    expect(text).toContain('Agent 说明');
+    expect(text).toContain('Agent 自述');
     expect(text).toContain('清理生产环境的旧构建产物');
-    expect(text.indexOf('Agent 说明')).toBeLessThan(
-      text.indexOf('rm -rf /srv/prod'),
-    );
+    expect(text.indexOf('Agent 自述')).toBeGreaterThan(text.indexOf('rm -rf /srv/prod'));
   });
 
   it('说明不再重复出现在参数 JSON 里', () => {
@@ -257,11 +266,35 @@ describe('Agent 说明（移动端）', () => {
 
   it('没有说明时不显示这一行', () => {
     render();
-    expect(document.body.textContent ?? '').not.toContain('Agent 说明');
+    expect(document.body.textContent ?? '').not.toContain('Agent 自述');
   });
 
   it('空白说明等同于没有', () => {
     render(true, withDescription('  '));
-    expect(document.body.textContent ?? '').not.toContain('Agent 说明');
+    expect(document.body.textContent ?? '').not.toContain('Agent 自述');
+  });
+});
+
+/** 与桌面端同一套精简：命令是主角，其余是不重复的短提示。 */
+describe('审批面板的信息块（移动端）', () => {
+  it('普通「请求审批」不再标一遍档位', () => {
+    render(true, { ...TOOL_CALL, disposition: 'Approval' });
+    expect(document.body.textContent ?? '').not.toContain('请求审批');
+  });
+
+  it('原因合并成一块，不再有「命中的风险规则」小标题', () => {
+    render(true, { ...TOOL_CALL, reasons: ['命令会递归删除目录'] });
+    const text = document.body.textContent ?? '';
+    expect(text).toContain('命令会递归删除目录');
+    expect(text).not.toContain('命中的风险规则');
+  });
+
+  it('跨机执行：目标机器一行说清，且排在命令前面', () => {
+    render(true, { ...TOOL_CALL, arguments: { command: 'rm -rf /srv/prod', host: 'db-02' } });
+    const text = document.body.textContent ?? '';
+    expect(text).toContain('在 db-02 上执行');
+    // 目标机器已由这一行点明，不再在参数 JSON 里重复
+    expect(text).not.toContain('"host"');
+    expect(text.indexOf('在 db-02 上执行')).toBeLessThan(text.indexOf('rm -rf /srv/prod'));
   });
 });

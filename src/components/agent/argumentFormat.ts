@@ -75,3 +75,19 @@ export function cleanExecuteCommandArgs(
   }
   return { main, description, extras };
 }
+
+/**
+ * 审批里目标机器已经由「在 X 上执行」那一行点明，`host` 就不必再在参数 JSON 里重复一遍。
+ * 只在那一行确实显示了同一个 host 时才剔除（`targetHost` 为空 = 没显示 = 原样保留），
+ * 其余参数不动。
+ */
+export function omitShownHost(
+  extras: Record<string, unknown>,
+  targetHost: string,
+): Record<string, unknown> {
+  if (!targetHost || typeof extras.host !== 'string' || extras.host.trim() !== targetHost) {
+    return extras;
+  }
+  const { host: _host, ...rest } = extras;
+  return rest;
+}

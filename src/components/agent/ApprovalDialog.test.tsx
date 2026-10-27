@@ -98,6 +98,13 @@ function pressEscape() {
   });
 }
 
+/** 「拒绝并停止任务」收在拒绝按钮旁的小箭头里：先展开菜单。 */
+function openRejectMenu() {
+  const caret = container.querySelector<HTMLButtonElement>('button[aria-label="更多拒绝方式"]');
+  if (!caret) throw new Error('找不到拒绝按钮旁的箭头');
+  act(() => caret.click());
+}
+
 /** 往拒绝理由输入框里打字（React 受控 input：走原生 setter 再派发 input 事件）。 */
 function typeReason(text: string) {
   const input = container.querySelector<HTMLInputElement>('input[aria-label="拒绝原因"]');
@@ -324,6 +331,7 @@ describe('队首切换', () => {
 describe('拒绝并停止任务', () => {
   it('走 onRejectAndStop 而不是 onReject', () => {
     render();
+    openRejectMenu();
     act(() => button('拒绝并停止任务').click());
 
     expect(onRejectAndStop).toHaveBeenCalledTimes(1);
@@ -339,6 +347,7 @@ describe('拒绝并停止任务', () => {
       setter.call(input, '整条路都不对');
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
+    openRejectMenu();
     act(() => button('拒绝并停止任务').click());
 
     expect(onRejectAndStop).toHaveBeenCalledWith('整条路都不对');
@@ -346,10 +355,39 @@ describe('拒绝并停止任务', () => {
 
   it('调用方没提供该能力时，按钮不出现', () => {
     render(true, false);
+    // 没有该能力时连箭头都不该有，只剩一个普通拒绝
+    expect(container.querySelector('button[aria-label="更多拒绝方式"]')).toBeNull();
+    const labels = Array.from(container.querySelectorAll('button')).map((b) =>
+      b.textContent?.trim(),
+    );
+    expect(labels).toContain('拒绝');
+    expect(labels).not.toContain('拒绝并停止任务');
+  });
+
+  it('菜单没展开时，「拒绝并停止任务」不在界面上（底栏只占一行）', () => {
+    render();
     const labels = Array.from(container.querySelectorAll('button')).map((b) =>
       b.textContent?.trim(),
     );
     expect(labels).not.toContain('拒绝并停止任务');
+  });
+
+  /// 焦点落在菜单项上按 Enter：必须是激活这个菜单项，绝不能被全局的 Enter = 批准抢走。
+  it('在「拒绝并停止任务」上按 Enter 不会批准', () => {
+    render();
+    openRejectMenu();
+    pressKey('Enter', button('拒绝并停止任务'));
+
+    expect(onApprove).not.toHaveBeenCalled();
+  });
+
+  it('菜单开着时按 Esc 只关菜单，不收起整个弹窗', () => {
+    render();
+    openRejectMenu();
+    pressKey('Escape', button('拒绝并停止任务'));
+
+    expect(onMinimize).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="menu"]')).toBeNull();
   });
 });
 
@@ -366,18 +404,18 @@ describe('Agent 说明', () => {
     arguments: { command: 'systemctl restart nginx', description },
   });
 
-  it('有说明时显示在命令上方，并标注来源', () => {
+  it('有说明时显示在命令下面，并标注是 agent 自述', () => {
     render(true, true, withDescription('重启 nginx 以加载新配置'));
 
     const text = container.textContent ?? '';
-    expect(text).toContain('Agent 说明');
+    expect(text).toContain('Agent 自述');
     expect(text).toContain('重启 nginx 以加载新配置');
 
-    // 位置：说明要排在命令前面（用户先读它再读命令）
-    const labelAt = text.indexOf('Agent 说明');
+    // 位置：先读命令本身，再看 agent 怎么说它
     const cmdAt = text.indexOf('systemctl restart nginx');
-    expect(labelAt).toBeGreaterThan(-1);
-    expect(cmdAt).toBeGreaterThan(labelAt);
+    const labelAt = text.indexOf('Agent 自述');
+    expect(cmdAt).toBeGreaterThan(-1);
+    expect(labelAt).toBeGreaterThan(cmdAt);
   });
 
   it('说明不再重复出现在参数 JSON 里', () => {
@@ -390,12 +428,97 @@ describe('Agent 说明', () => {
 
   it('没有说明时不显示这一行，也不留空白', () => {
     render();
-    expect(container.textContent ?? '').not.toContain('Agent 说明');
+    expect(container.textContent ?? '').not.toContain('Agent 自述');
   });
 
   it('空白说明等同于没有', () => {
     render(true, true, withDescription('   '));
-    expect(container.textContent ?? '').not.toContain('Agent 说明');
+    expect(container.textContent ?? '').not.toContain('Agent 自述');
+  });
+});
+
+/**
+ * 精简后的信息块：命令是主角，其余是不重复的短提示。
+ * 这些断言钉的是「没丢信息」与「不再说两遍」两头。
+ */
+describe('审批弹窗的信息块', () => {
+  it('普通「请求审批」不再标一遍档位（标题已经是这个意思）', () => {
+    render(true, true, { ...TOOL_CALL, disposition: 'Approval' });
+    const text = container.textContent ?? '';
+    expect(text).not.toContain('请求审批');
+    expect(text).not.toContain('处置');
+  });
+
+  it('命令类工具不再单独列「工具：」一行，非命令工具要显示工具名', () => {
+    render();
+    expect(container.textContent ?? '').not.toContain('工具：');
+
+    render(true, true, {
+      id: 'call-other',
+      name: 'write_file',
+      arguments: { path: '/srv/app/.env', content: 'A=1' },
+      disposition: 'Approval',
+    });
+    expect(container.textContent ?? '').toContain('write_file');
+  });
+
+  it('原因合并成一块，不再有「命中的风险规则」小标题', () => {
+    render(true, true, { ...TOOL_CALL, reasons: ['命令会递归删除目录'] });
+    const text = container.textContent ?? '';
+    expect(text).toContain('命令会递归删除目录');
+    expect(text).not.toContain('命中的风险规则');
+  });
+
+  it('跨机执行：目标机器一行说清，且排在命令前面', () => {
+    render(true, true, {
+      ...TOOL_CALL,
+      arguments: { command: 'systemctl restart nginx', host: 'db-02' },
+    });
+    const text = container.textContent ?? '';
+    expect(text).toContain('在 db-02 上执行');
+    // 目标机器已由这一行点明，不再在参数 JSON 里重复
+    expect(text).not.toContain('"host"');
+    expect(text.indexOf('在 db-02 上执行')).toBeLessThan(text.indexOf('systemctl restart nginx'));
+  });
+
+  it('本机工具：声明在这台电脑上执行', () => {
+    render(true, true, {
+      id: 'call-local',
+      name: 'local_bash',
+      arguments: { command: 'Get-ChildItem' },
+      disposition: 'Approval',
+    });
+    expect(container.textContent ?? '').toContain('本机');
+    expect(container.textContent ?? '').toContain('这台电脑');
+  });
+
+  it('当前会话的审批只有一行灰字，没有「跳转」；来自其他会话才给跳转', () => {
+    const navigate = vi.fn();
+    const renderWith = (isCurrentContext: boolean) =>
+      act(() => {
+        root.render(
+          <ApprovalDialog
+            toolCall={TOOL_CALL}
+            onApprove={onApprove}
+            onReject={onReject}
+            open={true}
+            onClose={onClose}
+            sessionName="prod-web-01"
+            conversationTitle="清理旧日志"
+            isCurrentContext={isCurrentContext}
+            onNavigateToContext={navigate}
+          />,
+        );
+      });
+
+    renderWith(true);
+    expect(container.textContent ?? '').toContain('prod-web-01');
+    expect(container.textContent ?? '').not.toContain('跳转');
+
+    renderWith(false);
+    expect(container.textContent ?? '').toContain('来自其他会话');
+    act(() => button('跳转 ›').click());
+    expect(navigate).toHaveBeenCalledTimes(1);
   });
 });
 

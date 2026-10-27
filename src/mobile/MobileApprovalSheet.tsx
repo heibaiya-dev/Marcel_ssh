@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react';
-import type { Disposition, ToolCallInfo } from '@/lib/types';
+import type { ToolCallInfo } from '@/lib/types';
 import { DISPOSITION_LABELS } from '@/lib/constants';
 import FileChangeView from '@/components/agent/FileChangeView';
-import { RiskRuleHits } from '@/components/agent/RiskRuleHits';
+import { ApprovalWhy } from '@/components/agent/ApprovalWhy';
+import { ApprovalTarget } from '@/components/agent/ApprovalTarget';
+import { ApprovalOrigin } from '@/components/agent/ApprovalOrigin';
+import { ApprovalRejectButton } from '@/components/agent/ApprovalRejectButton';
 import MobileSheet from './ui/MobileSheet';
-import { cleanExecuteCommandArgs } from '@/components/agent/argumentFormat';
+import { cleanExecuteCommandArgs, omitShownHost } from '@/components/agent/argumentFormat';
 import {
   asArgString,
   fileChangeToolName,
@@ -31,13 +34,6 @@ interface MobileApprovalSheetProps {
   /// 点「调整」：收起面板并打开设置里对应的风险规则。不传就不显示调整入口。
   onOpenRiskRule?: (ruleId: string) => void;
 }
-
-const DISPOSITION_TONE: Record<Disposition, string> = {
-  Allow: 'bg-emerald-500/15 text-emerald-300',
-  Approval: 'bg-amber-500/15 text-amber-300',
-  ForceApproval: 'bg-orange-500/15 text-orange-300',
-  Deny: 'bg-red-500/15 text-red-300',
-};
 
 /**
  * Bottom-sheet approval for the mobile shell. Deliberately NOT dismissible by
@@ -77,7 +73,6 @@ export default function MobileApprovalSheet({
   const path =
     typeof toolCall.arguments?.path === 'string' ? toolCall.arguments.path : '';
   const cleanedCmd = isExecuteCommand ? cleanExecuteCommandArgs(toolCall.arguments) : null;
-  const dispositionTone = DISPOSITION_TONE[toolCall.disposition];
   // 多机操控：命令带 host = 跨机执行，审批必须醒目提示目标机器（安全护栏）。
   const targetHost =
     typeof toolCall.arguments?.host === 'string' && toolCall.arguments.host.trim()
@@ -105,6 +100,16 @@ export default function MobileApprovalSheet({
         ? '只读调研'
         : promptMode;
 
+  // 命令类工具靠 `$` 提示符就自明了；其余工具（改文件、派发子 agent、其他）要把工具名
+  // 放在正文上方，用户才知道自己批的是什么。
+  const shownExtras = omitShownHost(cleanedCmd?.extras ?? {}, targetHost);
+  const toolNameLine = (
+    <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 text-xs">
+      <span className="shrink-0 font-mono text-zinc-400">{toolCall.name}</span>
+      {diffTool && path && <span className="break-all font-mono text-zinc-300">{path}</span>}
+    </div>
+  );
+
   return (
     <MobileSheet
       open={open}
@@ -114,17 +119,17 @@ export default function MobileApprovalSheet({
         <div className="flex items-center justify-between w-full pr-6">
           <span className="flex items-center gap-2">
             需要操作批准
-            <span
-              className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${dispositionTone}`}
-            >
-              {DISPOSITION_LABELS[toolCall.disposition]}
-            </span>
+            {/* 普通「请求审批」是这个面板的默认含义，不必再标一遍；只有不寻常的档位
+                （强制审批）才值得一枚标签。 */}
+            {toolCall.disposition !== 'Approval' && (
+              <span className="text-xs font-medium text-amber-300">
+                {DISPOSITION_LABELS[toolCall.disposition]}
+              </span>
+            )}
           </span>
           <div className="flex items-center gap-2">
             {queueLength > 1 && (
-              <span className="text-[11px] px-2 py-0.5 rounded-full bg-indigo-900/60 border border-indigo-700/50 text-indigo-300 font-medium">
-                1/{queueLength}
-              </span>
+              <span className="text-xs tabular-nums text-zinc-500">1/{queueLength}</span>
             )}
             {onMinimize && (
               <button
@@ -142,24 +147,25 @@ export default function MobileApprovalSheet({
         </div>
       }
       footer={
-        <div className="space-y-2.5">
+        <div className="space-y-2">
           {/* 拒绝理由：可选，但填了模型才有依据调整方向 */}
           <input
             type="text"
             value={reason}
             onChange={(e) => setReason(e.target.value)}
-            placeholder="可选：说明拒绝原因，会转达给 Agent"
+            placeholder="拒绝原因（可选，会告诉 Agent）"
             aria-label="拒绝原因"
             className="w-full rounded-xl bg-zinc-900 border border-edge-subtle px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-edge-strong"
           />
           <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => onReject(reason.trim() || undefined)}
-              className="flex-1 rounded-xl bg-zinc-800 px-4 py-3 text-sm font-medium text-zinc-200 active:bg-state-mid"
-            >
-              拒绝
-            </button>
+            <ApprovalRejectButton
+              touch
+              className="flex-1"
+              onReject={() => onReject(reason.trim() || undefined)}
+              onRejectAndStop={
+                onRejectAndStop ? () => onRejectAndStop(reason.trim() || undefined) : undefined
+              }
+            />
             <button
               type="button"
               onClick={onApprove}
@@ -168,107 +174,29 @@ export default function MobileApprovalSheet({
               批准
             </button>
           </div>
-          {onRejectAndStop && (
-            <button
-              type="button"
-              onClick={() => onRejectAndStop(reason.trim() || undefined)}
-              className="w-full text-xs text-zinc-500 active:text-red-400 py-1"
-            >
-              拒绝并停止任务
-            </button>
-          )}
         </div>
       }
     >
       <div className="space-y-3 px-4 pb-3">
-        {/* 上下文提示 (Context Banner) */}
-        {(sessionName || conversationTitle) && (
-          <div className="p-2.5 rounded-xl bg-zinc-950 border border-edge-subtle flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2 min-w-0">
-              <svg className="w-4 h-4 text-indigo-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              <div className="text-xs text-zinc-300 truncate">
-                <span className="font-semibold text-zinc-200">{sessionName || 'SSH 会话'}</span>
-                {conversationTitle && (
-                  <span className="text-zinc-400"> · {conversationTitle}</span>
-                )}
-              </div>
-            </div>
-            {onNavigateToContext && (
-              <button
-                type="button"
-                onClick={onNavigateToContext}
-                className="shrink-0 text-xs px-2.5 py-1 rounded-lg bg-indigo-600/30 active:bg-indigo-600/50 text-indigo-300 border border-indigo-500/40 font-medium"
-              >
-                跳转
-              </button>
-            )}
-          </div>
-        )}
+        <ApprovalOrigin
+          sessionName={sessionName}
+          conversationTitle={conversationTitle}
+          isCurrentContext={isCurrentContext}
+          onNavigateToContext={onNavigateToContext}
+          compact
+        />
 
-        {/* 多机操控：跨机执行的目标机器警示（安全不可协商：批准打在别机的
-            命令必须能看到目标） */}
-        {targetHost && (
-          <div className="rounded-xl border border-amber-600/70 bg-amber-950/50 px-3 py-2.5 flex items-center gap-2.5">
-            <svg className="w-4 h-4 text-amber-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 21v-4m0 0V5a2 2 0 012-2h6.5l1 1H21l-3 6 3 6h-8.5l-1-1H5a2 2 0 00-2 2zm9-13.5V9m0 0h2.5M12 9h-2.5" />
-            </svg>
-            <div className="text-xs text-amber-200 min-w-0">
-              <span className="font-semibold text-amber-300">目标机器：{targetHost}</span>
-              <span className="text-amber-200/80"> · 此操作将在该机器上执行（非当前会话）</span>
-            </div>
-          </div>
-        )}
-
-        {/* 本机（运行 Marcel SSH 的这台电脑）：与上面的目标机器横幅一样，是**执行
-            对象**的声明。没有它，用户在只有工具名（`local_bash` / `local_write_file`）
-            的审批面板里无法确知批准的是自己电脑上的动作，而不是服务器上的。 */}
-        {isLocalTool && (
-          <div className="rounded-xl border border-sky-600/70 bg-sky-950/50 px-3 py-2.5 flex items-center gap-2.5">
-            <svg className="w-4 h-4 text-sky-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-            </svg>
-            <div className="text-xs text-sky-200 min-w-0">
-              <span className="font-semibold text-sky-300">本机（运行 Marcel SSH 的这台电脑）</span>
-              <span className="text-sky-200/80">
-                {isLocalSubagent
-                  ? ' · 该子 agent 只在这台电脑上工作'
-                  : ' · 此操作在你这台电脑上执行，不经 SSH 到服务器'}
-              </span>
-            </div>
-          </div>
-        )}
-
-        {toolCall.reasons && toolCall.reasons.length > 0 && (
-          <div className="rounded-lg border border-amber-700/60 bg-amber-950/40 px-3 py-2">
-            <div className="mb-1 text-xs font-medium text-amber-300">
-              原因
-            </div>
-            <ul className="list-inside list-disc space-y-0.5 text-xs text-amber-200/90">
-              {toolCall.reasons.map((r, i) => (
-                <li key={i}>{r}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        <RiskRuleHits ruleIds={toolCall.ruleIds} onOpenRule={onOpenRiskRule} compact />
-
-        <div className="flex items-center gap-2 text-sm">
-          <span className="flex-shrink-0 text-zinc-500">工具</span>
-          <span className="truncate font-mono text-zinc-200">
-            {toolCall.name}
-          </span>
-        </div>
+        {/* 执行对象声明（安全不可协商：批准打在别机 / 用户自己电脑上的操作，必须
+            能看到目标）。判据是工具名，不是参数 —— 见 `isLocalTool` 的注释。 */}
+        <ApprovalTarget
+          targetHost={targetHost}
+          isLocalTool={isLocalTool}
+          isLocalSubagent={isLocalSubagent}
+        />
 
         {diffTool ? (
           <div className="space-y-2">
-            {path && (
-              <div className="break-all font-mono text-xs text-zinc-300">
-                {path}
-              </div>
-            )}
+            {toolNameLine}
             <div className="overflow-hidden rounded-lg border border-edge bg-zinc-950">
               <div className="overflow-x-auto">
                 <FileChangeView
@@ -285,6 +213,7 @@ export default function MobileApprovalSheet({
              命令输出 / 被注入的上下文），用户只有能读全文，才有机会发现「这条指令
              其实是在让子 agent 干别的事」。所以不截断、不折叠、不塞进 JSON 里。 */
           <div className="space-y-2">
+            {toolNameLine}
             {promptDescription && (
               <div>
                 <div className="mb-1 text-xs text-zinc-500">任务描述</div>
@@ -304,40 +233,45 @@ export default function MobileApprovalSheet({
             </pre>
           </div>
         ) : isExecuteCommand && cleanedCmd?.main ? (
-          <div>
-            {/* agent 对这条命令的说明。标注来源是刻意的：它可能把一条危险命令
-                说成「只读检查」，写清这是 agent 自述，用户才不会把它当成系统判定。 */}
-            {cleanedCmd.description && (
-              <div className="mb-2">
-                <div className="mb-1 text-xs text-zinc-500">Agent 说明</div>
-                <p className="text-xs leading-relaxed break-words whitespace-pre-wrap text-zinc-200">
-                  {cleanedCmd.description}
-                </p>
-              </div>
-            )}
-            <div className="mb-1 text-xs text-zinc-500">参数</div>
+          <div className="space-y-2">
             <div className="overflow-hidden rounded-lg border border-edge bg-zinc-950">
               <div className="flex items-start gap-2 px-3 py-2">
-                <span className="select-none font-mono text-xs leading-relaxed text-emerald-400">$</span>
+                <span className="select-none font-mono text-xs leading-relaxed text-zinc-500">$</span>
                 <code className="min-w-0 flex-1 break-words whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-200">
                   {cleanedCmd.main}
                 </code>
               </div>
-              {Object.keys(cleanedCmd.extras).length > 0 && (
+              {Object.keys(shownExtras).length > 0 && (
                 <pre className="max-h-40 overflow-y-auto border-t border-edge/60 px-3 py-2 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap text-zinc-400">
-                  {JSON.stringify(cleanedCmd.extras, null, 2)}
+                  {JSON.stringify(shownExtras, null, 2)}
                 </pre>
               )}
             </div>
+            {/* agent 对这条命令的说明，放在命令**下面**：先读命令本身，再看它怎么说。
+                标注来源是刻意的：它可能把一条危险命令说成「只读检查」，写清这是
+                agent 自述，用户才不会把它当成系统判定。 */}
+            {cleanedCmd.description && (
+              <p className="px-0.5 text-xs leading-relaxed break-words whitespace-pre-wrap text-zinc-300">
+                <span className="text-zinc-500">Agent 自述：</span>
+                {cleanedCmd.description}
+              </p>
+            )}
           </div>
         ) : (
-          <div>
-            <div className="mb-1 text-xs text-zinc-500">参数</div>
+          <div className="space-y-2">
+            {toolNameLine}
             <pre className="max-h-48 overflow-auto rounded-lg bg-zinc-950 p-2 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap text-zinc-300">
               {JSON.stringify(toolCall.arguments, null, 2)}
             </pre>
           </div>
         )}
+
+        <ApprovalWhy
+          reasons={toolCall.reasons}
+          ruleIds={toolCall.ruleIds}
+          onOpenRule={onOpenRiskRule}
+          compact
+        />
       </div>
     </MobileSheet>
   );
