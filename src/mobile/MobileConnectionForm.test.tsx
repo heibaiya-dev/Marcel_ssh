@@ -115,23 +115,28 @@ async function settle() {
   });
 }
 
+async function click(el: Element) {
+  await act(async () => {
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  });
+}
+
 /**
- * 切换「认证方式」下拉。
- * jsdom 里要拿原型上的原生 setter 绕开 React 的 value tracker，再派发 change。
+ * 切换「认证方式」下拉：点开底部面板，再点其中一项（不是原生 select，没有 change 事件）。
+ * 目标认证方式的下拉按钮读屏名以「认证方式」开头（跳板机那个叫「跳板机认证方式」）。
  */
 async function selectAuth(value: 'Password' | 'PrivateKey') {
-  const select = Array.from(document.querySelectorAll('select')).find((s) =>
-    Array.from(s.options).some((o) => o.value === 'PrivateKey'),
-  );
-  if (!select) throw new Error('找不到认证方式下拉');
-  await act(async () => {
-    const setter = Object.getOwnPropertyDescriptor(
-      HTMLSelectElement.prototype,
-      'value',
-    )!.set!;
-    setter.call(select, value);
-    select.dispatchEvent(new Event('change', { bubbles: true }));
-  });
+  const trigger = Array.from(
+    document.querySelectorAll<HTMLButtonElement>('button[aria-haspopup="dialog"]'),
+  ).find((b) => (b.getAttribute('aria-label') ?? '').startsWith('认证方式'));
+  if (!trigger) throw new Error('找不到认证方式下拉');
+  await click(trigger);
+  const label = value === 'Password' ? '密码' : '私钥';
+  const radio = Array.from(
+    document.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+  ).find((r) => r.textContent === label);
+  if (!radio) throw new Error(`找不到认证方式选项「${label}」`);
+  await click(radio);
   await settle();
 }
 

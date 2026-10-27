@@ -5,6 +5,7 @@ import SegmentedControl from '@/components/ui/SegmentedControl';
 import Toggle from '@/components/ui/Toggle';
 import MobileSheet from '@/mobile/ui/MobileSheet';
 import { MobileChoiceGroup } from '@/mobile/ui/MobileChoiceGroup';
+import MobileSelect from '@/mobile/ui/MobileSelect';
 import { collectPlatformHints, isMobilePlatform } from '@/platform';
 import { getErrorMessage } from '@/lib/errors';
 import {
@@ -178,20 +179,19 @@ export default function MemoryEditDialog({ open, onClose, item, defaultScope, on
       <div className="flex flex-col gap-1.5">
         <span className="text-xs text-zinc-400">谁能用到</span>
         {mobile ? (
-          <select
+          <MobileSelect
+            ariaLabel="谁能用到"
             value={scopeId(scope)}
-            onChange={(e) => {
-              const hit = scopeOptions.find((o) => scopeId(o.ref) === e.target.value);
+            onChange={(id) => {
+              const hit = scopeOptions.find((o) => scopeId(o.ref) === id);
               if (hit) setScope(hit.ref);
             }}
             className={fieldClass}
-          >
-            {scopeOptions.map((o) => (
-              <option key={scopeId(o.ref)} value={scopeId(o.ref)}>
-                {o.section ? `${o.section} · ${o.label}` : o.label}
-              </option>
-            ))}
-          </select>
+            options={scopeOptions.map((o) => ({
+              value: scopeId(o.ref),
+              label: o.section ? `${o.section} · ${o.label}` : o.label,
+            }))}
+          />
         ) : (
           <Select
             value={scopeId(scope)}

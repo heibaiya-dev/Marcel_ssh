@@ -11,6 +11,7 @@ import { getErrorMessage } from '@/lib/errors';
 import { usePrivacyMode } from '@/hooks/usePrivacyMode';
 import { formatConnLabel } from '@/lib/privacy';
 import MobileSheet from '../ui/MobileSheet';
+import MobileSelect from '../ui/MobileSelect';
 import Toggle from '@/components/ui/Toggle';
 
 interface FormState {
@@ -393,30 +394,30 @@ export function MobileQuickCommandSection() {
                     暂无已保存的连接，请先在连接页保存一个连接。
                   </p>
                 ) : (
-                  <select
+                  <MobileSelect
+                    ariaLabel="连接"
+                    title="选择连接"
+                    placeholder="选择连接…"
                     value={form.sessionKey ?? ''}
-                    onChange={(e) =>
-                      setForm({ ...form, sessionKey: e.target.value || null })
-                    }
+                    onChange={(key) => setForm({ ...form, sessionKey: key || null })}
                     className={`mt-2 ${inputClass}`}
-                  >
-                    <option value="" disabled>
-                      选择连接…
-                    </option>
-                    {connections.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}（
-                        {formatConnLabel(c.username, c.host, c.port, privacyMode)}）
-                      </option>
-                    ))}
-                    {/* Keep an orphaned key selectable so editing doesn't lose it. */}
-                    {form.sessionKey &&
-                      !connections.some((c) => c.id === form.sessionKey) && (
-                        <option value={form.sessionKey}>
-                          已删除的连接（{form.sessionKey}）
-                        </option>
-                      )}
-                  </select>
+                    options={[
+                      ...connections.map((c) => ({
+                        value: c.id,
+                        label: `${c.name}（${formatConnLabel(c.username, c.host, c.port, privacyMode)}）`,
+                      })),
+                      // 连接已被删掉但命令还指着它：保留这一项，编辑时才不会悄悄丢掉。
+                      ...(form.sessionKey &&
+                      !connections.some((c) => c.id === form.sessionKey)
+                        ? [
+                            {
+                              value: form.sessionKey,
+                              label: `已删除的连接（${form.sessionKey}）`,
+                            },
+                          ]
+                        : []),
+                    ]}
+                  />
                 ))}
             </div>
             <div>

@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { useAnimatedPresence } from '@/hooks/useAnimatedPresence';
+import Reveal from '@/components/ui/Reveal';
 import { useShowAfter } from '@/hooks/useShowAfter';
 
 /**
@@ -19,6 +19,7 @@ export const TRANSIENT_REVEAL_DELAY_MS = 400;
  *    从 0 长出来的动画进场；
  *  - 消失：`show` 变假后高度收回 0 再卸载，而不是当场拔掉。
  *
+ * 出入场动画本身是通用的 `ui/Reveal`；这里只加「观望」这一层。
  * 子内容在收起动画期间仍由调用方照常渲染，调用方需要让它在此期间保持不变
  * （例如实时输出定格在最后一帧），否则收起的过程中内容会变。
  */
@@ -32,16 +33,5 @@ export default function TransientReveal({
   children: ReactNode;
 }) {
   const visible = useShowAfter(show, delayMs);
-  const presence = useAnimatedPresence(visible);
-  if (!presence.mounted) return null;
-  const exiting = presence.phase === 'exit';
-  return (
-    <div
-      className={`transient-reveal ${exiting ? 'transient-reveal-exit' : 'transient-reveal-enter'}`}
-      aria-hidden={exiting || undefined}
-      onAnimationEnd={presence.onAnimationEnd}
-    >
-      <div>{children}</div>
-    </div>
-  );
+  return <Reveal show={visible}>{children}</Reveal>;
 }

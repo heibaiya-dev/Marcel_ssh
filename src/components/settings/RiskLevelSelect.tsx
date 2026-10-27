@@ -6,12 +6,13 @@ import {
   RULE_LEVEL_TONE,
 } from '@/lib/riskRules';
 import Select from '@/components/ui/Select';
+import MobileSelect from '@/mobile/ui/MobileSelect';
 
 /**
- * 档位下拉。桌面用共享的 `ui/Select`；手机没有共享下拉，沿用项目里手机端的做法（原生 select，调系统选择器）。
+ * 档位下拉。桌面用共享的 `ui/Select`，手机用共享的底部面板 `MobileSelect`（不用原生 select，原因见它的注释）。
  *
- * 桌面的每个选项下面带一行"选了会怎样"，已是默认的那个再标一句「默认」，不用翻文档就知道四档
- * 差别、也知道自己动没动过。
+ * 两端的选项内容一致：每个选项带一行"选了会怎样"，已是默认的那个再标一句「默认」，
+ * 不用翻文档就知道四档差别、也知道自己动没动过。
  */
 export function LevelSelect({
   value,
@@ -33,18 +34,24 @@ export function LevelSelect({
 }) {
   if (compact) {
     return (
-      <select
-        aria-label={ariaLabel}
+      <MobileSelect<Disposition>
         value={value}
-        onChange={(e) => onChange(e.target.value as Disposition)}
-        className={`min-h-11 flex-shrink-0 rounded-lg border bg-zinc-800 px-3 text-sm text-zinc-100 outline-none focus:border-indigo-500 ${RULE_LEVEL_TONE[value]}`}
-      >
-        {options.map((l) => (
-          <option key={l} value={l} className="bg-zinc-800 text-zinc-100">
-            {RULE_LEVEL_LABELS[l]}
-          </option>
-        ))}
-      </select>
+        onChange={onChange}
+        ariaLabel={ariaLabel}
+        title="选择处置档位"
+        className={`flex-shrink-0 rounded-lg border bg-zinc-800 px-3 text-sm ${RULE_LEVEL_TONE[value]}`}
+        options={options.map((l) => ({
+          value: l,
+          label: RULE_LEVEL_LABELS[l],
+          hint: LEVEL_HINT[l],
+          badge: l === defaultLevel ? '默认' : undefined,
+          leading: (
+            <span
+              className={`mt-1.5 h-2 w-2 flex-shrink-0 rounded-full ${RULE_LEVEL_DOT[l]}`}
+            />
+          ),
+        }))}
+      />
     );
   }
   return (

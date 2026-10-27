@@ -14,6 +14,7 @@ import { describeAlgorithm, shortFingerprint } from '@/lib/privateKey';
 import { useConnectionStore } from '@/stores/connectionStore';
 import KeyManager from '@/components/connection/KeyManager';
 import MobileSheet from './ui/MobileSheet';
+import MobileSelect from './ui/MobileSelect';
 
 interface MobileConnectionFormProps {
   open: boolean;
@@ -414,10 +415,10 @@ export default function MobileConnectionForm({
         </Field>
 
         <Field label="认证方式">
-          <select
+          <MobileSelect
+            ariaLabel="认证方式"
             value={authMethod}
-            onChange={(e) => {
-              const next = e.target.value;
+            onChange={(next) => {
               setAuthMethod(next);
               setSecret('');
               setSecretDirty(false);
@@ -426,34 +427,39 @@ export default function MobileConnectionForm({
               setHasSecret(false);
             }}
             className={inputClass}
-          >
-            <option value="Password">密码</option>
-            <option value="PrivateKey">私钥</option>
-          </select>
+            options={[
+              { value: 'Password', label: '密码' },
+              { value: 'PrivateKey', label: '私钥' },
+            ]}
+          />
         </Field>
 
         {authMethod === 'PrivateKey' && (
           <>
             <Field label="私钥">
               <div className="flex gap-2">
-                <select
+                <MobileSelect
+                  ariaLabel="私钥"
+                  title="选择私钥"
                   value={keyId}
-                  onChange={(e) => {
-                    setKeyId(e.target.value);
-                    if (e.target.value) setKeyPath('');
+                  onChange={(id) => {
+                    setKeyId(id);
+                    if (id) setKeyPath('');
                   }}
                   className={`min-w-0 flex-1 ${inputClass}`}
-                >
-                  <option value="">
-                    {keys.length > 0 ? '未选择' : '还没有导入私钥'}
-                  </option>
-                  {keys.map((key) => (
-                    <option key={key.id} value={key.id}>
-                      {key.name}（{describeAlgorithm(key.algorithm)}
-                      {key.encrypted ? ' · 带密码' : ''}）
-                    </option>
-                  ))}
-                </select>
+                  options={[
+                    {
+                      value: '',
+                      label: keys.length > 0 ? '未选择' : '还没有导入私钥',
+                    },
+                    ...keys.map((key) => ({
+                      value: key.id,
+                      label: `${key.name}（${describeAlgorithm(key.algorithm)}${
+                        key.encrypted ? ' · 带密码' : ''
+                      }）`,
+                    })),
+                  ]}
+                />
                 <button
                   type="button"
                   onClick={() => setKeyManagerTarget('main')}
@@ -689,19 +695,22 @@ export default function MobileConnectionForm({
               </Field>
 
               <Field label="认证方式">
-                <select
+                <MobileSelect<JumpAuthMethod>
+                  ariaLabel="跳板机认证方式"
+                  title="认证方式"
                   value={jumpAuthMethod}
-                  onChange={(e) => {
-                    setJumpAuthMethod(e.target.value as JumpAuthMethod);
+                  onChange={(next) => {
+                    setJumpAuthMethod(next);
                     setJumpPassword('');
                     setJumpPassphrase('');
                   }}
                   className={inputClass}
-                >
-                  <option value="withTarget">和目标相同</option>
-                  <option value="Password">密码</option>
-                  <option value="PrivateKey">私钥</option>
-                </select>
+                  options={[
+                    { value: 'withTarget', label: '和目标相同' },
+                    { value: 'Password', label: '密码' },
+                    { value: 'PrivateKey', label: '私钥' },
+                  ]}
+                />
               </Field>
 
               {jumpAuthMethod === 'Password' && (
@@ -728,23 +737,26 @@ export default function MobileConnectionForm({
                 <>
                   <Field label="私钥">
                     <div className="flex gap-2">
-                      <select
+                      <MobileSelect
+                        ariaLabel="跳板机私钥"
+                        title="选择私钥"
                         value={jumpKeyId}
-                        onChange={(e) => {
-                          setJumpKeyId(e.target.value);
-                          if (e.target.value) setJumpKeyPath('');
+                        onChange={(id) => {
+                          setJumpKeyId(id);
+                          if (id) setJumpKeyPath('');
                         }}
                         className={`min-w-0 flex-1 ${inputClass}`}
-                      >
-                        <option value="">
-                          {keys.length > 0 ? '未选择' : '还没有导入私钥'}
-                        </option>
-                        {keys.map((key) => (
-                          <option key={key.id} value={key.id}>
-                            {key.name}（{describeAlgorithm(key.algorithm)}）
-                          </option>
-                        ))}
-                      </select>
+                        options={[
+                          {
+                            value: '',
+                            label: keys.length > 0 ? '未选择' : '还没有导入私钥',
+                          },
+                          ...keys.map((key) => ({
+                            value: key.id,
+                            label: `${key.name}（${describeAlgorithm(key.algorithm)}）`,
+                          })),
+                        ]}
+                      />
                       <button
                         type="button"
                         onClick={() => setKeyManagerTarget('jump')}
