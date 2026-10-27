@@ -58,6 +58,7 @@ vi.mock('@/stores/sessionStore', () => ({
       connect: mocks.connect,
       connectWithSavedPassword: mocks.connectWithSavedPassword,
       connectWithSavedPassphrase: mocks.connectWithSavedPassphrase,
+      sessions: {},
     }),
 }));
 
@@ -153,6 +154,14 @@ afterEach(() => {
  * 没读回过后端真值前画「暂无已保存的连接」，用户会先看到空态再看到真实列表（与移动端同口径）。
  */
 describe('启动加载态与空态', () => {
+  it('已探测到的远端系统作为标签显示在连接行', () => {
+    mocks.connections = [{ ...PW_CONN, remotePlatform: 'windows' }];
+
+    render();
+
+    expect(document.body.textContent).toContain('Windows');
+  });
+
   it('尚未读回过后端真值：加载中，不闪「暂无已保存的连接」', () => {
     mocks.connections = [];
     mocks.loaded = false;

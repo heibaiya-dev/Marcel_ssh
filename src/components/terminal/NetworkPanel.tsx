@@ -1,26 +1,12 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { sshListNetwork, sshListInterfaces } from '@/lib/tauri';
+import { sshListNetwork } from '@/lib/tauri';
+import type { RemoteNetworkInterface, RemoteSocketInfo } from '@/lib/remoteSystem';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { getErrorMessage } from '@/lib/errors';
 
-interface SocketInfo {
-  proto: string;
-  laddr: string;
-  lport: number;
-  raddr: string;
-  rport: number;
-  state: string;
-  pid: number;
-  process: string;
-}
-
-interface NetInterface {
-  name: string;
-  ip: string;
-  mac: string;
-  state: string;
-}
+type SocketInfo = RemoteSocketInfo;
+type NetInterface = RemoteNetworkInterface;
 
 type SortKey = 'proto' | 'laddr' | 'lport' | 'raddr' | 'rport' | 'state' | 'pid' | 'process';
 type SortDir = 'asc' | 'desc';
@@ -28,112 +14,6 @@ type SubView = 'listen' | 'connections' | 'interfaces';
 
 interface NetworkPanelProps {
   sessionId: string;
-}
-
-// ─── 解析 ss 输出 ───
-// 真实格式：State RecvQ SendQ LocalAddr:Port PeerAddr:Port [users:(("name",pid=N,fd=N))]
-function parseSsLine(line: string): SocketInfo | null {
-  const trimmed = line.trim();
-  if (!trimmed) return null;
-  if (/^State\s/i.test(trimmed)) return null;
-
-  const parts = trimmed.split(/\s+/);
-  if (parts.length < 5) return null;
-
-  const state = parts[0];
-  let addrStart = -1;
-  for (let i = 1; i < parts.length; i++) {
-    if (parts[i].includes(':')) { addrStart = i; break; }
-  }
-  if (addrStart < 0) return null;
-
-  const local = parts[addrStart];
-  const remote = parts[addrStart + 1] || '';
-  let procRaw = '';
-  if (addrStart + 2 < parts.length) procRaw = parts[addrStart + 2];
-
-  const [laddr, lportStr] = parseAddr(local);
-  const [raddr, rportStr] = parseAddr(remote);
-
-  let proto = 'tcp';
-  if (local.startsWith('[')) proto = 'tcp6';
-  else if (remote && remote.startsWith('[')) proto = 'tcp6';
-
-  let pid = 0;
-  let process = '-';
-  if (procRaw) {
-    const m = procRaw.match(/users:\(\((.+?)\)\)$/);
-    if (m) {
-      const first = m[1].match(/"([^"]*)",pid=(\d+)/);
-      if (first) {
-        process = first[1];
-        pid = parseInt(first[2], 10) || 0;
-      }
-    }
-  }
-
-  return { proto, laddr, lport: parseInt(lportStr, 10) || 0, raddr, rport: parseInt(rportStr, 10) || 0, state, pid, process };
-}
-
-function parseAddr(addr: string): [string, string] {
-  if (!addr) return ['*', '0'];
-  const m = addr.match(/^\[([^\]]+)\]:(\d+|\*)$/);
-  if (m) return [m[1], m[2]];
-  const i = addr.lastIndexOf(':');
-  if (i < 0) return [addr, '0'];
-  return [addr.substring(0, i), addr.substring(i + 1)];
-}
-
-// ─── 解析 ip addr 输出 ───
-function parseInterfaceOutput(output: string): NetInterface[] {
-  const trimmed = output.trim();
-  if (!trimmed) return [];
-
-  if (trimmed.startsWith('[')) {
-    try {
-      const json = JSON.parse(trimmed);
-      return json
-        .filter((i: any) => i.ifname)
-        .map((i: any) => {
-          const addrs = i.addr_info || [];
-          const ipv4 = addrs.find((a: any) => a.family === 'inet');
-          return {
-            name: i.ifname,
-            ip: ipv4 ? `${ipv4.local}/${ipv4.prefixlen}` : '-',
-            mac: i.address || '-',
-            state: i.operstate || (i.flags?.includes('UP') ? 'UP' : 'DOWN'),
-          };
-        });
-    } catch { /* fall through */ }
-  }
-
-  const result: NetInterface[] = [];
-  const lines = output.split('\n');
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    // {num}: {name}: <{flags}> ... state {state}
-    const m = line.match(/^\d+:\s*(\S+?)(?:@\S+)?:\s*<(.+?)>.*?\bstate\s+(\S+)/);
-    if (!m) continue;
-    const name = m[1];
-    const flags = m[2];
-    const st = m[3].toUpperCase();
-    const up = flags.includes('UP') && st !== 'DOWN';
-
-    let mac = '-';
-    let ip = '-';
-    for (let j = i + 1; j < lines.length; j++) {
-      const nl = lines[j];
-      if (/^\d+:/.test(nl)) break;
-      const macM = nl.match(/link\/(?:ether|loopback)\s+(\S+)/);
-      if (macM) mac = macM[1];
-      const ipM = nl.match(/^\s+inet\s+(\S+)/);
-      if (ipM && ip === '-') ip = ipM[1];
-    }
-    result.push({ name, ip, mac, state: up ? 'UP' : 'DOWN' });
-  }
-
-  return result;
 }
 
 function stateBadge(state: string) {
@@ -162,22 +42,9 @@ export default function NetworkPanel({ sessionId }: NetworkPanelProps) {
     setLoading(true);
     setError(null);
     try {
-      const [netOutput, ifOutput] = await Promise.all([
-        sshListNetwork(sessionId),
-        sshListInterfaces(sessionId).catch(() => ''),
-      ]);
-
-      const lines = netOutput.split('\n');
-      const allSockets: SocketInfo[] = [];
-      let inConnections = false;
-      for (const line of lines) {
-        if (line.includes('---CONNECTIONS---')) { inConnections = true; continue; }
-        const parsed = parseSsLine(line);
-        if (parsed) allSockets.push(parsed);
-      }
-      setSockets(allSockets);
-
-      if (ifOutput) setInterfaces(parseInterfaceOutput(ifOutput));
+      const snapshot = await sshListNetwork(sessionId);
+      setSockets(snapshot.sockets);
+      setInterfaces(snapshot.interfaces);
     } catch (err) {
       setError(`加载失败：${getErrorMessage(err)}`);
     } finally {

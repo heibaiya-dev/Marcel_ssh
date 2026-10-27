@@ -191,6 +191,9 @@ export interface ReloadDiff {
 
 // Connection types
 
+/** 远端平台。由首次成功连接自动探测。 */
+export type RemotePlatform = 'windows' | 'linux' | 'macos' | 'unix';
+
 export interface JumpConfig {
   host: string;
   port: number;
@@ -250,6 +253,8 @@ export interface SavedConnection {
   jumpKeyPath?: string;
   /** 跳板机私钥的密钥库 id，语义同 keyId */
   jumpKeyId?: string;
+  /** 首次成功连接后自动探测到的远端平台；旧数据没有这个字段。 */
+  remotePlatform?: RemotePlatform;
 }
 
 /**
@@ -296,6 +301,8 @@ export interface Session {
   errorMessage?: string;
   /** The saved connection config ID (persistent across restarts) */
   configId?: string;
+  /** 当前会话探测到的远端平台（连接成功后异步补齐）。 */
+  remotePlatform?: RemotePlatform;
 }
 
 export type SessionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';

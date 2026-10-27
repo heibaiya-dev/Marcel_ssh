@@ -75,7 +75,7 @@ export function validateConnectionForm(
 
 /** 组装 SavedConnection 时从现有连接继承的字段（编辑模式才有）。 */
 export interface ConnectionFormDraft {
-  existing?: Pick<SavedConnection, 'id' | 'lastConnected'>;
+  existing?: Pick<SavedConnection, 'id' | 'lastConnected' | 'host' | 'remotePlatform'>;
   name: string;
   host: string;
   port: number;
@@ -100,12 +100,17 @@ export interface ConnectionFormDraft {
  * - 选了密钥库里的私钥就不再记路径；反之保留手填路径（老数据与高级用法）
  * - 分组 trim 后为空 = 未分组（落盘为缺省）
  * - 跳板机关闭时所有 jump* 字段一律缺省，不留残值
+ * - 编辑时目标主机未改就继承自动识别的远端系统；改主机则清掉旧标识
  */
 export function buildSavedConnection(draft: ConnectionFormDraft): SavedConnection {
+  const host = draft.host.trim();
+  const keepsSameTarget = Boolean(
+    draft.existing && host.toLowerCase() === draft.existing.host.trim().toLowerCase(),
+  );
   return {
     id: draft.existing?.id ?? crypto.randomUUID(),
     name: draft.name.trim(),
-    host: draft.host.trim(),
+    host,
     port: draft.port,
     username: draft.username.trim(),
     authMethod: draft.authMethod,
@@ -116,6 +121,7 @@ export function buildSavedConnection(draft: ConnectionFormDraft): SavedConnectio
     keyId: draft.authMethod === 'PrivateKey' ? draft.keyId || undefined : undefined,
     group: draft.group.trim() || undefined,
     lastConnected: draft.existing?.lastConnected,
+    remotePlatform: keepsSameTarget ? draft.existing?.remotePlatform : undefined,
     useJump: draft.useJump,
     jumpHost: draft.useJump ? draft.jumpHost.trim() : undefined,
     jumpPort: draft.useJump ? draft.jumpPort : undefined,

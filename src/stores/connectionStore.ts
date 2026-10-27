@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { SavedConnection } from "@/lib/types";
+import type { RemotePlatform, SavedConnection } from "@/lib/types";
 import * as tauri from "@/lib/tauri";
 import type { ConnectionOrderEntry } from "@/lib/tauri";
 import { getErrorMessage } from "@/lib/errors";
@@ -28,6 +28,8 @@ interface ConnectionState {
   /** 重命名分组：批量更新该组所有连接的 group 字段。 */
   renameGroup: (oldName: string, newName: string) => Promise<void>;
   setActiveConnection: (id: string | null) => void;
+  /** 保存自动探测到的远端平台；失败不打扰连接流程，只回滚本地标记。 */
+  setRemotePlatform: (id: string, platform: RemotePlatform) => Promise<void>;
 }
 
 export const useConnectionStore = create<ConnectionState>((set, get) => ({
@@ -84,6 +86,29 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
       await get().fetchConnections();
     } catch (err) {
       set({ error: getErrorMessage(err), loading: false });
+    }
+  },
+
+  setRemotePlatform: async (id: string, platform: RemotePlatform) => {
+    const target = get().connections.find((connection) => connection.id === id);
+    if (!target || target.remotePlatform === platform) return;
+
+    const previous = target.remotePlatform;
+    set((state) => ({
+      connections: state.connections.map((connection) =>
+        connection.id === id ? { ...connection, remotePlatform: platform } : connection,
+      ),
+    }));
+
+    try {
+      await tauri.setConnectionRemotePlatform(id, platform);
+    } catch (err) {
+      console.warn('持久化远端系统标识失败:', err);
+      set((state) => ({
+        connections: state.connections.map((connection) =>
+          connection.id === id ? { ...connection, remotePlatform: previous } : connection,
+        ),
+      }));
     }
   },
 

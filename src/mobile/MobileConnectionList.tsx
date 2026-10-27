@@ -26,6 +26,7 @@ import MobileKeepAliveTipCard from './MobileKeepAliveTipCard';
 import { getErrorMessage } from '@/lib/errors';
 import { isDebugConnection } from '@/lib/debugServer';
 import { formatConnLabel } from '@/lib/privacy';
+import RemotePlatformBadge from '@/components/connection/RemotePlatformBadge';
 import type { SavedConnection } from '@/lib/types';
 import { openMemorySettings } from '@/lib/memoryNav';
 import { useMemoryStore } from '@/stores/memoryStore';
@@ -459,8 +460,11 @@ export default function MobileConnectionList({
                               )}
                             </div>
                             <div className="min-w-0 flex-1">
-                              <div className="truncate text-sm font-medium text-zinc-100">
-                                {conn.name || formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}
+                              <div className="flex min-w-0 items-center gap-1.5">
+                                <div className="min-w-0 flex-1 truncate text-sm font-medium text-zinc-100">
+                                  {conn.name || formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}
+                                </div>
+                                <RemotePlatformBadge compact platform={conn.remotePlatform} />
                               </div>
                               <div className="truncate text-xs text-zinc-500">
                                 {formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}

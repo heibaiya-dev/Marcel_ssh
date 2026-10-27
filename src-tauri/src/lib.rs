@@ -1044,6 +1044,7 @@ pub fn run() {
             commands::agent_conversation::agent_load_plans_by_conversation,
             commands::connections::config_get_connections,
             commands::connections::config_save_connection,
+            commands::connections::config_set_connection_remote_platform,
             commands::connections::config_apply_connection_order,
             commands::connections::config_delete_connection,
             commands::memory::memory_overview,

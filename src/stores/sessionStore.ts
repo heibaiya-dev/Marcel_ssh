@@ -1,11 +1,12 @@
 import { create } from "zustand";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { Session, ConnectionConfig } from "@/lib/types";
+import type { Session, ConnectionConfig, RemotePlatform } from "@/lib/types";
 import * as tauri from "@/lib/tauri";
 import { getErrorMessage } from "@/lib/errors";
 import { formatConnLabel } from "@/lib/privacy";
 import { DEBUG_SERVER_ID, isDebugConnection, isDebugSession } from "@/lib/debugServer";
 import { useSettingsStore } from "./settingsStore";
+import { useConnectionStore } from "./connectionStore";
 import { terminalInstanceManager } from "@/components/terminal/TerminalInstanceManager";
 
 interface SessionState {
@@ -66,6 +67,41 @@ function allocateSessionSlot(
   if (!reused) return crypto.randomUUID();
   terminalInstanceManager.prepareReconnect(reused);
   return reused;
+}
+
+/**
+ * Identify the remote OS after a successful connection and persist it on the
+ * saved connection. This is deliberately fire-and-forget: a restricted shell
+ * or unsupported probe must never turn a working SSH session into an error.
+ */
+function identifyRemotePlatform(
+  sessionId: string,
+  connectionId: string | undefined,
+) {
+  if (isDebugSession(sessionId) || isDebugConnection(connectionId)) return;
+
+  void tauri.detectRemoteOs(sessionId)
+    .then((platform: RemotePlatform | null) => {
+      if (!platform) return;
+
+      useSessionStore.setState((state) => {
+        const session = state.sessions[sessionId];
+        if (!session || session.remotePlatform === platform) return state;
+        return {
+          sessions: {
+            ...state.sessions,
+            [sessionId]: { ...session, remotePlatform: platform },
+          },
+        };
+      });
+
+      if (connectionId) {
+        void useConnectionStore.getState().setRemotePlatform(connectionId, platform);
+      }
+    })
+    .catch(() => {
+      // Detection is best-effort; a restricted shell must not affect SSH.
+    });
 }
 
 export const useSessionStore = create<SessionState>((set, get) => ({
@@ -135,7 +171,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       });
       await attachSessionStatusListener(sessionId);
       await reconcileSessionSnapshot(sessionId);
-
+      identifyRemotePlatform(sessionId, session.configId);
       return sessionId;
     } catch (err) {
       const errorMessage = getErrorMessage(err);
@@ -189,7 +225,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       });
       await attachSessionStatusListener(sessionId);
       await reconcileSessionSnapshot(sessionId);
-
+      identifyRemotePlatform(sessionId, session.configId);
       return sessionId;
     } catch (err) {
       const errorMessage = getErrorMessage(err);
@@ -243,7 +279,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       });
       await attachSessionStatusListener(sessionId);
       await reconcileSessionSnapshot(sessionId);
-
+      identifyRemotePlatform(sessionId, session.configId);
       return sessionId;
     } catch (err) {
       const errorMessage = getErrorMessage(err);
@@ -286,6 +322,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           ...state.sessions[sessionId],
           status: "connecting",
           errorMessage: undefined,
+          remotePlatform: undefined,
         },
       },
     }));
@@ -296,6 +333,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       await tauri.sshReconnect(sessionId, connectionId, trustNewHostKey);
       await attachSessionStatusListener(sessionId);
       await reconcileSessionSnapshot(sessionId);
+      identifyRemotePlatform(sessionId, connectionId);
       terminalInstanceManager.onReconnected(sessionId);
       set((state) => {
         const existing = state.sessions[sessionId];
@@ -476,6 +514,7 @@ async function attachSessionStatusListener(sessionId: string) {
       const store = useSessionStore.getState();
       if (parsed.status === "connected") {
         store.updateSessionStatus(sessionId, "connected");
+        identifyRemotePlatform(sessionId, store.sessions[sessionId]?.configId);
       } else if (parsed.status === "disconnected") {
         // 任务不在这里收尾：后端断连观察者已按会话级联停止它们（与停止按钮同一
         // 套语义，见 `agent::manager::stop_task_cascade`），界面由那条

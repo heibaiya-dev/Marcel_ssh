@@ -919,6 +919,7 @@ mod tests {
             jump_auth_method: None,
             jump_key_path: None,
             jump_key_id: None,
+            remote_platform: None,
         }
     }
 

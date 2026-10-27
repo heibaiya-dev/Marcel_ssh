@@ -26,6 +26,7 @@ vi.mock('@/lib/tauri', () => ({
   connectWithSavedPassword,
   connectWithSavedPassphrase,
   sshDisconnect: vi.fn(),
+  detectRemoteOs: vi.fn().mockResolvedValue('linux'),
   // 连接成功后会拉一次会话快照做对齐，成功路径需要它
   sshListSessions: vi.fn().mockResolvedValue([]),
 }));
@@ -174,6 +175,21 @@ describe('sessionStore', () => {
       const { sessions, activeSessionId } = useSessionStore.getState();
       expect(Object.keys(sessions)).toHaveLength(1);
       expect(activeSessionId).toBe(firstId);
+    });
+
+    it('连接成功后自动把远端系统写进会话', async () => {
+      sshConnect.mockResolvedValueOnce('session-win');
+      vi.mocked(tauri.sshListSessions).mockResolvedValueOnce(['session-win']);
+      vi.mocked(tauri.detectRemoteOs).mockResolvedValueOnce('windows');
+
+      await useSessionStore.getState().connect({
+        ...makeConfig(),
+        connectionId: 'conn-win',
+      });
+
+      await vi.waitFor(() => {
+        expect(useSessionStore.getState().sessions['session-win'].remotePlatform).toBe('windows');
+      });
     });
 
     it('连接成功后失败槽位被正式会话取代（不残留）', async () => {

@@ -1,7 +1,7 @@
 use tauri::State;
 use uuid::Uuid;
 
-use crate::config::connections::{ConnectionStore, SavedConnection};
+use crate::config::connections::{ConnectionStore, RemotePlatform, SavedConnection};
 use crate::config::keychain;
 use crate::config::persist::JsonPersistable;
 use crate::error::AppError;
@@ -41,6 +41,28 @@ pub async fn config_save_connection(
     *store = candidate;
 
     Ok(id)
+}
+
+/// Persist an auto-detected remote platform.
+///
+/// A missing id is a successful no-op: the user may delete a connection while
+/// the asynchronous probe is still in flight.
+#[tauri::command]
+pub async fn config_set_connection_remote_platform(
+    state: State<'_, AppState>,
+    id: String,
+    platform: RemotePlatform,
+) -> Result<(), AppError> {
+    let mut store = state.connection_store.write().await;
+    let mut candidate = store.clone();
+    if !candidate.set_remote_platform(&id, platform) {
+        return Ok(());
+    }
+
+    let path = ConnectionStore::default_file(&state.config_dir);
+    tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
+    *store = candidate;
+    Ok(())
 }
 
 /// 一条连接的落位：id + 目标分组（`None` = 未分组）。

@@ -8,6 +8,7 @@ vi.mock('@/lib/tauri', () => ({
   saveConnection: vi.fn(),
   deleteConnection: vi.fn(),
   applyConnectionOrder: vi.fn(),
+  setConnectionRemotePlatform: vi.fn(),
 }));
 
 function conn(id: string, group?: string): SavedConnection {
@@ -95,6 +96,28 @@ describe('connectionStore.applyConnectionOrder', () => {
     const convs = useConnectionStore.getState().connections;
     expect(convs.find((c) => c.id === 'a')?.group).toBeUndefined();
     expect(ids()).toEqual(['a', 'b']);
+  });
+
+  it('远端系统标识先更新本地，再单独落库', async () => {
+    useConnectionStore.setState({ connections: [conn('a')] });
+    (tauri.setConnectionRemotePlatform as any).mockResolvedValue(undefined);
+
+    await useConnectionStore.getState().setRemotePlatform('a', 'windows');
+
+    expect(useConnectionStore.getState().connections[0].remotePlatform).toBe('windows');
+    expect(tauri.setConnectionRemotePlatform).toHaveBeenCalledWith('a', 'windows');
+  });
+
+  it('远端系统标识落库失败时回滚，不影响连接列表其它字段', async () => {
+    useConnectionStore.setState({ connections: [conn('a')] });
+    (tauri.setConnectionRemotePlatform as any).mockRejectedValue(new Error('disk full'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await useConnectionStore.getState().setRemotePlatform('a', 'linux');
+
+    expect(useConnectionStore.getState().connections[0].remotePlatform).toBeUndefined();
+    expect(useConnectionStore.getState().connections[0].host).toBe('127.0.0.1');
+    warn.mockRestore();
   });
 
   it('请求里缺的连接按原相对顺序补到末尾（不丢连接）', async () => {

@@ -150,6 +150,22 @@ describe('buildSavedConnection', () => {
     expect(edited.lastConnected).toBe('2026-01-01T00:00:00Z');
   });
 
+  it('编辑同一主机保留自动识别的系统；改主机时清掉旧标识', () => {
+    const existing: SavedConnection = {
+      ...validValues,
+      id: 'c-win',
+      host: '10.0.0.1',
+      remotePlatform: 'windows',
+    };
+
+    expect(
+      buildSavedConnection({ ...validValues, existing, host: ' 10.0.0.1 ' }).remotePlatform,
+    ).toBe('windows');
+    expect(
+      buildSavedConnection({ ...validValues, existing, host: '10.0.0.2' }).remotePlatform,
+    ).toBeUndefined();
+  });
+
   it('密码认证：keyPath / keyId 一律缺省', () => {
     const saved = buildSavedConnection({
       ...validValues,

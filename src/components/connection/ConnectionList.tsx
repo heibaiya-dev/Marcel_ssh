@@ -28,6 +28,7 @@ import Modal from '@/components/ui/Modal';
 import ListPanel from '@/components/ui/ListPanel';
 import ContextMenu from '@/components/ui/ContextMenu';
 import ConnectionForm from './ConnectionForm';
+import RemotePlatformBadge from './RemotePlatformBadge';
 import DeleteConnectionDialog from './DeleteConnectionDialog';
 import { openMemorySettings } from '@/lib/memoryNav';
 
@@ -102,6 +103,7 @@ export default function ConnectionList() {
   const renameGroup = useConnectionStore((s) => s.renameGroup);
   const activeConnectionId = useConnectionStore((s) => s.activeConnectionId);
   const setActiveConnection = useConnectionStore((s) => s.setActiveConnection);
+  const sessions = useSessionStore((s) => s.sessions);
   const connect = useSessionStore((s) => s.connect);
   const connectWithSavedPassword = useSessionStore((s) => s.connectWithSavedPassword);
   const connectWithSavedPassphrase = useSessionStore((s) => s.connectWithSavedPassphrase);
@@ -1049,8 +1051,18 @@ export default function ConnectionList() {
                     }
                   `}
                         >
-                          <div className="font-medium text-zinc-200 truncate">
-                            {conn.name}
+                          <div className="flex min-w-0 items-center gap-1.5">
+                            <div className="min-w-0 flex-1 truncate font-medium text-zinc-200">
+                              {conn.name}
+                            </div>
+                            <RemotePlatformBadge
+                              platform={
+                                conn.remotePlatform ??
+                                Object.values(sessions ?? {}).find(
+                                  (session) => session.configId === conn.id,
+                                )?.remotePlatform
+                              }
+                            />
                           </div>
                           <div className="text-xs text-zinc-500 truncate">
                             {formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}

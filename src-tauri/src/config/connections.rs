@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 
 use super::persist::JsonPersistable;
 
+/// Auto-detected remote platform, persisted alongside the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemotePlatform {
+    Windows,
+    Linux,
+    Macos,
+    Unix,
+}
+
 /// A saved SSH connection configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +47,9 @@ pub struct SavedConnection {
     /// 跳板机私钥的密钥库 id，语义同 `key_id`
     #[serde(default)]
     pub jump_key_id: Option<String>,
+    /// 首次成功连接后自动探测到的远端平台；旧数据没有这个字段。
+    #[serde(default)]
+    pub remote_platform: Option<RemotePlatform>,
 }
 
 /// Store for managing saved SSH connections.
@@ -113,6 +126,20 @@ impl ConnectionStore {
         self.connections.iter().find(|c| c.id == id)
     }
 
+    /// Store the platform detected after a successful connection.
+    ///
+    /// Returns whether the value changed. Unknown ids are ignored so a stale
+    /// probe cannot recreate a connection deleted while it was running.
+    pub fn set_remote_platform(&mut self, id: &str, platform: RemotePlatform) -> bool {
+        match self.connections.iter_mut().find(|c| c.id == id) {
+            Some(connection) if connection.remote_platform != Some(platform) => {
+                connection.remote_platform = Some(platform);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Update `last_connected` timestamp for a connection.
     pub fn mark_connected(&mut self, id: &str) {
         if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
@@ -156,6 +183,7 @@ mod tests {
             jump_auth_method: None,
             jump_key_path: None,
             jump_key_id: None,
+            remote_platform: None,
         }
     }
 
@@ -187,6 +215,39 @@ mod tests {
         assert_eq!(appended, 0);
         assert_eq!(ignored, 0);
         assert_eq!(store.get_by_id("c").unwrap().group.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn set_remote_platform_only_touches_the_matching_connection() {
+        let mut store = store_of(vec![conn("a", None), conn("b", None)]);
+
+        assert!(store.set_remote_platform("a", RemotePlatform::Windows));
+        assert_eq!(
+            store.get_by_id("a").unwrap().remote_platform,
+            Some(RemotePlatform::Windows)
+        );
+        assert_eq!(store.get_by_id("b").unwrap().remote_platform, None);
+        assert!(!store.set_remote_platform("missing", RemotePlatform::Linux));
+    }
+
+    #[test]
+    fn remote_platform_uses_stable_lowercase_json_values() {
+        assert_eq!(
+            serde_json::to_string(&RemotePlatform::Windows).unwrap(),
+            "\"windows\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RemotePlatform::Linux).unwrap(),
+            "\"linux\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RemotePlatform::Macos).unwrap(),
+            "\"macos\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RemotePlatform::Unix).unwrap(),
+            "\"unix\""
+        );
     }
 
     #[test]

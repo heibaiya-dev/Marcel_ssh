@@ -1,5 +1,26 @@
 import { invoke } from "@tauri-apps/api/core";
 import { isDebugSession } from "@/lib/debugServer";
+import {
+  POSIX_INTERFACES_COMMAND,
+  POSIX_NETWORK_COMMAND,
+  POSIX_PROCESS_COMMAND,
+  POSIX_UNAME_COMMAND,
+  WINDOWS_NETWORK_COMMAND,
+  WINDOWS_PROBE_COMMAND,
+  WINDOWS_PROBE_MARKER,
+  WINDOWS_PROCESS_COMMAND,
+  WINDOWS_TERMINATED_MARKER,
+  parsePosixInterfaces,
+  parsePosixNetworkOutput,
+  parsePosixProcessOutput,
+  parseWindowsNetworkOutput,
+  parseWindowsProcessOutput,
+  classifyRemotePlatform,
+  windowsKillCommand,
+  type RemoteNetworkInterface,
+  type RemoteNetworkSnapshot,
+  type RemoteProcessInfo,
+} from "./remoteSystem";
 import { getErrorMessage } from "./errors";
 import type { HistorySnapshot } from "./historySnapshot";
 import type {
@@ -47,6 +68,7 @@ import type {
   PluginInstallResult,
   TruncateConversationResult,
   JobInfo,
+  RemotePlatform,
 } from "./types";
 
 // SSH commands
@@ -87,28 +109,145 @@ export async function sshExec(
   return invoke<string>("ssh_exec", { sessionId, command });
 }
 
-export async function sshListProcesses(sessionId: string): Promise<string> {
-  return invoke<string>("ssh_exec", {
+/**
+ * A session id belongs to one SSH connection for its whole lifetime, so the
+ * platform probe only needs to run once. Cache the in-flight promise as well:
+ * session setup and the process/network panels may all ask on the same tick.
+ */
+const remoteOsCache = new Map<string, Promise<RemotePlatform | null>>();
+
+/**
+ * Detect the remote platform.
+ *
+ * Windows OpenSSH always has Windows PowerShell 5.1, so a tiny PowerShell
+ * marker is the most reliable positive test. If it is absent, `uname -s`
+ * distinguishes Linux/macOS from other POSIX hosts. Returning null is
+ * deliberate: a restricted shell or forced command must not be mislabeled.
+ */
+export function detectRemoteOs(
+  sessionId: string,
+): Promise<RemotePlatform | null> {
+  const cached = remoteOsCache.get(sessionId);
+  if (cached) return cached;
+
+  const pending = invoke<string>("ssh_exec", {
     sessionId,
-    command:
-      "ps -eo pid,user,pcpu,pmem,etime,comm,args --no-headers 2>/dev/null || ps -eo pid,user,pcpu,pmem,etime,comm,args --no-headers",
-  });
+    command: WINDOWS_PROBE_COMMAND,
+  })
+    .then(async (output) => {
+      if (output.includes(WINDOWS_PROBE_MARKER)) return "windows" as const;
+      const uname = await invoke<string>("ssh_exec", {
+        sessionId,
+        command: POSIX_UNAME_COMMAND,
+      });
+      return classifyRemotePlatform(uname);
+    })
+    .then((platform) => {
+      if (platform === null) remoteOsCache.delete(sessionId);
+      return platform;
+    })
+    .catch((error) => {
+      remoteOsCache.delete(sessionId);
+      throw error;
+    });
+
+  remoteOsCache.set(sessionId, pending);
+  return pending;
 }
 
-export async function sshListNetwork(sessionId: string): Promise<string> {
-  return invoke<string>("ssh_exec", {
-    sessionId,
-    command:
-      '(ss -Htlnp 2>/dev/null || ss -tlnp 2>/dev/null); echo "---CONNECTIONS---"; (ss -Htnp 2>/dev/null || ss -tnp 2>/dev/null)',
-  });
+/**
+ * Read the process table for either a POSIX host or a Windows OpenSSH host.
+ *
+ * Windows OpenSSH runs remote commands through cmd.exe by default. PowerShell
+ * is invoked explicitly and emits JSON, avoiding fragile parsing of localized
+ * `tasklist` output. On POSIX hosts the existing `ps` command is retained.
+ */
+export async function sshListProcesses(
+  sessionId: string,
+): Promise<RemoteProcessInfo[]> {
+  const os = await detectRemoteOs(sessionId);
+  if (os === "windows") {
+    const output = await sshExec(sessionId, WINDOWS_PROCESS_COMMAND);
+    const parsed = parseWindowsProcessOutput(output);
+    if (parsed === null) {
+      throw new Error("Windows 进程数据读取失败，请确认服务器已安装 PowerShell 5.1 或更高版本");
+    }
+    return parsed;
+  }
+
+  const output = await sshExec(sessionId, POSIX_PROCESS_COMMAND);
+  return parsePosixProcessOutput(output);
 }
 
-export async function sshListInterfaces(sessionId: string): Promise<string> {
-  return invoke<string>("ssh_exec", {
-    sessionId,
-    command:
-      "ip -j addr 2>/dev/null || ip addr 2>/dev/null || ifconfig 2>/dev/null",
-  });
+/**
+ * Read listening sockets, active TCP connections, and network interfaces.
+ *
+ * Windows uses the built-in `netstat -ano` table (fast and available on older
+ * Server editions) and enriches it with PowerShell process/adapter metadata.
+ */
+export async function sshListNetwork(
+  sessionId: string,
+): Promise<RemoteNetworkSnapshot> {
+  const os = await detectRemoteOs(sessionId);
+  if (os === "windows") {
+    const output = await sshExec(sessionId, WINDOWS_NETWORK_COMMAND);
+    const parsed = parseWindowsNetworkOutput(output);
+    if (parsed === null) {
+      throw new Error("Windows 网络数据读取失败，请确认服务器已启用 PowerShell 与网络适配器命令");
+    }
+    return parsed;
+  }
+
+  const [networkOutput, interfacesOutput] = await Promise.all([
+    sshExec(sessionId, POSIX_NETWORK_COMMAND),
+    sshExec(sessionId, POSIX_INTERFACES_COMMAND).catch(() => ""),
+  ]);
+  return {
+    sockets: parsePosixNetworkOutput(networkOutput),
+    interfaces: parsePosixInterfaces(interfacesOutput),
+  };
+}
+
+/** Kept as a small standalone helper for callers that only need interfaces. */
+export async function sshListInterfaces(
+  sessionId: string,
+): Promise<RemoteNetworkInterface[]> {
+  const os = await detectRemoteOs(sessionId);
+  if (os === "windows") {
+    const output = await sshExec(sessionId, WINDOWS_NETWORK_COMMAND);
+    const parsed = parseWindowsNetworkOutput(output);
+    if (parsed === null) throw new Error("Windows 网卡数据读取失败");
+    return parsed.interfaces;
+  }
+  return parsePosixInterfaces(
+    await sshExec(sessionId, POSIX_INTERFACES_COMMAND),
+  );
+}
+
+/**
+ * Terminate a process inside a user-triggered panel action.
+ *
+ * Keep the command constructed here rather than interpolating from React:
+ * a malformed PID is rejected before reaching the remote shell.
+ */
+export async function sshTerminateProcess(
+  sessionId: string,
+  pid: string | number,
+): Promise<void> {
+  const os = await detectRemoteOs(sessionId);
+  if (os === "windows") {
+    const command = windowsKillCommand(pid);
+    if (!command) throw new Error("无效的进程 PID");
+    const output = await sshExec(sessionId, command);
+    if (!output.includes(WINDOWS_TERMINATED_MARKER)) {
+      throw new Error(output.trim() || "终止进程失败");
+    }
+    return;
+  }
+
+  const rawPid = String(pid).trim();
+  if (!/^\d+$/.test(rawPid)) throw new Error("无效的进程 PID");
+  await sshExec(sessionId, `kill -TERM ${rawPid}`);
 }
 
 // Agent commands
@@ -537,6 +676,14 @@ export async function saveConnection(
   connection: SavedConnection,
 ): Promise<string> {
   return invoke<string>("config_save_connection", { connection });
+}
+
+/** Persist the auto-detected remote platform without rewriting the whole connection. */
+export async function setConnectionRemotePlatform(
+  id: string,
+  platform: RemotePlatform,
+): Promise<void> {
+  return invoke("config_set_connection_remote_platform", { id, platform });
 }
 
 /**

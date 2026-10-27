@@ -1,18 +1,11 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { sshExec, sshListProcesses } from '@/lib/tauri';
+import { sshListProcesses, sshTerminateProcess } from '@/lib/tauri';
+import type { RemoteProcessInfo } from '@/lib/remoteSystem';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { getErrorMessage } from '@/lib/errors';
 
-interface ProcessInfo {
-  pid: string;
-  user: string;
-  cpu: number;
-  mem: number;
-  etime: string;
-  comm: string;
-  args: string;
-}
+type ProcessInfo = RemoteProcessInfo;
 
 type SortKey = 'pid' | 'user' | 'comm' | 'mem' | 'cpu' | 'etime' | 'args';
 type SortDir = 'asc' | 'desc';
@@ -37,23 +30,7 @@ export default function ProcessPanel({ sessionId }: ProcessPanelProps) {
     setLoading(true);
     setError(null);
     try {
-      const output = await sshListProcesses(sessionId);
-      const lines = output.split('\n').filter((l) => l.trim());
-      const parsed: ProcessInfo[] = lines.map((line) => {
-        const parts = line.trim().split(/\s+/);
-        if (parts.length < 6) return null;
-
-        const isNum = (s: string) => /^\d+(\.\d+)?$/.test(s);
-        let pid: string, user: string, cpu: number, mem: number, etime: string, comm: string, args: string;
-
-        if (isNum(parts[2])) {
-          pid = parts[0]; user = parts[1]; cpu = parseFloat(parts[2]) || 0; mem = parseFloat(parts[3]) || 0; etime = parts[4]; comm = parts[5]; args = parts.slice(6).join(' ');
-        } else {
-          pid = parts[0]; user = parts[1]; comm = parts[2]; cpu = parseFloat(parts[3]) || 0; mem = parseFloat(parts[4]) || 0; etime = parts[5]; args = parts.slice(6).join(' ');
-        }
-
-        return { pid, user, cpu, mem, etime, comm, args };
-      }).filter(Boolean) as ProcessInfo[];
+      const parsed = await sshListProcesses(sessionId);
       setProcesses(parsed);
     } catch (err) {
       setError(`加载失败：${getErrorMessage(err)}`);
@@ -112,7 +89,7 @@ export default function ProcessPanel({ sessionId }: ProcessPanelProps) {
     setKillConfirm(null);
     setMenuProcess(null);
     try {
-      await sshExec(sessionId, `kill -TERM ${proc.pid}`);
+      await sshTerminateProcess(sessionId, proc.pid);
       await loadProcesses();
     } catch (err) {
       setError(`终止失败：${getErrorMessage(err)}`);

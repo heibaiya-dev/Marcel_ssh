@@ -11,6 +11,7 @@ import { usePrivacyMode } from '@/hooks/usePrivacyMode';
 import { asHostKeyMismatch, getErrorMessage, parseAppError } from '@/lib/errors';
 import { isPasswordRejected } from '@/lib/privateKey';
 import { formatConnLabel } from '@/lib/privacy';
+import RemotePlatformBadge from '@/components/connection/RemotePlatformBadge';
 import type { SavedConnection } from '@/lib/types';
 import * as tauri from '@/lib/tauri';
 
@@ -197,6 +198,14 @@ export default function TabBar() {
 
                 {/* Label */}
                 <span className="truncate flex-1">{label}</span>
+
+                <RemotePlatformBadge
+                  compact
+                  platform={
+                    session.remotePlatform ??
+                    savedConnectionOf(session.id)?.remotePlatform
+                  }
+                />
 
                 {/* Agent Activity Status (OpenCode style Spinner / Amber dot / Emerald dot) */}
                 <AgentStatusIndicator
