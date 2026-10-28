@@ -59,3 +59,6 @@ scratch/
 
 .workbuddy/
 promo/
+# TypeScript 编译缓存（tsc 增量 / composite 产物）
+tsconfig.tsbuildinfo
+dist-node/
