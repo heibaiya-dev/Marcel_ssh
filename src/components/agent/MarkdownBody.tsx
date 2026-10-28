@@ -7,8 +7,10 @@ import { markdownRenderManager } from '@/lib/markdownRenderManager';
 import type { MarkdownTree } from '@/lib/markdownProcessor';
 import { openExternalLink } from '@/lib/externalLinks';
 import { MarkdownVisibility } from './markdownVisibility';
+import CodeBlock from './CodeBlock';
 
 const components: Components = {
+  pre: CodeBlock,
   a: ({ href, children, node: _node, ...props }) => (
     <a {...props} href={href} onClick={(event) => {
       event.preventDefault();
