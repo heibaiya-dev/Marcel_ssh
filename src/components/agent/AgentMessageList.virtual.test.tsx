@@ -156,7 +156,10 @@ function renderedIds() {
   return [...viewport.querySelectorAll<HTMLElement>('[data-message-id]')].map((el) => el.dataset.messageId);
 }
 
-describe('real virtualizer integration', () => {
+// 真实 virtualizer + 10,000 行夹具，单个用例在 CI 的 Windows 机器上会逼近 vitest 默认的 5 秒上限
+// （同一文件在 CI 上整体约 19 秒，本地只要 1/4）。超时一旦触发，用例的残余异步会串进下一个用例，
+// 报出的 scrollTop 空指针是这个连锁结果，所以这里整组放宽超时，而不是逐个用例碰运气。
+describe('real virtualizer integration', { timeout: 20_000 }, () => {
   // 回归：曾给 Virtualizer 传 ssrCount，virtua 的 store 会停在「SSR 模式」直到第一次
   // 有效滚动事件；内容不足一屏的会话永远滚不动，于是第 12 个槽位之后的行（新会话第一轮
   // 的后续工具卡、回复）只有正在执行时靠 keepMounted 露面，一完成就从列表消失。
