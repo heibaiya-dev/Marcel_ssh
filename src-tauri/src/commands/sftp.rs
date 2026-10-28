@@ -597,6 +597,21 @@ pub async fn sftp_read_file(
     })
 }
 
+/// 登录用户的家目录（SFTP 服务器对 `.` 的规范化结果，即 OpenSSH `sftp` 一登录就落脚的
+/// 目录）。文件管理器在「默认的 `/` 读不了」时用它兜底：serv00 这类共享主机的普通用户
+/// 没有根目录的读权限，从 `/` 起步只会得到 Permission denied。
+#[tauri::command]
+pub async fn sftp_home_dir(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<String, AppError> {
+    state
+        .ssh_manager
+        .with_shared_sftp(&session_id, |sftp| async move { sftp.canonicalize(".").await })
+        .await?
+        .map_err(|e| AppError::Ssh(format!("获取家目录失败: {}", e)))
+}
+
 #[tauri::command]
 pub async fn sftp_get_mtime(
     state: State<'_, AppState>,

@@ -16,6 +16,7 @@ import type { StoredTransferItem } from '@/stores/transferStore';
 
 const mocks = vi.hoisted(() => ({
   sftpListDir: vi.fn(),
+  sftpHomeDir: vi.fn(),
   sftpRename: vi.fn(async () => {}),
   sftpPasteEntry: vi.fn(async () => 'a (1).txt'),
   saveSettings: vi.fn(async () => {}),
@@ -24,6 +25,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@/lib/tauri', () => ({
   sftpListDir: mocks.sftpListDir,
+  sftpHomeDir: mocks.sftpHomeDir,
   sftpRename: mocks.sftpRename,
   sftpPasteEntry: mocks.sftpPasteEntry,
   saveSettings: mocks.saveSettings,
@@ -229,6 +231,8 @@ async function putTransfer(
 beforeEach(() => {
   mocks.sftpListDir.mockReset();
   mocks.sftpListDir.mockResolvedValue([DIR, FILE]);
+  mocks.sftpHomeDir.mockReset();
+  mocks.sftpHomeDir.mockResolvedValue('/usr/home/u');
   mocks.sftpRename.mockClear();
   mocks.sftpPasteEntry.mockClear();
   useFileClipboardStore.getState().clear();
@@ -299,6 +303,51 @@ describe('目录记忆走本机存储而不是整份保存设置', () => {
     expect(mocks.sftpListDir).toHaveBeenLastCalledWith('s1', '/home/user');
     expect(localStorage.getItem(FILE_MANAGER_PATH_MEMORY_STORAGE_KEY)).not.toBeNull();
     expect(mocks.saveSettings).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 起始目录读不了（serv00 这类共享主机的普通用户没有 `/` 的读权限，或记住的目录已被删）
+ * 时改去家目录，而不是停在一条 Permission denied 上。
+ */
+describe('起始目录读不了时改去家目录', () => {
+  const denied = { kind: 'Ssh', message: 'SSH error: 读取目录失败: Permission denied' };
+
+  it('起始目录被拒：自动进入家目录并正常列出，不留错误条', async () => {
+    mocks.sftpListDir.mockImplementation(async (_s: string, path: string) => {
+      if (path === '/home/user') throw denied;
+      return [DIR, FILE];
+    });
+    await mountFilesTab();
+    await act(async () => {});
+
+    expect(mocks.sftpHomeDir).toHaveBeenCalledWith('s1');
+    expect(mocks.sftpListDir).toHaveBeenLastCalledWith('s1', '/usr/home/u');
+    expect(container.textContent).not.toContain('加载失败');
+    const stored = JSON.parse(
+      localStorage.getItem(FILE_MANAGER_PATH_MEMORY_STORAGE_KEY) ?? '{}',
+    );
+    expect(stored.byConnection['cfg-1']).toBe('/usr/home/u');
+  });
+
+  it('家目录也读不了：显示原始错误，不循环重试', async () => {
+    mocks.sftpListDir.mockRejectedValue(denied);
+    await mountFilesTab();
+    await act(async () => {});
+
+    expect(container.textContent).toContain('加载失败');
+    // 起始目录一次 + 家目录一次，之后不再反复尝试。
+    expect(mocks.sftpListDir).toHaveBeenCalledTimes(2);
+  });
+
+  it('取不到家目录（返回的就是失败的目录）：显示原始错误', async () => {
+    mocks.sftpHomeDir.mockResolvedValue('/home/user');
+    mocks.sftpListDir.mockRejectedValue(denied);
+    await mountFilesTab();
+    await act(async () => {});
+
+    expect(container.textContent).toContain('加载失败');
+    expect(mocks.sftpListDir).toHaveBeenCalledTimes(1);
   });
 });
 

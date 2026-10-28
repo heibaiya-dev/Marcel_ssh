@@ -4,6 +4,7 @@ import {
   cacheKeysUnder,
   canExpandPath,
   canWalkChildren,
+  chainChildToward,
   clampTreeWidth,
   FILE_TREE_MAX_DEPTH,
   filterDirEntries,
@@ -136,5 +137,22 @@ describe('fileTreeModel', () => {
       }),
     ).toBe(true);
     expect(canWalkChildren({ status: 'loaded', dirs: [] })).toBe(true);
+  });
+
+  it('chainChildToward：列不出来的祖先补上通往当前目录的下一级', () => {
+    expect(chainChildToward('/', '/usr/home/u')).toEqual({
+      name: 'usr',
+      path: '/usr',
+      isSymlink: false,
+    });
+    expect(chainChildToward('/usr', '/usr/home/u')?.path).toBe('/usr/home');
+    expect(chainChildToward('/usr/home', '/usr/home/u/')?.path).toBe('/usr/home/u');
+  });
+
+  it('chainChildToward：不是真祖先（自己、兄弟、前缀同名）一律不补', () => {
+    expect(chainChildToward('/usr/home/u', '/usr/home/u')).toBeNull();
+    expect(chainChildToward('/var', '/usr/home/u')).toBeNull();
+    expect(chainChildToward('/usr/ho', '/usr/home/u')).toBeNull();
+    expect(chainChildToward('/', '/')).toBeNull();
   });
 });

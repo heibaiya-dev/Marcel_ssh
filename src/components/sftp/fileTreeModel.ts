@@ -122,6 +122,23 @@ export function seedCacheFromListing(
   };
 }
 
+/**
+ * 某个祖先目录列不出来（共享主机的 `/` 没有读权限）时，目录树里它下面的链条会断：
+ * 缓存里没有它的子目录，树就没法往下走到用户正在看的目录。这里按「当前目录」补出
+ * 这条链上的下一级——它至少是存在的，因为用户此刻就在它下面。
+ * `failedPath` 不是 `currentPath` 的真祖先（或就是它自己）时返回 null。
+ */
+export function chainChildToward(failedPath: string, currentPath: string): TreeDirChild | null {
+  const from = normalizeRemotePath(failedPath);
+  const to = normalizeRemotePath(currentPath);
+  if (from === to) return null;
+  const prefix = from === '/' ? '/' : `${from}/`;
+  if (!to.startsWith(prefix)) return null;
+  const name = to.slice(prefix.length).split('/')[0];
+  if (!name) return null;
+  return { name, path: joinRemotePath(from, name), isSymlink: false };
+}
+
 /** Drop self + descendants; leave siblings intact. */
 export function invalidateCacheAt(cache: TreeCache, path: string): TreeCache {
   const keys = cacheKeysUnder(cache, path);

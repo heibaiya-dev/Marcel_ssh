@@ -1340,6 +1340,11 @@ export async function sftpReadFile(
   return { ...result, hasBom: result.hasBom === true };
 }
 
+/** 登录用户的家目录（绝对路径）。 */
+export async function sftpHomeDir(sessionId: string): Promise<string> {
+  return invoke<string>("sftp_home_dir", { sessionId });
+}
+
 export async function sftpGetMtime(
   sessionId: string,
   path: string,

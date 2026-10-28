@@ -1137,6 +1137,7 @@ pub fn run() {
             commands::sftp::sftp_compress_archive,
             commands::sftp::sftp_read_file,
             commands::sftp::sftp_get_mtime,
+            commands::sftp::sftp_home_dir,
             commands::sftp::sftp_write_file,
             commands::sftp::sftp_download_stream,
             commands::sftp::sftp_upload_stream,

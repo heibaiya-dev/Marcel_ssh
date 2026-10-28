@@ -14,6 +14,7 @@ import {
   sftpOpenWithSystem,
 } from '@/lib/tauri';
 import type { SftpFileEntry } from '@/lib/types';
+import { resolveHomeFallback } from '@/lib/sftpHomeFallback';
 import { formatSize, modeToString, getErrorMessage, isDialogCancelled, isPreviewableImage, getFileExtension } from '@/lib/sftp-helpers';
 import { binaryNotEditableMessage, fileTooLargeMessage, imageTooLargeMessage, joinRemotePath, sortFileEntries } from '@/lib/sftpFileOpen';
 import { loadRememberedPath, rememberPath } from '@/lib/fileManagerPathMemory';
@@ -159,6 +160,10 @@ export default function FileManagerPanel({ sessionId, connectionKey }: FileManag
     useSettingsStore.getState().update({ fileManagerTreeUserHidden: next });
   }, []);
 
+  // 起始目录（默认 `/` 或上次记住的）读不了时改去家目录，每个会话只兜一次。
+  const initialPathRef = useRef(currentPath);
+  const homeTriedRef = useRef<string | null>(null);
+
   const loadDirectory = useCallback(async (path: string) => {
     // 迟到的请求不许套在新目录上：传输完成回调捕获的是**发起上传时**的 currentPath，
     // 传大文件夹期间用户可能已经切走。此前只有 loadSeqRef 防乱序，旧路径的刷新是最
@@ -177,6 +182,19 @@ export default function FileManagerPanel({ sessionId, connectionKey }: FileManag
       seedTreeFromListing(path, items);
     } catch (err) {
       if (seq !== loadSeqRef.current || currentPathRef.current !== path) return;
+      if (path === initialPathRef.current && homeTriedRef.current !== sessionId) {
+        homeTriedRef.current = sessionId;
+        const home = await resolveHomeFallback(sessionId, path);
+        if (seq !== loadSeqRef.current || currentPathRef.current !== path) return;
+        if (home) {
+          // 替换而不是新增历史：「后退」不该退回那个读不了的起点。
+          initialPathRef.current = home;
+          setHistory([home]);
+          setHistoryIndex(0);
+          setCurrentPath(home);
+          return;
+        }
+      }
       setError(`加载失败：${getErrorMessage(err)}`);
     } finally {
       if (seq === loadSeqRef.current && currentPathRef.current === path) {

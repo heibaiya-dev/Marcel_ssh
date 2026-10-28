@@ -4,6 +4,7 @@ import { getErrorMessage } from '@/lib/sftp-helpers';
 import {
   ancestorPaths,
   canExpandPath,
+  chainChildToward,
   filterDirEntries,
   invalidateCacheAt,
   isCacheFresh,
@@ -29,6 +30,8 @@ export function useFileTree({ sessionId, showHidden, currentPath }: UseFileTreeO
   showHiddenRef.current = showHidden;
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  const currentPathRef = useRef(currentPath);
+  currentPathRef.current = currentPath;
 
   const loadNode = useCallback(async (rawPath: string, force = false) => {
     const path = normalizeRemotePath(rawPath);
@@ -60,14 +63,20 @@ export function useFileTree({ sessionId, showHidden, currentPath }: UseFileTreeO
       setCache((prev) => ({ ...prev, [path]: entry }));
     } catch (err) {
       if (loadSeqRef.current[path] !== seq) return;
-      setCache((prev) => ({
-        ...prev,
-        [path]: {
-          status: 'error',
-          dirs: prev[path]?.dirs ?? [],
-          error: getErrorMessage(err),
-        },
-      }));
+      // 列不出来的祖先（共享主机的 `/` 无读权限）：补上通往当前目录的那一级，
+      // 否则树在这里断掉，用户正在看的目录在树里找不到。
+      const bridge = chainChildToward(path, currentPathRef.current);
+      setCache((prev) => {
+        const dirs = prev[path]?.dirs ?? [];
+        return {
+          ...prev,
+          [path]: {
+            status: 'error',
+            dirs: bridge && !dirs.some((d) => d.path === bridge.path) ? [...dirs, bridge] : dirs,
+            error: getErrorMessage(err),
+          },
+        };
+      });
     }
   }, []);
 

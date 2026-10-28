@@ -50,6 +50,7 @@ import {
 import { useConnectionStore } from '@/stores/connectionStore';
 import { isDebugSession } from '@/lib/debugServer';
 import { loadRememberedPath, rememberPath } from '@/lib/fileManagerPathMemory';
+import { resolveHomeFallback } from '@/lib/sftpHomeFallback';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { withForegroundKeepAlive } from './mobileBridge';
@@ -134,6 +135,8 @@ export default function MobileFilesHost({
   const bindingKey = ids ? `${ids.sessionId}:${ids.connectionKey ?? ''}` : null;
 
   const [currentPath, setCurrentPath] = useState('/');
+  const initialPathRef = useRef<string | null>(null);
+  const homeTriedRef = useRef(false);
   const [pathReady, setPathReady] = useState(false);
   const [entries, setEntries] = useState<SftpFileEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -196,6 +199,9 @@ export default function MobileFilesHost({
       useSettingsStore.getState().settings,
     );
     setCurrentPath(remembered);
+    // 起始目录读不了就改去家目录，每次（重新）绑定会话只兜一次。
+    initialPathRef.current = remembered;
+    homeTriedRef.current = false;
     setPathReady(true);
     setActionOpen(false);
     setSelectMode(false);
@@ -240,6 +246,16 @@ export default function MobileFilesHost({
         setEntries(items);
       } catch (err) {
         if (seq !== loadSeqRef.current || path !== currentPathRef.current) return;
+        if (path === initialPathRef.current && !homeTriedRef.current) {
+          homeTriedRef.current = true;
+          const home = await resolveHomeFallback(sessionId, path);
+          if (seq !== loadSeqRef.current || path !== currentPathRef.current) return;
+          if (home) {
+            initialPathRef.current = home;
+            setCurrentPath(home);
+            return;
+          }
+        }
         setEntries([]);
         setError(`加载失败：${getErrorMessage(err)}`);
       } finally {
