@@ -149,9 +149,7 @@ impl ConnectionStore {
 }
 
 impl JsonPersistable for ConnectionStore {
-    fn default_filename() -> &'static str {
-        "connections.json"
-    }
+    const SOURCE: crate::data::DataSourceId = crate::data::DataSourceId::Connections;
 }
 
 impl Default for ConnectionStore {

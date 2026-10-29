@@ -8,6 +8,7 @@
 use tauri::http::Response;
 use tauri::{Manager, Runtime};
 
+use crate::data::DataSourceId;
 use crate::plugins::enabled::is_plugin_enabled;
 use crate::plugins::fs::is_within_base;
 
@@ -51,7 +52,7 @@ pub fn handle_plugin_uri<R: Runtime>(
         Err(_) => return server_error("no config dir"),
     };
     let rel = path.trim_start_matches('/').to_string();
-    let plugin_dir = config_dir.join("plugins").join(&plugin_id);
+    let plugin_dir = DataSourceId::Plugins.path(&config_dir).join(&plugin_id);
     let candidate = plugin_dir.join(if rel.is_empty() { "index.html" } else { &rel });
     if !is_within_base(&plugin_dir, &candidate) {
         return forbidden("invalid plugin resource path");

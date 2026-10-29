@@ -24,13 +24,13 @@ use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::data::DataSourceId;
 use crate::emit_event;
 use crate::error::AppError;
 use crate::util::validate_sftp_remote_path;
 
 use super::{commit_remote_temp_file, remote_sidecar_path};
 
-const SYSOPEN_TEMP_DIR_PREFIX: &str = "marcel-sysopen";
 const SYSOPEN_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// 单个 SSH 会话同时「用系统方式打开」的文件数上限。超过则拒绝，
 /// 避免本地临时文件过多、SFTP 通道被回传任务挤占、磁盘被打满。
@@ -870,7 +870,7 @@ pub(super) async fn open_with_system(
         .path()
         .app_data_dir()
         .map_err(|e| AppError::Ssh(format!("获取 app_data_dir 失败: {}", e)))?;
-    let session_temp_root = app_data.join(SYSOPEN_TEMP_DIR_PREFIX).join(&session_id);
+    let session_temp_root = DataSourceId::SysopenTemp.path(&app_data).join(&session_id);
     let task_temp_root = session_temp_root.join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&task_temp_root)
         .map_err(|e| AppError::Ssh(format!("创建临时目录失败: {}", e)))?;
@@ -1034,7 +1034,7 @@ pub(crate) async fn cleanup_session_sysopen(
         Ok(d) => d,
         Err(_) => return,
     };
-    let temp_dir = app_data.join(SYSOPEN_TEMP_DIR_PREFIX).join(session_id);
+    let temp_dir = DataSourceId::SysopenTemp.path(&app_data).join(session_id);
     if temp_dir.exists() {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

@@ -31,7 +31,7 @@ use crate::agent::tools::subagent::{resolve_subagent_candidates, SubagentModelCa
 use crate::agent::tools::{
     mcp::register_mcp_tools, plugin_tool::register_plugin_tools, subagent, ToolRegistry,
 };
-use crate::config::keychain;
+use crate::config::keychain::{self, SecretSlot};
 use crate::config::settings::{CommandApprovalEngine, ExperimentalSettings};
 use crate::error::AppError;
 use crate::llm::jev::JevConfig;
@@ -631,7 +631,7 @@ impl AgentManager {
         let jev_cfg = if agent_settings.enable_model_command_approval
             && agent_settings.command_approval_engine == CommandApprovalEngine::Jev
         {
-            match keychain::get_jev_api_key() {
+            match keychain::get(&SecretSlot::JevApiKey) {
                 Ok(Some(key)) if !key.trim().is_empty() => Some(
                     JevConfig::new(
                         key,

@@ -3,7 +3,6 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::commands::market::{download_first_with_progress, zip_urls_for_branch};
-use crate::config::persist::JsonPersistable;
 use crate::emit_event;
 use crate::error::AppError;
 use crate::skills::github::parse_skill_url;
@@ -11,7 +10,7 @@ use crate::skills::parser::{
     discover_repo_skills, process_md, process_repo_archive, process_zip, validate_resources,
     DiscoveredSkill, ParsedSkill,
 };
-use crate::skills::store::{Skill, SkillResource, SkillStore};
+use crate::skills::store::{Skill, SkillResource};
 use crate::AppState;
 
 #[tauri::command]
@@ -211,20 +210,18 @@ pub async fn skill_add(
     }
     let resources = resources.unwrap_or_default();
     validate_resources(&resources).map_err(AppError::Config)?;
-    let path = SkillStore::default_file(&state.config_dir);
-    let (candidate, cloned) = {
-        let store = state.skill_store.write().await;
-        let mut candidate = store.clone();
-        let mut skill = Skill::new(name, description, prompt);
-        skill.resources = resources;
-        // 新 skill 追加到用户排序列表末尾
-        skill.position = candidate.next_position();
-        let cloned = skill.clone();
-        candidate.add(skill);
-        (candidate, cloned)
-    };
-    tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-    *state.skill_store.write().await = candidate;
+    let cloned = state
+        .skill_store
+        .mutate(|store| {
+            let mut skill = Skill::new(name, description, prompt);
+            skill.resources = resources;
+            // 新 skill 追加到用户排序列表末尾
+            skill.position = store.next_position();
+            let cloned = skill.clone();
+            store.add(skill);
+            Ok(cloned)
+        })
+        .await?;
 
     Ok(cloned)
 }
@@ -257,40 +254,28 @@ pub async fn skill_update(
     if let Some(ref r) = resources {
         validate_resources(r).map_err(AppError::Config)?;
     }
-    let path = SkillStore::default_file(&state.config_dir);
-    {
-        let candidate = {
-            let store = state.skill_store.write().await;
-            let mut candidate = store.clone();
-            if !candidate.update(&id, name, description, prompt, resources) {
+    state
+        .skill_store
+        .mutate(|store| {
+            if !store.update(&id, name, description, prompt, resources) {
                 return Err(AppError::Config(format!("skill not found: {}", id)));
             }
-            candidate
-        };
-        tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-        *state.skill_store.write().await = candidate;
-    }
-
-    Ok(())
+            Ok(())
+        })
+        .await
 }
 
 #[tauri::command]
 pub async fn skill_toggle(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    let path = SkillStore::default_file(&state.config_dir);
-    {
-        let candidate = {
-            let store = state.skill_store.write().await;
-            let mut candidate = store.clone();
-            if !candidate.toggle(&id) {
+    state
+        .skill_store
+        .mutate(|store| {
+            if !store.toggle(&id) {
                 return Err(AppError::Config(format!("skill not found: {}", id)));
             }
-            candidate
-        };
-        tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-        *state.skill_store.write().await = candidate;
-    }
-
-    Ok(())
+            Ok(())
+        })
+        .await
 }
 
 #[tauri::command]
@@ -300,19 +285,15 @@ pub async fn skill_delete(state: State<'_, AppState>, id: String) -> Result<(), 
             "内置 Skill 不可删除，可在列表中禁用".into(),
         ));
     }
-    let path = SkillStore::default_file(&state.config_dir);
-    let candidate = {
-        let store = state.skill_store.write().await;
-        let mut candidate = store.clone();
-        if !candidate.delete(&id) {
-            return Err(AppError::Config(format!("skill not found: {}", id)));
-        }
-        candidate
-    };
-    tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-    *state.skill_store.write().await = candidate;
-
-    Ok(())
+    state
+        .skill_store
+        .mutate(|store| {
+            if !store.delete(&id) {
+                return Err(AppError::Config(format!("skill not found: {}", id)));
+            }
+            Ok(())
+        })
+        .await
 }
 
 /// 用户 skill 手动排序（拖拽 / 上移下移）。ids 为完整的用户 skill id 顺序，
@@ -325,19 +306,13 @@ pub async fn skill_reorder(state: State<'_, AppState>, ids: Vec<String>) -> Resu
     {
         return Err(AppError::Config("内置 Skill 不参与手动排序".into()));
     }
-    let path = SkillStore::default_file(&state.config_dir);
-    {
-        let (candidate, changed) = {
-            let store = state.skill_store.write().await;
-            let mut candidate = store.clone();
-            let changed = candidate.apply_user_order(&ids);
-            (candidate, changed)
-        };
-        if !changed.is_empty() {
-            tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-            *state.skill_store.write().await = candidate;
-        }
-    }
-
-    Ok(())
+    // 顺序没变 = 成功的 no-op：`apply_user_order` 只在有 skill 的 position 真的变了时才改候选值，
+    // 没变 `mutate` 序列化前后相同，不写盘。
+    state
+        .skill_store
+        .mutate(|store| {
+            store.apply_user_order(&ids);
+            Ok(())
+        })
+        .await
 }

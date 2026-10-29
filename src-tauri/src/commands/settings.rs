@@ -1,8 +1,7 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::config::keychain;
-use crate::config::persist::JsonPersistable;
+use crate::config::keychain::{self, SecretSlot};
 use crate::config::settings::AppSettings;
 use crate::error::AppError;
 use crate::llm::manager::LlmManager;
@@ -74,10 +73,7 @@ pub fn compute_channel_key_status(settings: &AppSettings) -> Vec<ChannelKeyStatu
         .iter()
         .map(|c| {
             let has_key = !c.api_key.is_empty()
-                || keychain::get_llm_channel_key(&c.id)
-                    .ok()
-                    .flatten()
-                    .is_some();
+                || keychain::has(&SecretSlot::LlmChannel(c.id.clone())).unwrap_or(false);
             ChannelKeyStatus {
                 channel_id: c.id.clone(),
                 has_key,
@@ -90,25 +86,16 @@ pub fn compute_channel_key_status(settings: &AppSettings) -> Vec<ChannelKeyStatu
 #[tauri::command]
 pub async fn config_get_settings(state: State<'_, AppState>) -> Result<SettingsResponse, AppError> {
     let settings = state.settings.read().await.clone();
-    let has_api_key = keychain::get_llm_api_key().ok().flatten().is_some();
-    let has_web_search_api_key = keychain::get_web_search_api_key().ok().flatten().is_some();
-    let has_deepseek_tools_api_key = keychain::get_deepseek_tools_api_key()
-        .ok()
-        .flatten()
-        .is_some();
-    let has_custom_search_api_key = keychain::get_custom_search_api_key()
-        .ok()
-        .flatten()
-        .is_some();
-    let has_custom_fetch_api_key = keychain::get_custom_fetch_api_key()
-        .ok()
-        .flatten()
-        .is_some();
-    let has_tavily_fetch_api_key = keychain::get_tavily_fetch_api_key()
-        .ok()
-        .flatten()
-        .is_some();
-    let has_jev_api_key = keychain::get_jev_api_key().ok().flatten().is_some();
+    // 各功能 Key 的有无由槽位表统一探测，字段名 / 语义与改造前一致：
+    // 这里的 `has_api_key` 只看旧版单配置 Key（渠道维度另走 `channel_key_status`）。
+    let flags = keychain::FeatureKeyFlags::probe();
+    let has_api_key = flags.legacy_llm_api_key;
+    let has_web_search_api_key = flags.web_search_api_key;
+    let has_deepseek_tools_api_key = flags.deepseek_tools_api_key;
+    let has_custom_search_api_key = flags.custom_search_api_key;
+    let has_custom_fetch_api_key = flags.custom_fetch_api_key;
+    let has_tavily_fetch_api_key = flags.tavily_fetch_api_key;
+    let has_jev_api_key = flags.jev_api_key;
     let channel_key_status = compute_channel_key_status(&settings);
     // Take the warning so the user only sees it once (after a single load).
     let warning = state.settings_warning.write().take();
@@ -178,7 +165,10 @@ pub async fn config_save_settings(
         let store = state.settings.read().await;
         for channel in &mut candidate.llm_registry.channels {
             if !channel.api_key.is_empty() && !is_masked_key(&channel.api_key) {
-                keychain::save_llm_channel_key(&channel.id, &channel.api_key)?;
+                keychain::set(
+                    &SecretSlot::LlmChannel(channel.id.clone()),
+                    &channel.api_key,
+                )?;
                 log::info!("已将渠道 [{}] 的 API Key 保存到密钥链", channel.name);
             } else if channel.api_key.is_empty() || is_masked_key(&channel.api_key) {
                 // 保留内存旧 key（若存在）；api_key 不落盘，掩码值只在内存停留
@@ -202,18 +192,15 @@ pub async fn config_save_settings(
                 .iter()
                 .any(|c| c.id == old.id)
             {
-                let _ = keychain::delete_llm_channel_key(&old.id);
+                let _ = keychain::delete(&SecretSlot::LlmChannel(old.id.clone()));
             }
         }
     }
 
-    // 先持久化候选快照，成功后才提交内存；写盘失败保持旧状态。
-    let path = AppSettings::default_file(&state.config_dir);
-    tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-    let mut store = state.settings.write().await;
-    *store = candidate.clone();
-    let snapshot = candidate;
-    drop(store);
+    // 先持久化候选快照，成功后才提交内存；写盘失败保持旧状态（`replace` 保证）。
+    // 没变化时不写盘（但候选值照常换入内存：渠道 `api_key` 等不进序列化的字段要生效）。
+    let snapshot = candidate.clone();
+    state.settings.replace(candidate).await?;
 
     // 更新方式变了 → 让更新器立刻按新模式行事：切到「关闭」要停掉进行中的
     // 下载并收回提示，从「关闭」切回来要马上检查一次（否则用户刚打开开关还要
@@ -314,12 +301,13 @@ pub async fn llm_list_models(
 
     let resolved_key = match api_key {
         Some(k) if !k.is_empty() && !is_masked_key(&k) => k,
-        _ => match channel_id
-            .as_deref()
-            .and_then(|id| keychain::get_llm_channel_key(id).ok().flatten())
-        {
+        _ => match channel_id.as_deref().and_then(|id| {
+            keychain::get(&SecretSlot::LlmChannel(id.to_string()))
+                .ok()
+                .flatten()
+        }) {
             Some(k) => k,
-            None => match keychain::get_llm_api_key()? {
+            None => match keychain::get(&SecretSlot::LegacyLlmApiKey)? {
                 Some(k) => k,
                 None => {
                     return Err(AppError::Llm(

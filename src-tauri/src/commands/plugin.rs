@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::data::DataSourceId;
 use crate::error::AppError;
 use crate::plugins::capability::as_hash_map;
 use crate::plugins::manifest::PluginManifest;
@@ -52,13 +53,13 @@ pub async fn plugin_reload(
 
 #[tauri::command]
 pub async fn get_plugin_dir(state: State<'_, AppState>) -> Result<String, AppError> {
-    let plugins_dir = state.config_dir.join("plugins");
+    let plugins_dir = DataSourceId::Plugins.path(&state.config_dir);
     Ok(plugins_dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 pub async fn open_plugin_dir(state: State<'_, AppState>) -> Result<(), AppError> {
-    let plugins_dir = state.config_dir.join("plugins");
+    let plugins_dir = DataSourceId::Plugins.path(&state.config_dir);
     if !plugins_dir.exists() {
         std::fs::create_dir_all(&plugins_dir)
             .map_err(|e| AppError::Other(format!("创建插件目录失败: {}", e)))?;

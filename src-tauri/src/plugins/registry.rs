@@ -21,6 +21,7 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 
 use crate::config::settings::AppSettings;
+use crate::data::DataSourceId;
 use crate::plugins::manifest::PluginManifest;
 use crate::plugins::scan::scan_plugins;
 
@@ -165,7 +166,7 @@ impl PluginRegistry {
                 if rel.is_empty() {
                     None
                 } else {
-                    let section_path = config_dir.join("plugins").join(id).join(rel);
+                    let section_path = DataSourceId::Plugins.path(config_dir).join(id).join(rel);
                     match std::fs::metadata(&section_path)
                         .and_then(|md| md.modified().map(|mtime| (section_path.clone(), mtime)))
                     {

@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::keychain;
+use crate::config::keychain::{self, SecretSlot};
 use crate::config::settings::AppSettings;
 use crate::error::AppError;
 use crate::llm::error::validate_retry_conditions;
@@ -372,7 +372,7 @@ impl LlmRegistry {
         let api_key = if !channel.api_key.is_empty() {
             channel.api_key.clone()
         } else {
-            match keychain::get_llm_channel_key(&channel.id)? {
+            match keychain::get(&SecretSlot::LlmChannel(channel.id.clone()))? {
                 Some(k) => k,
                 None => {
                     return Err(AppError::Llm(format!(
@@ -797,8 +797,8 @@ pub fn migrate_legacy_settings(settings: &mut AppSettings) -> bool {
     if migrated_llm && !settings.llm_registry.channels.is_empty() {
         let channel_id = settings.llm_registry.channels[0].id.clone();
         if settings.llm_registry.channels[0].api_key.is_empty() {
-            if let Ok(Some(key)) = keychain::get_llm_api_key() {
-                if keychain::save_llm_channel_key(&channel_id, &key).is_ok() {
+            if let Ok(Some(key)) = keychain::get(&SecretSlot::LegacyLlmApiKey) {
+                if keychain::set(&SecretSlot::LlmChannel(channel_id.clone()), &key).is_ok() {
                     settings.llm_registry.channels[0].api_key = key;
                     log::info!("已从旧 keychain 条目迁移 API Key 到渠道 {}", channel_id);
                 }

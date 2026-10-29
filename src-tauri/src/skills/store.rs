@@ -180,9 +180,7 @@ impl SkillStore {
 }
 
 impl JsonPersistable for SkillStore {
-    fn default_filename() -> &'static str {
-        "skills.json"
-    }
+    const SOURCE: crate::data::DataSourceId = crate::data::DataSourceId::Skills;
 }
 
 #[cfg(test)]

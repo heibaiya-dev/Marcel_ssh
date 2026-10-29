@@ -371,11 +371,13 @@ pub async fn build_headless_llm(config_dir: &Path) -> Result<LlmManager, AppErro
 
     let mut fetched: Vec<Option<String>> = Vec::with_capacity(channel_ids.len());
     for id in channel_ids {
-        let key = tokio::task::spawn_blocking(move || crate::config::keychain::get_llm_channel_key(&id))
-            .await
-            .ok()
-            .and_then(|res| res.ok())
-            .flatten();
+        let key = tokio::task::spawn_blocking(move || {
+            crate::config::keychain::get(&crate::config::keychain::SecretSlot::LlmChannel(id))
+        })
+        .await
+        .ok()
+        .and_then(|res| res.ok())
+        .flatten();
         fetched.push(key);
     }
 
@@ -639,9 +641,11 @@ mod tests {
             )
             .await,
         );
-        let store = Arc::new(tokio::sync::RwLock::new(
+        let store = crate::data::JsonStore::new(
+            &dir,
             crate::config::connections::ConnectionStore::new(),
-        ));
+            None,
+        );
         let executor = Arc::new(ExternalExecutor::new(store, exec_mgr, Arc::new(ssh)));
         let registry = ToolRegistry::new_with_agent_tasks(executor, dir);
         let runner = registry

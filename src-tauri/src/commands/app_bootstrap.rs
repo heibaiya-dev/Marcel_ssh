@@ -60,52 +60,23 @@ pub async fn app_get_bootstrap(state: State<'_, AppState>) -> Result<AppBootstra
         tokio::task::spawn_blocking(move || {
             let channel_key_status =
                 crate::commands::settings::compute_channel_key_status(&settings);
-            let has_api_key = channel_key_status.iter().any(|s| s.has_key)
-                || keychain::get_llm_api_key().ok().flatten().is_some();
-            let has_web_search_api_key =
-                keychain::get_web_search_api_key().ok().flatten().is_some();
-            let has_deepseek_tools_api_key = keychain::get_deepseek_tools_api_key()
-                .ok()
-                .flatten()
-                .is_some();
-            let has_custom_search_api_key = keychain::get_custom_search_api_key()
-                .ok()
-                .flatten()
-                .is_some();
-            let has_custom_fetch_api_key = keychain::get_custom_fetch_api_key()
-                .ok()
-                .flatten()
-                .is_some();
-            let has_tavily_fetch_api_key = keychain::get_tavily_fetch_api_key()
-                .ok()
-                .flatten()
-                .is_some();
-            let has_jev_api_key = keychain::get_jev_api_key().ok().flatten().is_some();
-            (
-                channel_key_status,
-                (
-                    has_api_key,
-                    has_web_search_api_key,
-                    has_deepseek_tools_api_key,
-                    has_custom_search_api_key,
-                    has_custom_fetch_api_key,
-                    has_tavily_fetch_api_key,
-                    has_jev_api_key,
-                ),
-            )
+            // 各功能 Key 的有无由槽位表统一探测（`FeatureKeyFlags`），这里只负责把它们
+            // 映射成前端契约里的字段；`has_api_key` 是「任一渠道有 Key，或旧版单配置 Key 还在」。
+            let flags = keychain::FeatureKeyFlags::probe();
+            let has_api_key =
+                channel_key_status.iter().any(|s| s.has_key) || flags.legacy_llm_api_key;
+            (channel_key_status, (has_api_key, flags))
         })
         .await
         .map_err(|e| AppError::Other(format!("密钥链探测任务失败: {}", e)))?
     };
-    let (
-        has_api_key,
-        has_web_search_api_key,
-        has_deepseek_tools_api_key,
-        has_custom_search_api_key,
-        has_custom_fetch_api_key,
-        has_tavily_fetch_api_key,
-        has_jev_api_key,
-    ) = key_flags;
+    let (has_api_key, flags) = key_flags;
+    let has_web_search_api_key = flags.web_search_api_key;
+    let has_deepseek_tools_api_key = flags.deepseek_tools_api_key;
+    let has_custom_search_api_key = flags.custom_search_api_key;
+    let has_custom_fetch_api_key = flags.custom_fetch_api_key;
+    let has_tavily_fetch_api_key = flags.tavily_fetch_api_key;
+    let has_jev_api_key = flags.jev_api_key;
     let settings_warning = state.settings_warning.write().take();
 
     let connections = state.connection_store.read().await.get_all().to_vec();

@@ -8,6 +8,8 @@ pub mod child_resources;
 pub mod command_exec;
 pub mod commands;
 pub mod config;
+// 数据源登记表 + 数据变更广播 + 统一 JSON 存储：本机所有落盘数据的唯一来源。
+pub mod data;
 // 分段并发下载器（HTTP Range）：GitHub 这类线路按单连接限速，安装包下载
 // 靠把一条流拆成多条连接才能跑满带宽（见模块内实测数据）。
 pub mod download;
@@ -34,7 +36,6 @@ use std::path::PathBuf;
 
 use parking_lot::RwLock as PlRwLock;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::RwLock as TokioRwLock;
 
 use crate::agent::conversation::ConversationDb;
 use crate::agent::task::AgentTask;
@@ -43,6 +44,7 @@ use crate::config::connections::ConnectionStore;
 use crate::config::persist::JsonPersistable;
 use crate::config::quick_commands::QuickCommandStore;
 use crate::config::settings::AppSettings;
+use crate::data::{DataChangeBus, DataSourceId, JsonStore};
 use crate::mcp::manager::McpManager;
 use crate::mcp::store::McpServerStore;
 use crate::skills::store::SkillStore;
@@ -115,12 +117,17 @@ pub struct AppState {
     /// 空串 = 无记忆。与 `session_models` 同生命周期（启动装载、会话删除
     /// 级联清理），但独立维度：仅当档位在当前生效模型声明内才生效。
     pub session_efforts: std::sync::Arc<PlRwLock<HashMap<String, HashMap<String, String>>>>,
-    pub connection_store: std::sync::Arc<TokioRwLock<ConnectionStore>>,
-    pub settings: std::sync::Arc<TokioRwLock<AppSettings>>,
-    pub quick_command_store: std::sync::Arc<TokioRwLock<QuickCommandStore>>,
+    // 5 份 JSON 配置：读用 `store.read().await`（与原来的 RwLock 一致），**写只能走**
+    // `mutate` / `begin_update` / `replace`（`JsonStore` 是它们唯一的写盘出口，见 `data/`）。
+    pub connection_store: JsonStore<ConnectionStore>,
+    pub settings: JsonStore<AppSettings>,
+    pub quick_command_store: JsonStore<QuickCommandStore>,
     pub conversation_db: std::sync::Arc<ConversationDb>,
-    pub skill_store: std::sync::Arc<TokioRwLock<SkillStore>>,
-    pub mcp_store: std::sync::Arc<TokioRwLock<McpServerStore>>,
+    pub skill_store: JsonStore<SkillStore>,
+    pub mcp_store: JsonStore<McpServerStore>,
+    /// 数据变更广播：任何已登记的数据成功写盘后发一条「哪份数据变了」。
+    /// 现阶段只有测试订阅，以后的同步引擎订阅它。
+    pub data_changes: DataChangeBus,
     pub mcp_manager: std::sync::Arc<McpManager>,
     /// Application config directory. Used for persisting connections, settings, etc.
     pub config_dir: PathBuf,
@@ -214,12 +221,14 @@ impl AppState {
         // 私钥库：导入的私钥加密存放在 {config_dir}/keys，与其它配置同目录
         crate::ssh::key_store::init(&config_dir);
 
+        // 数据变更广播：先建好，各 store 与 known_hosts 写盘后都往这里发。
+        let data_changes = DataChangeBus::new();
+
         // Pre-compute file paths so each `spawn_blocking` closure can own its
         // own copy without borrowing `config_dir`.
-        let known_hosts_path = config_dir.join("known_hosts.json");
         let connections_file = ConnectionStore::default_file(&config_dir);
         let settings_file = AppSettings::default_file(&config_dir);
-        let db_path = config_dir.join("conversations.db");
+        let db_path = DataSourceId::Conversations.path(&config_dir);
         let skills_file = SkillStore::default_file(&config_dir);
         let quick_commands_file = QuickCommandStore::default_file(&config_dir);
         let mcp_servers_file = McpServerStore::default_file(&config_dir);
@@ -245,7 +254,7 @@ impl AppState {
 
             tokio::join!(
                 // KnownHostsStore::load is already async.
-                KnownHostsStore::load(known_hosts_path),
+                KnownHostsStore::load_in_config_dir(&config_dir, Some(data_changes.clone())),
                 // Sync JSON stores – offload to blocking thread pool.
                 tokio::task::spawn_blocking(move || {
                     ConnectionStore::load_from_path(&connections_file)
@@ -356,9 +365,14 @@ impl AppState {
         // Backwards-compat: 旧版单渠道单模型配置（llmConfig）在加载时自动迁移为
         // 多渠道多模型注册表（默认渠道 + 单模型 + 槽位绑定），API Key 从旧
         // keychain 条目搬入渠道条目。迁移幂等，无旧配置时不做任何改动。
+        //
+        // 下面三段启动期自愈各自只改内存里的 `settings` 并记一笔「要回写」，等
+        // `JsonStore` 建好后统一 `save_current()` 落一次盘（旧版是每段各写一次，
+        // 终态相同）。
+        let mut settings_needs_save = false;
         if crate::llm::registry::migrate_legacy_settings(&mut settings) {
             log::info!("旧版 LLM 单配置已迁移为多渠道多模型注册表");
-            let _ = settings.save_to_path(&AppSettings::default_file(&config_dir));
+            settings_needs_save = true;
         }
 
         // 自愈：清理注册表里同 id 重复的模型条目（历史「保存渠道」合并 bug 的
@@ -373,7 +387,7 @@ impl AppState {
                     before,
                     settings.llm_registry.models.len()
                 );
-                let _ = settings.save_to_path(&AppSettings::default_file(&config_dir));
+                settings_needs_save = true;
             }
         }
 
@@ -384,7 +398,7 @@ impl AppState {
             let changed = settings.llm_registry.normalize_reasoning_efforts();
             if changed {
                 log::warn!("检测到思考强度档位含空格/重复/空项，已自动归一化并落盘修复");
-                let _ = settings.save_to_path(&AppSettings::default_file(&config_dir));
+                settings_needs_save = true;
             }
         }
 
@@ -499,6 +513,9 @@ impl AppState {
         // 一个用户 skill 都没有。等用户自己触发一次保存（那时内存已合并好
         // 新内容）再写，与 connections / quick_commands / mcp「启动期不写盘」
         // 的既有做法一致。
+        //
+        // 落盘本身要等 `JsonStore` 建好（见下方 Phase 3 的 `skills_needs_save`）。
+        let mut skills_needs_save = false;
         let skill_store = {
             let mut store = skill_store;
             let changed = crate::skills::builtin::ensure_builtin_skills(&mut store);
@@ -511,10 +528,7 @@ impl AppState {
                         retired
                     );
                 } else {
-                    let path = SkillStore::default_file(&config_dir);
-                    if let Err(e) = store.save_to_path(&path) {
-                        log::warn!("内置 skill 同步后持久化失败: {}", e);
-                    }
+                    skills_needs_save = true;
                     log::info!(
                         "内置 skill 已注入/更新 {} 项，下线 {} 项",
                         changed.len(),
@@ -550,13 +564,29 @@ impl AppState {
         };
 
         // ── Phase 3: wire up shared store handles ─────────────────────
-        // 先把各 store 包成 Arc<TokioRwLock<T>>，供 Self{} 使用。
-        let connection_store_arc = std::sync::Arc::new(TokioRwLock::new(connection_store));
-        let settings_arc = std::sync::Arc::new(TokioRwLock::new(settings));
-        let quick_command_store_arc = std::sync::Arc::new(TokioRwLock::new(quick_command_store));
+        // 5 份 JSON 配置包成 `JsonStore`（此后唯一的写盘出口），供 Self{} 使用。
+        let connection_store_arc =
+            JsonStore::new(&config_dir, connection_store, Some(data_changes.clone()));
+        let settings_arc = JsonStore::new(&config_dir, settings, Some(data_changes.clone()));
+        let quick_command_store_arc =
+            JsonStore::new(&config_dir, quick_command_store, Some(data_changes.clone()));
         let conversation_db_arc = std::sync::Arc::new(conversation_db);
-        let skill_store_arc = std::sync::Arc::new(TokioRwLock::new(skill_store));
-        let mcp_store_arc = std::sync::Arc::new(TokioRwLock::new(mcp_store));
+        let skill_store_arc = JsonStore::new(&config_dir, skill_store, Some(data_changes.clone()));
+        let mcp_store_arc = JsonStore::new(&config_dir, mcp_store, Some(data_changes.clone()));
+
+        // 启动期要回写的两份：设置（LLM 迁移 / 去重 / 档位归一化）与 skills（内置注入）。
+        // 失败只记日志，不阻断启动（与旧版 `let _ =` / warn 的处理一致）。
+        if settings_needs_save {
+            if let Err(e) = settings_arc.save_current().await {
+                log::warn!("启动期设置自愈后持久化失败: {}", e);
+            }
+        }
+        if skills_needs_save {
+            if let Err(e) = skill_store_arc.save_current().await {
+                log::warn!("内置 skill 同步后持久化失败: {}", e);
+            }
+        }
+
         let mcp_manager = std::sync::Arc::new(McpManager::new());
         let memory = std::sync::Arc::new(crate::memory::MemoryManager::open(&config_dir));
 
@@ -567,8 +597,8 @@ impl AppState {
         let ssh_manager = SshManager::with_known_hosts(known_hosts);
         let command_exec = crate::command_exec::CommandExecutionManager::new(
             ssh_manager.clone(),
-            config_dir.join("jobs_temp"),
-            config_dir.join(crate::command_exec::LEDGER_FILE_NAME),
+            DataSourceId::JobsTemp.path(&config_dir),
+            DataSourceId::JobLedger.path(&config_dir),
         )
         .await;
 
@@ -586,7 +616,7 @@ impl AppState {
         let local_command_exec =
             crate::command_exec::CommandExecutionManager::with_transport_at_prefixed(
                 std::sync::Arc::new(crate::command_exec::LocalExecTransport::new()),
-                config_dir.join("local_command"),
+                DataSourceId::LocalCommand.path(&config_dir),
                 crate::command_exec::CommandExecutionManager::LOCAL_JOB_ID_PREFIX,
             );
 
@@ -602,6 +632,7 @@ impl AppState {
             conversation_db: conversation_db_arc,
             skill_store: skill_store_arc,
             mcp_store: mcp_store_arc,
+            data_changes,
             mcp_manager: mcp_manager.clone(),
             config_dir,
             agent_interaction: crate::agent::interaction::AgentInteractionManager::new(),
@@ -876,21 +907,29 @@ pub fn run() {
                     for id in channel_ids {
                         let id_owned = id.clone();
                         let key_res = tokio::task::spawn_blocking(move || {
-                            crate::config::keychain::get_llm_channel_key(&id_owned)
+                            crate::config::keychain::get(
+                                &crate::config::keychain::SecretSlot::LlmChannel(id_owned),
+                            )
                         })
                         .await;
                         if let Ok(Ok(Some(key))) = key_res {
-                            let mut settings = settings_arc.write().await;
-                            if let Some(channel) = settings
-                                .llm_registry
-                                .channels
-                                .iter_mut()
-                                .find(|c| c.id == id)
-                            {
-                                if channel.api_key.is_empty() {
-                                    channel.api_key = key;
-                                }
-                            }
+                            // `api_key` 不进序列化（skip_serializing），所以这一步走
+                            // `mutate` 只会换入内存、**不会写盘也不会广播**。
+                            let _ = settings_arc
+                                .mutate(|settings| {
+                                    if let Some(channel) = settings
+                                        .llm_registry
+                                        .channels
+                                        .iter_mut()
+                                        .find(|c| c.id == id)
+                                    {
+                                        if channel.api_key.is_empty() {
+                                            channel.api_key = key;
+                                        }
+                                    }
+                                    Ok(())
+                                })
+                                .await;
                         }
                     }
                     log::info!("已后台异步预热各渠道 LLM API Key");

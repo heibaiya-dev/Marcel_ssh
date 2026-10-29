@@ -35,12 +35,13 @@ use parking_lot::RwLock as PlRwLock;
 use tauri::AppHandle;
 use tokio::sync::{watch, Mutex as TokioMutex};
 
+use crate::data::DataSourceId;
 use crate::error::AppError;
 use crate::ssh::connection::SshManager;
 
 use super::executor::{timeout_preview, ExecExit, ExecOutcome, ExecTransport, SshExecTransport};
 use super::job::{next_unwaited_polls, JobInfo, JobInstance, JobOutputResult, JobStatus};
-use super::ledger::{JobLedgerStore, LedgerJob, LEDGER_FILE_NAME, RETENTION_MILLIS};
+use super::ledger::{JobLedgerStore, LedgerJob, RETENTION_MILLIS};
 use super::ticket::{
     truncate_display, CancelReason, CommandSource, CommandTicket, ExecutionSnapshot,
     ExecutionStatus, DEFAULT_EXEC_TIMEOUT,
@@ -509,7 +510,7 @@ impl CommandExecutionManager {
         base: PathBuf,
         prefix: &str,
     ) -> Self {
-        let temp_dir = base.join("jobs_temp");
+        let temp_dir = DataSourceId::JobsTemp.path(&base);
         let _ = std::fs::create_dir_all(&temp_dir);
         let inner = Arc::new(ManagerInner {
             transport,
@@ -518,10 +519,10 @@ impl CommandExecutionManager {
             by_task_id: TokioMutex::new(HashMap::new()),
             recent: TokioMutex::new(VecDeque::new()),
             jobs: PlMutex::new(HashMap::new()),
-            // 台账文件名只认 `ledger::LEDGER_FILE_NAME`：硬编码字符串会在
-            // 改名时静默分叉（改了常量、这里还在读写旧文件，重启后作业
-            // 全「查无此作业」）。
-            ledger: Arc::new(JobLedgerStore::load(base.join(LEDGER_FILE_NAME))),
+            // 台账位置只认数据源登记表的 `JobLedger`（`ledger::LEDGER_FILE_NAME` 是它的
+            // 别名）：硬编码字符串会在改名时静默分叉（改了登记、这里还在读写旧文件，
+            // 重启后作业全「查无此作业」）。
+            ledger: Arc::new(JobLedgerStore::load(DataSourceId::JobLedger.path(&base))),
             job_id_prefix: PlRwLock::new(prefix.to_string()),
             temp_dir,
             task_drain_hook: PlRwLock::new(None),
@@ -1734,6 +1735,7 @@ impl Drop for JobFinalizeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command_exec::ledger::LEDGER_FILE_NAME;
     use crate::command_exec::ticket::CommandSource;
     use async_trait::async_trait;
     use std::time::Duration;

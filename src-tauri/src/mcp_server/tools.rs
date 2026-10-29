@@ -765,7 +765,7 @@ mod tests {
             )
             .await,
         );
-        let store = Arc::new(tokio::sync::RwLock::new(ConnectionStore::new()));
+        let store = crate::data::JsonStore::new(&dir, ConnectionStore::new(), None);
         let executor = Arc::new(ExternalExecutor::new(store, exec, Arc::new(ssh)));
         ToolRegistry::new(executor)
     }
@@ -957,7 +957,7 @@ mod tests {
         assert!(id.starts_with("mcp-temp-"), "临时连接 id 应有前缀: {}", id);
         assert_eq!(parsed["temporary"], true);
 
-        // 关键：临时连接必须能被 list_connections 看见（共享 RwLock，不是快照）
+        // 关键：临时连接必须能被 list_connections 看见（共享 JsonStore，不是快照）
         let listed = registry
             .call_tool("list_connections", json!({}))
             .await
@@ -1013,7 +1013,7 @@ mod tests {
             )
             .await,
         );
-        let store = Arc::new(tokio::sync::RwLock::new(ConnectionStore::new()));
+        let store = crate::data::JsonStore::new(&dir, ConnectionStore::new(), None);
         let executor = Arc::new(ExternalExecutor::new(store, exec, Arc::new(ssh)));
         ToolRegistry::new_with_agent_tasks(executor, dir)
     }

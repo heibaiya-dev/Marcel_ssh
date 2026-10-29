@@ -1,12 +1,26 @@
+use crate::data::DataSourceId;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// 一份落在配置目录里的 JSON 配置。
+///
+/// **只管「读」**：读文件 + 解析 + 迁移。**写盘的唯一出口是
+/// [`crate::data::JsonStore`]**——这个 trait 刻意没有 `save_to_path`，除了
+/// `JsonStore` 没人能把这几份文件存下来（编译期保证）。原因是以后的同步引擎要求
+/// 「每次写盘都串行化、都广播」，散在各处的 `clone → 改 → save → 换回` 做不到。
 pub trait JsonPersistable: Sized + Serialize + for<'de> Deserialize<'de> + Default {
-    fn default_filename() -> &'static str;
+    /// 这份配置在数据源登记表里的身份。**必填、没有默认值**：以后新加配置文件
+    /// 忘了登记就直接编译不过，而不是悄悄落到一个登记表不知道的位置。
+    const SOURCE: DataSourceId;
+
+    /// 文件名（取自登记表）。
+    fn default_filename() -> &'static str {
+        Self::SOURCE.rel_path()
+    }
 
     fn default_file(config_dir: &Path) -> PathBuf {
-        config_dir.join(Self::default_filename())
+        Self::SOURCE.path(config_dir)
     }
 
     /// 只做「读文件 + serde 解析」，**不含任何迁移/归一化**。
@@ -28,16 +42,6 @@ pub trait JsonPersistable: Sized + Serialize + for<'de> Deserialize<'de> + Defau
 
     fn load_from_path(path: &Path) -> Result<Self, AppError> {
         Self::load_parsed(path)
-    }
-
-    fn save_to_path(&self, path: &Path) -> Result<(), AppError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| AppError::Config(format!("创建配置目录失败: {}", e)))?;
-        }
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| AppError::Config(format!("序列化配置失败: {}", e)))?;
-        atomic_write(path, &json).map_err(|e| AppError::Config(format!("写入配置文件失败: {}", e)))
     }
 }
 

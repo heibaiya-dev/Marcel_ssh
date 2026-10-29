@@ -1107,9 +1107,7 @@ impl AppSettings {
 }
 
 impl JsonPersistable for AppSettings {
-    fn default_filename() -> &'static str {
-        "settings.json"
-    }
+    const SOURCE: crate::data::DataSourceId = crate::data::DataSourceId::Settings;
 
     /// 覆盖默认加载：解析后补一次三态更新方式的迁移（见
     /// `migrate_update_mode_from_legacy`）。原始文本读不到时跳过迁移 ——

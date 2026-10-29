@@ -156,7 +156,7 @@ mod tests {
         let mut server = McpServer::new(
             McpServerConfig::default(),
             Arc::new(ssh_mgr),
-            Arc::new(tokio::sync::RwLock::new(ConnectionStore::new())),
+            crate::data::JsonStore::new(&dir, ConnectionStore::new(), None),
         );
         server.command_exec = Some(command_exec);
         server
@@ -265,7 +265,7 @@ mod tests {
         let server = McpServer::new(
             McpServerConfig::default(),
             Arc::new(SshManager::new()),
-            Arc::new(tokio::sync::RwLock::new(ConnectionStore::new())),
+            crate::data::JsonStore::new(&std::env::temp_dir(), ConnectionStore::new(), None),
         );
         assert!(server.build_registry().is_err());
     }

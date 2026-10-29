@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::data::DataSourceId;
 use crate::error::AppError;
 
 /// 插件清单文件名（写保护比较的唯一来源）。
@@ -57,7 +58,7 @@ pub fn resolve_read_path(
     if is_manifest_relative_path(path) {
         return Err(AppError::Other("plugin.json access rejected".into()));
     }
-    let plugin_dir = config_dir.join("plugins").join(plugin_id);
+    let plugin_dir = DataSourceId::Plugins.path(config_dir).join(plugin_id);
     let base_dir = plugin_dir
         .canonicalize()
         .map_err(|_| AppError::Other(format!("plugin directory not found: {}", plugin_id)))?;
@@ -87,7 +88,7 @@ pub fn resolve_write_path(
     if is_manifest_relative_path(path) {
         return Err(AppError::Other("plugin.json write rejected".into()));
     }
-    let plugin_dir = config_dir.join("plugins").join(plugin_id);
+    let plugin_dir = DataSourceId::Plugins.path(config_dir).join(plugin_id);
     let base_dir = plugin_dir
         .canonicalize()
         .map_err(|_| AppError::Other(format!("plugin directory not found: {}", plugin_id)))?;

@@ -32,6 +32,7 @@ use crate::agent::task::{AgentMode, AgentStatus, AgentTask};
 use crate::command_exec::executor::{ExecExit, ExecOutcome, ExecTransport};
 use crate::command_exec::{CancelReason, CommandExecutionManager, CommandTicket};
 use crate::config::settings::{AppSettings, NotificationSettings};
+use crate::data::{DataChangeBus, DataSourceId, JsonStore};
 use crate::error::AppError;
 use crate::llm::registry::{ChannelConfig, LlmRegistry, ModelEntry, NetPolicy};
 use crate::ssh::connection::SshManager;
@@ -335,22 +336,23 @@ fn isolated_state_with(
         plans: Default::default(),
         session_models: Default::default(),
         session_efforts: Default::default(),
-        connection_store: Arc::new(tokio::sync::RwLock::new(
+        connection_store: JsonStore::new(
+            dir,
             crate::config::connections::ConnectionStore::new(),
-        )),
-        settings: Arc::new(tokio::sync::RwLock::new(settings)),
-        quick_command_store: Arc::new(tokio::sync::RwLock::new(
-            crate::config::quick_commands::QuickCommandStore::new(),
-        )),
-        conversation_db: Arc::new(
-            ConversationDb::new(dir.join("conversations.db")).expect("temporary SQLite"),
+            None,
         ),
-        skill_store: Arc::new(tokio::sync::RwLock::new(
-            crate::skills::store::SkillStore::new(),
-        )),
-        mcp_store: Arc::new(tokio::sync::RwLock::new(
-            crate::mcp::store::McpServerStore::new(),
-        )),
+        settings: JsonStore::new(dir, settings, None),
+        quick_command_store: JsonStore::new(
+            dir,
+            crate::config::quick_commands::QuickCommandStore::new(),
+            None,
+        ),
+        conversation_db: Arc::new(
+            ConversationDb::new(DataSourceId::Conversations.path(dir)).expect("temporary SQLite"),
+        ),
+        skill_store: JsonStore::new(dir, crate::skills::store::SkillStore::new(), None),
+        mcp_store: JsonStore::new(dir, crate::mcp::store::McpServerStore::new(), None),
+        data_changes: DataChangeBus::new(),
         mcp_manager: Arc::new(crate::mcp::manager::McpManager::new()),
         config_dir: dir.to_path_buf(),
         agent_interaction: AgentInteractionManager::new(),
@@ -1332,10 +1334,12 @@ fn scripted_production_loop_pressure_compaction_via_real_anchor() {
         // 压力窗口只在任务启动时读一次：spawn 前把测试窗口写进设置。
         state
             .settings
-            .write()
+            .mutate(|settings| {
+                settings.agent_mode_settings.context_window = PRESSURE_WINDOW;
+                Ok(())
+            })
             .await
-            .agent_mode_settings
-            .context_window = PRESSURE_WINDOW;
+            .unwrap();
         let parent = state
             .conversation_db
             .create_conversation("scripted-connection", "parent")
@@ -2949,7 +2953,14 @@ fn hanging_mcp_server_does_not_delay_task_start() {
             trusted: false,
         })
         .expect("valid MCP server config");
-        state.mcp_store.write().await.add(server);
+        state
+            .mcp_store
+            .mutate(|store| {
+                store.add(server);
+                Ok(())
+            })
+            .await
+            .unwrap();
         // 主任务要有一条在册的 SSH 会话，否则会按"出生即孤儿"当场收场。
         state
             .ssh_manager

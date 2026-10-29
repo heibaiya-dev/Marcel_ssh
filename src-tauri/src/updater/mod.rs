@@ -35,6 +35,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::commands::update::{check_for_update, LatestRelease};
 use crate::config::settings::UpdateMode;
+use crate::data::DataSourceId;
 use crate::error::AppError;
 
 pub mod install;
@@ -58,8 +59,6 @@ const DISK_HEADROOM_MB: u64 = 64;
 
 pub const UPDATE_STATE_EVENT: &str = "update://state";
 
-/// 下载/待装文件统一落在这个子目录，目录内一切文件都由本模块管理。
-const UPDATE_DIR_NAME: &str = "update";
 const PENDING_FILE_NAME: &str = "pending.json";
 
 /// 推送给前端的状态（每次变化 emit `update://state`）。
@@ -209,12 +208,14 @@ pub fn init(app: &AppHandle) {
     });
 }
 
+/// 下载/待装文件统一落在这个子目录（`DataSourceId::UpdateCache`），目录内一切文件
+/// 都由本模块管理。
 fn update_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let cache = app
         .path()
         .app_cache_dir()
         .map_err(|e| format!("获取缓存目录失败: {}", e))?;
-    Ok(cache.join(UPDATE_DIR_NAME))
+    Ok(DataSourceId::UpdateCache.path(&cache))
 }
 
 // ── 状态写入与事件 ────────────────────────────────────────────────

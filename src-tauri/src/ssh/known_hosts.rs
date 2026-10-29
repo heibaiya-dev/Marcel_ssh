@@ -15,6 +15,7 @@ use russh::keys::ssh_key::{HashAlg, PublicKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::data::{DataChangeBus, DataSourceId};
 use crate::error::AppError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +58,9 @@ pub enum VerifyOutcome {
 pub struct KnownHostsStore {
     path: PathBuf,
     inner: RwLock<KnownHostsFile>,
+    /// 每次**成功写盘**后广播 `DataSourceId::KnownHosts`（以后同步引擎订阅）。
+    /// `None` = 不广播（临时 fallback 文件、纯内存 store、无头模式、测试）。
+    bus: Option<DataChangeBus>,
 }
 
 impl KnownHostsStore {
@@ -67,13 +71,33 @@ impl KnownHostsStore {
         Arc::new(Self {
             path: PathBuf::new(),
             inner: RwLock::new(KnownHostsFile::default()),
+            bus: None,
         })
+    }
+
+    /// 从配置目录里登记表指定的位置（`DataSourceId::KnownHosts`）加载。
+    ///
+    /// GUI 与无头 `--mcp-server` **必须读同一份**（否则无头模式把每台主机都当首次见到，
+    /// 指纹不匹配永不触发），所以两边都经这个入口取路径，而不是各拼各的。
+    /// `bus` 是可选的变更广播，写盘成功后发 `KnownHosts`；其它行为与 [`Self::load`] 完全一致。
+    pub async fn load_in_config_dir(
+        config_dir: &Path,
+        bus: Option<DataChangeBus>,
+    ) -> Result<Arc<Self>, AppError> {
+        Self::load_with_bus(DataSourceId::KnownHosts.path(config_dir), bus).await
     }
 
     /// Load store from disk. Missing file is treated as empty. Corrupt JSON
     /// is renamed aside (`.corrupt.<ts>.bak`) so that the user is forced to
     /// re-confirm host identities rather than silently re-TOFU on next start.
     pub async fn load(path: PathBuf) -> Result<Arc<Self>, AppError> {
+        Self::load_with_bus(path, None).await
+    }
+
+    async fn load_with_bus(
+        path: PathBuf,
+        bus: Option<DataChangeBus>,
+    ) -> Result<Arc<Self>, AppError> {
         let inner = if path.exists() {
             match fs::read_to_string(&path) {
                 Ok(content) if content.trim().is_empty() => KnownHostsFile::default(),
@@ -110,6 +134,7 @@ impl KnownHostsStore {
         Ok(Arc::new(Self {
             path,
             inner: RwLock::new(inner),
+            bus,
         }))
     }
 
@@ -178,7 +203,7 @@ impl KnownHostsStore {
                 guard.entries.insert(id, entry);
             }
         }
-        Self::persist_locked(&self.path, &*guard)
+        self.persist_and_notify(&guard)
     }
 
     /// Replace an existing entry with a new fingerprint after explicit user
@@ -192,14 +217,14 @@ impl KnownHostsStore {
         let id = Self::key_of(host, port);
         let mut guard = self.inner.write().await;
         guard.entries.insert(id, entry);
-        Self::persist_locked(&self.path, &*guard)
+        self.persist_and_notify(&guard)
     }
 
     pub async fn forget(&self, host: &str, port: u16) -> Result<(), AppError> {
         let id = Self::key_of(host, port);
         let mut guard = self.inner.write().await;
         guard.entries.remove(&id);
-        Self::persist_locked(&self.path, &*guard)
+        self.persist_and_notify(&guard)
     }
 
     pub async fn list(&self) -> Vec<(String, KnownHostEntry)> {
@@ -210,6 +235,17 @@ impl KnownHostsStore {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// 写盘；真的写成功了才广播（纯内存 store 没有文件，不广播）。
+    fn persist_and_notify(&self, file: &KnownHostsFile) -> Result<(), AppError> {
+        Self::persist_locked(&self.path, file)?;
+        if let Some(bus) = &self.bus {
+            if !self.path.as_os_str().is_empty() {
+                bus.publish(DataSourceId::KnownHosts);
+            }
+        }
+        Ok(())
     }
 
     /// Atomic write: tmp + fsync + rename. Skips write for in-memory stores
@@ -364,6 +400,85 @@ mod tests {
         let store2 = KnownHostsStore::load(path).await.unwrap();
         assert!(matches!(
             store2.verify("h", 22, &k).await,
+            VerifyOutcome::Match(_)
+        ));
+    }
+
+    fn entry_for(key: &PublicKey) -> KnownHostEntry {
+        let (algo, fp) = KnownHostsStore::fingerprint(key);
+        let now = Utc::now().to_rfc3339();
+        KnownHostEntry {
+            algorithm: algo,
+            fingerprint_sha256: fp,
+            first_seen: now.clone(),
+            last_seen: now,
+        }
+    }
+
+    /// 从配置目录加载走登记表里的 `known_hosts.json`，GUI 与无头模式因此读同一份。
+    #[tokio::test]
+    async fn load_in_config_dir_uses_the_registered_location() {
+        let dir = TempDir::new().unwrap();
+        let store = KnownHostsStore::load_in_config_dir(dir.path(), None)
+            .await
+            .unwrap();
+        store.record("h", 22, entry_for(&key_a())).await.unwrap();
+        assert!(
+            DataSourceId::KnownHosts.path(dir.path()).is_file(),
+            "必须写在登记表指定的位置"
+        );
+        assert_eq!(DataSourceId::KnownHosts.rel_path(), "known_hosts.json");
+    }
+
+    /// 每次成功写盘后广播 `KnownHosts`（record / replace / forget 各一次）；
+    /// 没有订阅者或没有总线时写入照常。
+    #[tokio::test]
+    async fn successful_writes_publish_a_known_hosts_change() {
+        let dir = TempDir::new().unwrap();
+        let bus = DataChangeBus::new();
+        let mut rx = bus.subscribe();
+        let store = KnownHostsStore::load_in_config_dir(dir.path(), Some(bus))
+            .await
+            .unwrap();
+
+        store.record("h", 22, entry_for(&key_a())).await.unwrap();
+        store.replace("h", 22, entry_for(&key_b())).await.unwrap();
+        store.forget("h", 22).await.unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(rx.try_recv().unwrap().source, DataSourceId::KnownHosts);
+        }
+        assert!(rx.try_recv().is_err(), "三次写入就是三条广播");
+    }
+
+    /// 被拒绝的写入（指纹不同的 record）没有落盘，也不得广播；
+    /// 校验结果（Mismatch）不受总线影响。
+    #[tokio::test]
+    async fn rejected_record_does_not_publish_and_mismatch_still_detected() {
+        let dir = TempDir::new().unwrap();
+        let bus = DataChangeBus::new();
+        let store = KnownHostsStore::load_in_config_dir(dir.path(), Some(bus.clone()))
+            .await
+            .unwrap();
+        store.record("h", 22, entry_for(&key_a())).await.unwrap();
+        let mut rx = bus.subscribe();
+
+        let err = store.record("h", 22, entry_for(&key_b())).await;
+        assert!(err.is_err(), "指纹不同不得静默覆盖");
+        assert!(rx.try_recv().is_err(), "被拒绝的写入不得广播");
+        assert!(matches!(
+            store.verify("h", 22, &key_b()).await,
+            VerifyOutcome::Mismatch { .. }
+        ));
+    }
+
+    /// 纯内存 store 没有文件可写，自然也不广播（也没有总线可发）。
+    #[tokio::test]
+    async fn in_memory_store_still_works_without_a_bus() {
+        let store = KnownHostsStore::in_memory();
+        store.record("h", 22, entry_for(&key_a())).await.unwrap();
+        assert!(matches!(
+            store.verify("h", 22, &key_a()).await,
             VerifyOutcome::Match(_)
         ));
     }

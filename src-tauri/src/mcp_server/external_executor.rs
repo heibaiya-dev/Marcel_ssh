@@ -16,10 +16,10 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::RwLock as TokioRwLock;
 
 use crate::command_exec::{CommandExecutionManager, CommandSource, CommandTicket, SubmitOutcome};
 use crate::config::connections::{ConnectionStore, SavedConnection};
+use crate::data::JsonStore;
 use crate::error::AppError;
 use crate::mcp_server::sftp_ops::{FileInfo, SftpExecutor, TransferResult};
 use crate::ssh::auth::AuthMethod;
@@ -53,11 +53,11 @@ fn is_dead_session_error(err: &AppError) -> bool {
 
 /// 外部调用执行器
 pub struct ExternalExecutor {
-    /// 连接表。用 **tokio 的 RwLock** 而不是 parking_lot：GUI 内启动 MCP 服务时
-    /// 要直接复用 `AppState.connection_store` 那一份（AppState 用的是 tokio 锁），
-    /// 共用同一个实例才能让「GUI 里新增的连接」立刻对 MCP 调用可见。
-    /// 若各持一份快照，用户在界面上加完连接、外部 agent 却看不到，是极难查的坑。
-    connection_store: Arc<TokioRwLock<ConnectionStore>>,
+    /// 连接表。GUI 内启动 MCP 服务时要直接复用 `AppState.connection_store` 那一份
+    /// （`JsonStore` 的 `Clone` 共享同一份数据），共用同一个实例才能让「GUI 里新增的
+    /// 连接」立刻对 MCP 调用可见。若各持一份快照，用户在界面上加完连接、外部 agent
+    /// 却看不到，是极难查的坑。
+    connection_store: JsonStore<ConnectionStore>,
     command_exec: Arc<CommandExecutionManager>,
     ssh_manager: Arc<SshManager>,
     sftp_executor: SftpExecutor,
@@ -104,7 +104,7 @@ pub struct TestConnectionResult {
 
 impl ExternalExecutor {
     pub fn new(
-        connection_store: Arc<TokioRwLock<ConnectionStore>>,
+        connection_store: JsonStore<ConnectionStore>,
         command_exec: Arc<CommandExecutionManager>,
         ssh_manager: Arc<SshManager>,
     ) -> Self {
@@ -348,29 +348,32 @@ impl ExternalExecutor {
 
         let connection_id = format!("mcp-temp-{}", uuid::Uuid::new_v4());
 
-        {
-            let mut store = self.connection_store.write().await;
-            store.add(SavedConnection {
-                id: connection_id.clone(),
-                name: name.to_string(),
-                host: host.to_string(),
-                port,
-                username: username.to_string(),
-                auth_method: stored_auth_method.to_string(),
-                key_path: private_key_path.map(str::to_string),
-                key_id: None,
-                group: None,
-                last_connected: None,
-                use_jump: false,
-                jump_host: None,
-                jump_port: None,
-                jump_username: None,
-                jump_auth_method: None,
-                jump_key_path: None,
-                jump_key_id: None,
-                remote_platform: None,
-            });
-        }
+        // 临时连接**只改内存、不落盘、不广播**（随进程生灭，刻意不进 connections.json）：
+        // 这是 `mutate_transient` 唯一的合法用途。
+        self.connection_store
+            .mutate_transient(|store| {
+                store.add(SavedConnection {
+                    id: connection_id.clone(),
+                    name: name.to_string(),
+                    host: host.to_string(),
+                    port,
+                    username: username.to_string(),
+                    auth_method: stored_auth_method.to_string(),
+                    key_path: private_key_path.map(str::to_string),
+                    key_id: None,
+                    group: None,
+                    last_connected: None,
+                    use_jump: false,
+                    jump_host: None,
+                    jump_port: None,
+                    jump_username: None,
+                    jump_auth_method: None,
+                    jump_key_path: None,
+                    jump_key_id: None,
+                    remote_platform: None,
+                });
+            })
+            .await;
 
         self.temp_auth.write().insert(connection_id.clone(), auth);
 
@@ -560,7 +563,7 @@ mod tests {
             )
             .await,
         );
-        let store = Arc::new(TokioRwLock::new(ConnectionStore::new()));
+        let store = JsonStore::new(&dir, ConnectionStore::new(), None);
         let executor = ExternalExecutor::new(store.clone(), exec_mgr, Arc::new(ssh));
 
         // 空表：查不到
@@ -592,7 +595,7 @@ mod tests {
             )
             .await,
         );
-        let store = Arc::new(TokioRwLock::new(ConnectionStore::new()));
+        let store = JsonStore::new(&dir, ConnectionStore::new(), None);
         let executor = ExternalExecutor::new(store, exec_mgr, Arc::new(ssh));
 
         // 大小写在边界处归一：内部存 "Password"，外部只认小写 "password"

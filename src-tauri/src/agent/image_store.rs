@@ -4,12 +4,14 @@ use std::sync::OnceLock;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use uuid::Uuid;
 
+use crate::data::DataSourceId;
+
 static IMAGES_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
-/// Initialize the images root directory (`{config_dir}/images`).
+/// Initialize the images root directory (`DataSourceId::Images`，即 `{config_dir}/images`).
 /// Safe to call multiple times; only the first call wins.
 pub fn init(config_dir: &Path) {
-    let root = config_dir.join("images");
+    let root = DataSourceId::Images.path(config_dir);
     let _ = std::fs::create_dir_all(&root);
     let _ = IMAGES_ROOT.set(root);
 }

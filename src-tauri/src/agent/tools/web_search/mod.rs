@@ -28,7 +28,7 @@ use crate::agent::risk::Disposition;
 use crate::agent::tools::browser_cdp;
 use crate::agent::tools::web_result::{detect_challenge, FallbackNote};
 use crate::agent::tools::{truncate_output, AgentTool, ToolContext, ToolOutput};
-use crate::config::keychain;
+use crate::config::keychain::{self, SecretSlot};
 use crate::config::settings::{WebSearchApiProvider, WebSearchEndpoint, WebSearchMode};
 use crate::error::AppError;
 use api::ApiSearchTarget;
@@ -300,10 +300,10 @@ async fn run_search(
 /// has selected — never Brave's or DeepSeek's key to a custom host, or the reverse.
 fn search_api_key(provider: WebSearchApiProvider) -> Result<String, AppError> {
     let stored = match provider {
-        WebSearchApiProvider::Deepseek => keychain::get_deepseek_tools_api_key()?,
-        WebSearchApiProvider::Custom => keychain::get_custom_search_api_key()?,
+        WebSearchApiProvider::Deepseek => keychain::get(&SecretSlot::DeepseekToolsApiKey)?,
+        WebSearchApiProvider::Custom => keychain::get(&SecretSlot::CustomSearchApiKey)?,
         WebSearchApiProvider::Brave | WebSearchApiProvider::Tavily => {
-            keychain::get_web_search_api_key()?
+            keychain::get(&SecretSlot::WebSearchApiKey)?
         }
     };
     Ok(stored.unwrap_or_default())
