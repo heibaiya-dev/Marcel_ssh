@@ -2,6 +2,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { ArrowLeft, ChevronRight } from 'lucide-react';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useRiskRuleFocusStore } from '@/stores/riskRuleFocusStore';
+import { useSyncStore } from '@/stores/syncStore';
+import { needsAttention } from '@/lib/syncModel';
+import { StatusDot } from '@/components/settings/sync/syncUi';
 import { RiskRulesPage } from '@/components/settings/RiskRulesPage';
 import type { AppSettings } from '@/lib/types';
 import { getErrorMessage } from '@/lib/errors';
@@ -23,6 +26,7 @@ import { MobileModelSection } from './settings/MobileModelSection';
 import { MobileArchiveSection } from './settings/MobileArchiveSection';
 import { MobileMemorySection } from './settings/MobileMemorySection';
 import { MobileNotificationBackgroundSection } from './settings/MobileNotificationBackgroundSection';
+import { MobileSyncSection } from './settings/MobileSyncSection';
 import { registerBackHandler } from './backHandler';
 import DebugPage from '@/components/debug/DebugPage';
 import MobileFullscreenPage from './ui/MobileFullscreenPage';
@@ -47,6 +51,8 @@ export default function MobileSettings({
   const storeUpdate = useSettingsStore((s) => s.update);
   const storeSetPreview = useSettingsStore((s) => s.setPreview);
   const storeClearPreview = useSettingsStore((s) => s.clearPreview);
+  // 同步需要用户处理（出错 / 待确认 / 需升级）时，在「跨设备同步」入口上亮一个状态点。
+  const syncState = useSyncStore((s) => s.status?.state);
 
   const [activeCategory, setActiveCategory] =
     useState<MobileSettingsCategoryId | null>(null);
@@ -232,6 +238,12 @@ export default function MobileSettings({
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 text-sm font-medium text-zinc-100">
                       {cat.title}
+                      {cat.id === 'sync' && needsAttention(syncState) && (
+                        <>
+                          <StatusDot tone={syncState === 'error' ? 'error' : 'warn'} />
+                          <span className="sr-only">需要处理</span>
+                        </>
+                      )}
                     </div>
                     <div className="mt-0.5 text-xs text-zinc-500">
                       {cat.description}
@@ -300,6 +312,12 @@ export default function MobileSettings({
           {activeCategory === 'notification-background' && (
             <div className="p-3">
               <MobileNotificationBackgroundSection />
+            </div>
+          )}
+
+          {activeCategory === 'sync' && (
+            <div className="p-3">
+              <MobileSyncSection />
             </div>
           )}
 

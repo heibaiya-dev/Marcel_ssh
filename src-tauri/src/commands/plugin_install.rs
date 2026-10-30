@@ -27,8 +27,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::commands::market::{download_first_with_progress, github_repo_parts, zip_urls};
-use crate::config::persist::JsonPersistable;
-use crate::config::settings::AppSettings;
+use crate::data::DataSourceId;
 use crate::emit_event;
 use crate::error::AppError;
 use crate::plugins::manifest::PluginManifest;
@@ -314,7 +313,7 @@ fn install_from_archive_with_progress(
             .map_err(|e| AppError::Other(format!("plugin.json 解析失败: {}", e)))?;
         validate_plugin_id(&manifest.id)?;
 
-        let plugins_dir = config_dir.join("plugins");
+        let plugins_dir = DataSourceId::Plugins.path(config_dir);
         let target = plugins_dir.join(&manifest.id);
         if target.exists() {
             return Err(AppError::Other(format!(
@@ -382,7 +381,7 @@ fn update_from_archive_with_progress(
             }
         };
 
-        let plugins_dir = config_dir.join("plugins");
+        let plugins_dir = DataSourceId::Plugins.path(config_dir);
         let target = plugins_dir.join(&new_manifest.id);
         if !target.exists() {
             return Err(AppError::Other(format!(
@@ -789,7 +788,7 @@ pub async fn plugin_uninstall(
     validate_plugin_id(&plugin_id)?;
 
     let config_dir = state.config_dir.clone();
-    let target = config_dir.join("plugins").join(&plugin_id);
+    let target = DataSourceId::Plugins.path(&config_dir).join(&plugin_id);
     if !target.exists() {
         return Err(AppError::Other(format!("插件 {} 未安装", plugin_id)));
     }
@@ -800,13 +799,22 @@ pub async fn plugin_uninstall(
         .map_err(|e| AppError::Other(format!("删除插件目录失败: {}", e)))?;
 
     // 清理设置残留（disabled_plugins / authorized_capabilities）并用更新后
-    // 的快照 reload registry。落盘失败不阻断（内存已更新，下次保存设置会
-    // 补齐；残留记录对功能无影响，也不主动触发云同步）。
+    // 的快照 reload registry。落盘失败不阻断（残留记录对功能无影响，下次保存
+    // 设置会补齐，也不主动触发云同步）。
+    //
+    // 先落盘再 reload：reload 用的是传入的 `updated_settings` 而不是读盘，顺序对结果
+    // 没有影响。统一存储「先落盘成功才提交内存」，所以落盘失败时内存里也还留着残留
+    // 记录（同样无害）；reload 仍按「已清理」的设置做，registry 里这个插件照旧消失。
     let updated_settings = {
-        let mut settings = state.settings.write().await;
-        settings.disabled_plugins.retain(|id| id != &plugin_id);
-        settings.authorized_capabilities.remove(&plugin_id);
-        settings.clone()
+        let mut update = state.settings.begin_update().await;
+        let candidate = update.candidate_mut();
+        candidate.disabled_plugins.retain(|id| id != &plugin_id);
+        candidate.authorized_capabilities.remove(&plugin_id);
+        let updated = update.candidate().clone();
+        if let Err(e) = update.commit().await {
+            log::warn!("卸载后设置落盘失败（残留无害，下次保存设置会补齐）: {}", e);
+        }
+        updated
     };
 
     let app_version = app.package_info().version.to_string();
@@ -814,11 +822,6 @@ pub async fn plugin_uninstall(
         let mut reg = state.plugin_registry.write().await;
         reg.reload(&config_dir, &updated_settings, &app_version)
             .await;
-    }
-
-    let path = AppSettings::default_file(&config_dir);
-    if let Err(e) = tokio::task::block_in_place(|| updated_settings.save_to_path(&path)) {
-        log::warn!("卸载后设置落盘失败（残留无害，下次保存设置会补齐）: {}", e);
     }
 
     Ok(())

@@ -32,6 +32,7 @@ use crate::agent::task::{AgentMode, AgentStatus, AgentTask};
 use crate::command_exec::executor::{ExecExit, ExecOutcome, ExecTransport};
 use crate::command_exec::{CancelReason, CommandExecutionManager, CommandTicket};
 use crate::config::settings::{AppSettings, NotificationSettings};
+use crate::data::{DataChangeBus, DataSourceId, JsonStore};
 use crate::error::AppError;
 use crate::llm::registry::{ChannelConfig, LlmRegistry, ModelEntry, NetPolicy};
 use crate::ssh::connection::SshManager;
@@ -329,29 +330,51 @@ fn isolated_state_with(
         dir.join("local"),
         CommandExecutionManager::LOCAL_JOB_ID_PREFIX,
     );
+    let ssh_manager = SshManager::with_known_hosts(KnownHostsStore::in_memory());
+    let connection_store =
+        JsonStore::new(dir, crate::config::connections::ConnectionStore::new(), None);
+    let settings_store = JsonStore::new(dir, settings, None);
+    let quick_command_store = JsonStore::new(
+        dir,
+        crate::config::quick_commands::QuickCommandStore::new(),
+        None,
+    );
+    let skill_store = JsonStore::new(dir, crate::skills::store::SkillStore::new(), None);
+    let mcp_store = JsonStore::new(dir, crate::mcp::store::McpServerStore::new(), None);
+    let mcp_manager = Arc::new(crate::mcp::manager::McpManager::new());
+    let data_changes = DataChangeBus::new();
+    // 跨设备同步 manager：测试里从不 `start`，只是 AppState 的必填字段。
+    let sync = crate::sync::SyncManager::new(crate::sync::SyncWiring {
+        config_dir: dir.to_path_buf(),
+        stores: crate::sync::sources::SourceStores {
+            settings: settings_store.clone(),
+            connections: connection_store.clone(),
+            quick_commands: quick_command_store.clone(),
+            skills: skill_store.clone(),
+            mcp_servers: mcp_store.clone(),
+            known_hosts: KnownHostsStore::in_memory(),
+            mcp_manager: mcp_manager.clone(),
+        },
+        ssh_manager: ssh_manager.clone(),
+        data_changes: data_changes.clone(),
+        load_failures: Vec::new(),
+    });
     AppState {
-        ssh_manager: SshManager::with_known_hosts(KnownHostsStore::in_memory()),
+        ssh_manager,
         agent_tasks: Default::default(),
         plans: Default::default(),
         session_models: Default::default(),
         session_efforts: Default::default(),
-        connection_store: Arc::new(tokio::sync::RwLock::new(
-            crate::config::connections::ConnectionStore::new(),
-        )),
-        settings: Arc::new(tokio::sync::RwLock::new(settings)),
-        quick_command_store: Arc::new(tokio::sync::RwLock::new(
-            crate::config::quick_commands::QuickCommandStore::new(),
-        )),
+        connection_store,
+        settings: settings_store,
+        quick_command_store,
         conversation_db: Arc::new(
-            ConversationDb::new(dir.join("conversations.db")).expect("temporary SQLite"),
+            ConversationDb::new(DataSourceId::Conversations.path(dir)).expect("temporary SQLite"),
         ),
-        skill_store: Arc::new(tokio::sync::RwLock::new(
-            crate::skills::store::SkillStore::new(),
-        )),
-        mcp_store: Arc::new(tokio::sync::RwLock::new(
-            crate::mcp::store::McpServerStore::new(),
-        )),
-        mcp_manager: Arc::new(crate::mcp::manager::McpManager::new()),
+        skill_store,
+        mcp_store,
+        data_changes,
+        mcp_manager,
         config_dir: dir.to_path_buf(),
         agent_interaction: AgentInteractionManager::new(),
         task_cancel: Default::default(),
@@ -372,6 +395,7 @@ fn isolated_state_with(
         memory: Arc::new(crate::memory::MemoryManager::with_store(
             crate::memory::MemoryStore::in_memory(),
         )),
+        sync,
     }
 }
 
@@ -1332,10 +1356,12 @@ fn scripted_production_loop_pressure_compaction_via_real_anchor() {
         // 压力窗口只在任务启动时读一次：spawn 前把测试窗口写进设置。
         state
             .settings
-            .write()
+            .mutate(|settings| {
+                settings.agent_mode_settings.context_window = PRESSURE_WINDOW;
+                Ok(())
+            })
             .await
-            .agent_mode_settings
-            .context_window = PRESSURE_WINDOW;
+            .unwrap();
         let parent = state
             .conversation_db
             .create_conversation("scripted-connection", "parent")
@@ -2949,7 +2975,14 @@ fn hanging_mcp_server_does_not_delay_task_start() {
             trusted: false,
         })
         .expect("valid MCP server config");
-        state.mcp_store.write().await.add(server);
+        state
+            .mcp_store
+            .mutate(|store| {
+                store.add(server);
+                Ok(())
+            })
+            .await
+            .unwrap();
         // 主任务要有一条在册的 SSH 会话，否则会按"出生即孤儿"当场收场。
         state
             .ssh_manager

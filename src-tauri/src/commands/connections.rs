@@ -1,9 +1,8 @@
 use tauri::State;
 use uuid::Uuid;
 
-use crate::config::connections::{ConnectionStore, RemotePlatform, SavedConnection};
-use crate::config::keychain;
-use crate::config::persist::JsonPersistable;
+use crate::config::connections::{RemotePlatform, SavedConnection};
+use crate::config::keychain::{self, SecretSlot};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -31,14 +30,14 @@ pub async fn config_save_connection(
     }
     let id = connection.id.clone();
 
-    let mut store = state.connection_store.write().await;
-    let mut candidate = store.clone();
-    candidate.replace_keeping_order(connection);
-
-    // 先持久化候选快照，成功后再提交内存。
-    let path = ConnectionStore::default_file(&state.config_dir);
-    tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-    *store = candidate;
+    // 先持久化候选快照，成功后再提交内存（`mutate` 保证，失败保持旧值）。
+    state
+        .connection_store
+        .mutate(|store| {
+            store.replace_keeping_order(connection);
+            Ok(())
+        })
+        .await?;
 
     Ok(id)
 }
@@ -53,16 +52,15 @@ pub async fn config_set_connection_remote_platform(
     id: String,
     platform: RemotePlatform,
 ) -> Result<(), AppError> {
-    let mut store = state.connection_store.write().await;
-    let mut candidate = store.clone();
-    if !candidate.set_remote_platform(&id, platform) {
-        return Ok(());
-    }
-
-    let path = ConnectionStore::default_file(&state.config_dir);
-    tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-    *store = candidate;
-    Ok(())
+    // 找不到 id / 值没变都是成功的 no-op：`set_remote_platform` 返回 false 时没动候选值，
+    // `mutate` 序列化前后相同就不写盘。
+    state
+        .connection_store
+        .mutate(|store| {
+            store.set_remote_platform(&id, platform);
+            Ok(())
+        })
+        .await
 }
 
 /// 一条连接的落位：id + 目标分组（`None` = 未分组）。
@@ -98,24 +96,25 @@ pub async fn config_apply_connection_order(
         })
         .collect();
 
-    let mut store = state.connection_store.write().await;
-    let mut candidate = store.clone();
-    let groups_before: Vec<(String, Option<String>)> = store
-        .get_all()
-        .iter()
-        .map(|c| (c.id.clone(), c.group.clone()))
-        .collect();
-    let (reordered, appended, ignored) = candidate.apply_order(&pairs);
-
-    let path = ConnectionStore::default_file(&state.config_dir);
-    tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-    let groups_after: Vec<(String, Option<String>)> = candidate
-        .get_all()
-        .iter()
-        .map(|c| (c.id.clone(), c.group.clone()))
-        .collect();
-    *store = candidate;
-    drop(store);
+    // 改动前后的「连接 → 分组」都在 mutate 的闭包里取：闭包看到的就是持写者锁时的
+    // 那一份，不会被并发写者插队。
+    let (groups_before, groups_after, reordered, appended, ignored) = state
+        .connection_store
+        .mutate(|store| {
+            let groups_before: Vec<(String, Option<String>)> = store
+                .get_all()
+                .iter()
+                .map(|c| (c.id.clone(), c.group.clone()))
+                .collect();
+            let (reordered, appended, ignored) = store.apply_order(&pairs);
+            let groups_after: Vec<(String, Option<String>)> = store
+                .get_all()
+                .iter()
+                .map(|c| (c.id.clone(), c.group.clone()))
+                .collect();
+            Ok((groups_before, groups_after, reordered, appended, ignored))
+        })
+        .await?;
 
     // 分组改名 → 分组记忆跟着搬（认不出来的不动，见 `detect_group_renames`）。
     let mut moved_any = false;
@@ -153,27 +152,22 @@ pub async fn config_delete_connection(
     id: String,
     delete_memories: Option<bool>,
 ) -> Result<(), AppError> {
-    let mut store = state.connection_store.write().await;
-    let mut candidate = store.clone();
-    if !candidate.remove(&id) {
-        return Err(AppError::Config(format!("未找到连接: {}", id)));
-    }
-    let path = ConnectionStore::default_file(&state.config_dir);
-    tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-    *store = candidate;
+    state
+        .connection_store
+        .mutate(|store| {
+            if !store.remove(&id) {
+                return Err(AppError::Config(format!("未找到连接: {}", id)));
+            }
+            Ok(())
+        })
+        .await?;
 
-    // Best-effort: also purge any stored password and passphrase from the keychain
-    if let Err(e) = keychain::delete_password(&id) {
-        log::warn!("清除密钥链条目失败（id={}): {}", id, e);
-    }
-    if let Err(e) = keychain::delete_password(&format!("pk:{}", id)) {
-        log::warn!("清除密钥链 passphrase 条目失败（id={}): {}", id, e);
-    }
-    if let Err(e) = keychain::delete_password(&format!("jump:{}", id)) {
-        log::warn!("清除跳板机密码密钥链条目失败（id={}): {}", id, e);
-    }
-    if let Err(e) = keychain::delete_password(&format!("jump:pk:{}", id)) {
-        log::warn!("清除跳板机 passphrase 密钥链条目失败（id={}): {}", id, e);
+    // Best-effort: also purge every secret bound to this connection (登录密码 / 私钥口令 /
+    // 跳板机密码 / 跳板机私钥口令) from the keychain. 槽位清单见 `SecretSlot::for_connection`。
+    for slot in SecretSlot::for_connection(&id) {
+        if let Err(e) = keychain::delete(&slot) {
+            log::warn!("清除{}密钥链条目失败（id={}): {}", slot.describe(), id, e);
+        }
     }
     // 删除确认框里勾了「同时删除这台机器的记忆」：作为一批用户改动删掉（可撤销）。
     // 没勾的话记忆留着，管理页会把它列在「已删除的连接」下。

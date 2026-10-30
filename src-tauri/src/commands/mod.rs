@@ -29,6 +29,8 @@ pub mod sftp;
 pub mod skill;
 pub mod ssh;
 pub mod ssh_keys;
+/// 跨设备同步（`sync/` 模块）的前端命令：契约见 `src/lib/tauri.ts` 的 `sync*`。
+pub mod sync;
 pub mod update;
 
 #[cfg(desktop)]

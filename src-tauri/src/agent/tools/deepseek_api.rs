@@ -18,7 +18,7 @@ use reqwest::{Client, StatusCode};
 use serde_json::Value;
 
 use crate::agent::tools::web_result::truncate_error_body;
-use crate::config::keychain;
+use crate::config::keychain::{self, SecretSlot};
 use crate::error::AppError;
 
 const TOOLS_BASE: &str = "https://api.deepseek.com/v1/tools";
@@ -26,7 +26,7 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 /// 读取 DeepSeek 工具类 Key；没配或为空白时给出能指向设置页的错误。
 pub(crate) fn load_api_key() -> Result<String, AppError> {
-    keychain::get_deepseek_tools_api_key()?
+    keychain::get(&SecretSlot::DeepseekToolsApiKey)?
         .map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty())
         .ok_or_else(|| {

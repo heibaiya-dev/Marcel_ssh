@@ -338,6 +338,7 @@ impl SshManager {
             port,
             username: username.clone(),
             connection_id,
+            headless,
             generation,
             cmd_tx,
             handle: shared_handle.clone(),
@@ -712,9 +713,19 @@ impl SshManager {
         self.connections.read().await.contains_key(session_id)
     }
 
-    /// List active session IDs.
+    /// List active session IDs（用户可见的会话）。
+    ///
+    /// **不含无头会话**（MCP 无头连接、跨设备同步的 SFTP 连接）：这个列表是前端与插件 API
+    /// 回答「现在开着哪些终端」用的，后台连接不该混进去。要看全部连接用 `get_connection`
+    /// 按 id 查，或 `sessions_for_connection`。
     pub async fn list_sessions(&self) -> Vec<String> {
-        self.connections.read().await.keys().cloned().collect()
+        self.connections
+            .read()
+            .await
+            .iter()
+            .filter(|(_, c)| !c.headless)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Get the connection_id associated with a session, if available.
@@ -1120,6 +1131,11 @@ impl SshManager {
     /// 的真实 russh 连接，让需要"会话在册"的上层流程（比如主任务的"出生即孤儿"
     /// 检查）不依赖网络也能跑通。连接上不开任何通道，也不会真的执行命令。
     pub(crate) async fn register_loopback_session(&self, session_id: &str) {
+        self.register_loopback_session_as(session_id, false).await;
+    }
+
+    /// 同 [`Self::register_loopback_session`]，可指定是否登记成无头会话。
+    pub(crate) async fn register_loopback_session_as(&self, session_id: &str, headless: bool) {
         struct MinimalSshd;
         impl russh::server::Handler for MinimalSshd {
             type Error = russh::Error;
@@ -1168,6 +1184,126 @@ impl SshManager {
                 port: 22,
                 username: "tester".into(),
                 connection_id: None,
+                headless,
+                generation: 1,
+                cmd_tx,
+                handle: Arc::new(TokioMutex::new(handle)),
+                jump_handle: None,
+                sftp_meta: SharedSlot::new(),
+            }),
+        );
+    }
+
+    /// 测试专用：登记一条**带 SFTP 子系统**的回环会话，每开一条 SFTP 通道就用 `make_fs()` 造一个
+    /// 服务端文件系统处理器。跨设备同步的 SFTP 存储适配器用它对着一个内存文件系统跑端到端测试。
+    ///
+    /// `closers` 收集每条 SFTP 通道的关闭手柄：测试调 `handle.close(channel_id)` 就能模拟「对端把
+    /// 通道关了」（连接本身还在册、但已不可用）。
+    pub(crate) async fn register_loopback_sftp_session<H, F>(
+        &self,
+        session_id: &str,
+        make_fs: F,
+        closers: Arc<std::sync::Mutex<Vec<(russh::server::Handle, russh::ChannelId)>>>,
+    ) where
+        H: russh_sftp::server::Handler + Send + 'static,
+        F: Fn() -> H + Send + Sync + 'static,
+    {
+        use russh::server::{Auth, Msg, Session as ServerSession};
+        use russh::{Channel, ChannelId};
+
+        struct Peer<H, F> {
+            make_fs: Arc<F>,
+            pending: HashMap<ChannelId, Channel<Msg>>,
+            closers: Arc<std::sync::Mutex<Vec<(russh::server::Handle, ChannelId)>>>,
+            _handler: std::marker::PhantomData<fn() -> H>,
+        }
+
+        impl<H, F> russh::server::Handler for Peer<H, F>
+        where
+            H: russh_sftp::server::Handler + Send + 'static,
+            F: Fn() -> H + Send + Sync + 'static,
+        {
+            type Error = russh::Error;
+
+            async fn auth_none(&mut self, _: &str) -> Result<Auth, Self::Error> {
+                Ok(Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self,
+                channel: Channel<Msg>,
+                _: &mut ServerSession,
+            ) -> Result<bool, Self::Error> {
+                self.pending.insert(channel.id(), channel);
+                Ok(true)
+            }
+
+            async fn subsystem_request(
+                &mut self,
+                channel_id: ChannelId,
+                name: &str,
+                session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                let Some(channel) = self.pending.remove(&channel_id).filter(|_| name == "sftp")
+                else {
+                    session.channel_failure(channel_id)?;
+                    return Ok(());
+                };
+                session.channel_success(channel_id)?;
+                self.closers
+                    .lock()
+                    .unwrap()
+                    .push((session.handle(), channel_id));
+                russh_sftp::server::run(channel.into_stream(), (self.make_fs)()).await;
+                Ok(())
+            }
+        }
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let key = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[13; 32]);
+        let config = russh::server::Config {
+            keys: vec![key.into()],
+            ..Default::default()
+        };
+        let peer = Peer {
+            make_fs: Arc::new(make_fs),
+            pending: HashMap::new(),
+            closers,
+            _handler: std::marker::PhantomData,
+        };
+        tokio::spawn(async move {
+            if let Ok(session) = russh::server::run_stream(Arc::new(config), server_io, peer).await
+            {
+                let _ = session.await;
+            }
+        });
+        let client = Client {
+            host: "127.0.0.1".into(),
+            port: 22,
+            store: KnownHostsStore::in_memory(),
+            trust_new: true,
+            verdict: Arc::new(TokioMutex::new(None)),
+            tofu_record_error: Arc::new(TokioMutex::new(None)),
+        };
+        let mut handle =
+            client::connect_stream(Arc::new(client::Config::default()), client_io, client)
+                .await
+                .expect("loopback sftp sshd handshake");
+        assert!(handle
+            .authenticate_none("tester")
+            .await
+            .expect("loopback auth")
+            .success());
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        self.connections.write().await.insert(
+            session_id.to_string(),
+            Arc::new(SshConnection {
+                id: session_id.to_string(),
+                host: "127.0.0.1".into(),
+                port: 22,
+                username: "tester".into(),
+                connection_id: None,
+                headless: true,
                 generation: 1,
                 cmd_tx,
                 handle: Arc::new(TokioMutex::new(handle)),
@@ -1354,6 +1490,7 @@ mod shared_sftp_tests {
                 port: 22,
                 username: "tester".into(),
                 connection_id: None,
+                headless: false,
                 generation: 1,
                 cmd_tx,
                 handle: Arc::new(TokioMutex::new(handle)),
@@ -1361,6 +1498,20 @@ mod shared_sftp_tests {
                 sftp_meta: SharedSlot::new(),
             }),
         );
+    }
+
+    /// 对外的会话列表（前端 / 插件 API 用）不含无头会话：跨设备同步的 SFTP 连接、MCP 无头连接
+    /// 都是后台连接，混进「现在开着哪些终端」只会误导插件的 `session.active`。
+    /// 无头会话本身仍然在册，按 id 取连接照常可用（同步的 SFTP 读写靠它）。
+    #[tokio::test]
+    async fn list_sessions_hides_headless_sessions_but_keeps_them_registered() {
+        let manager = SshManager::with_known_hosts(KnownHostsStore::in_memory());
+        manager.register_loopback_session_as("term", false).await;
+        manager.register_loopback_session_as("bg", true).await;
+
+        assert_eq!(manager.list_sessions().await, vec!["term".to_string()]);
+        assert!(manager.is_connected("bg").await, "无头会话仍然在册");
+        assert!(manager.get_connection("bg").await.is_some());
     }
 
     async fn list_root(

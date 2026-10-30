@@ -139,9 +139,7 @@ impl QuickCommandStore {
 }
 
 impl JsonPersistable for QuickCommandStore {
-    fn default_filename() -> &'static str {
-        "quick_commands.json"
-    }
+    const SOURCE: crate::data::DataSourceId = crate::data::DataSourceId::QuickCommands;
 }
 
 fn validate_input(input: &QuickCommandInput) -> Result<(), AppError> {

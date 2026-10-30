@@ -132,9 +132,7 @@ impl McpServerStore {
 }
 
 impl JsonPersistable for McpServerStore {
-    fn default_filename() -> &'static str {
-        "mcp_servers.json"
-    }
+    const SOURCE: crate::data::DataSourceId = crate::data::DataSourceId::McpServers;
 }
 
 #[cfg(test)]

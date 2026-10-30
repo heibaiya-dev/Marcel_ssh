@@ -18,7 +18,8 @@ interface ConnectionState {
   loaded: boolean;
   error: string | null;
 
-  fetchConnections: () => Promise<void>;
+  /** `silent`：后台静默刷新（跨设备同步落地后用），不翻 loading、不闪动列表。 */
+  fetchConnections: (opts?: { silent?: boolean }) => Promise<void>;
   addConnection: (connection: SavedConnection) => Promise<void>;
   addDebugServer: () => void;
   /** `deleteMemories` = 同时删掉这台机器的长期记忆（确认框里的复选框）。 */
@@ -39,15 +40,16 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
   loaded: false,
   error: null,
 
-  fetchConnections: async () => {
-    set({ loading: true, error: null });
+  fetchConnections: async (opts) => {
+    const silent = opts?.silent === true;
+    if (!silent) set({ loading: true, error: null });
     try {
       const connections = await tauri.getConnections();
       set((state) => ({ connections: mergeDebugServer(connections, state.connections) }));
     } catch (err) {
       set({ error: getErrorMessage(err) });
     } finally {
-      set({ loading: false, loaded: true });
+      set(silent ? { loaded: true } : { loading: false, loaded: true });
     }
   },
 

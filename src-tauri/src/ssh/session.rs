@@ -27,6 +27,10 @@ pub struct SshConnection {
     pub port: u16,
     pub username: String,
     pub connection_id: Option<String>,
+    /// 无头会话（`connect_headless` 建的）：没有终端、不是用户打开的会话——MCP 外部调用与跨设备
+    /// 同步的 SFTP 存储都用它。**对外「有哪些会话」的列表（前端、插件 API）一律不含它**，
+    /// 否则插件的 `session.active` 会把同步的后台连接当成用户正在用的终端。
+    pub headless: bool,
     /// Monotonic generation counter — incremented each time a new connection
     /// is created for the same session_id (reconnect). Used by cleanup to
     /// prevent a stale driver task from removing a newer connection.

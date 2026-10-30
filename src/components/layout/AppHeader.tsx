@@ -3,6 +3,7 @@ import { APP_NAME } from '@/lib/constants';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import WindowControls from '@/components/layout/WindowControls';
 import UpdatePill from '@/components/layout/UpdatePill';
+import SyncStatusButton from '@/components/layout/SyncStatusButton';
 import { useUpdateStore } from '@/stores/updateStore';
 
 interface Props {
@@ -51,6 +52,7 @@ export default function AppHeader({ onToggleSidebar, onToggleDock, dockPanel, cl
         </h1>
         <UpdatePill />
         <div className="flex-1" data-tauri-drag-region />
+        <SyncStatusButton />
         <button
           onClick={onToggleDock}
           className="p-1 rounded-lg hover:bg-state-soft text-zinc-400 hover:text-zinc-200 transition-colors"

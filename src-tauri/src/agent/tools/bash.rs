@@ -24,7 +24,7 @@ use zeroize::Zeroize;
 
 use crate::agent::risk::{Disposition, RiskAssessor};
 use crate::agent::tools::{truncate_output, AgentTool, ToolContext, ToolOutput};
-use crate::config::keychain;
+use crate::config::keychain::{self, SecretSlot};
 use crate::error::AppError;
 
 /// Maximum bytes of combined stdout+stderr returned to the LLM.
@@ -467,7 +467,7 @@ async fn lookup_password(ctx: &ToolContext) -> Option<String> {
 
     match &connection_id {
         Some(id) => {
-            let result = keychain::get_password(id);
+            let result = keychain::get(&SecretSlot::SshPassword(id.clone()));
             match &result {
                 Ok(Some(_)) => {
                     log::info!("bash: password available for connection={}", id);

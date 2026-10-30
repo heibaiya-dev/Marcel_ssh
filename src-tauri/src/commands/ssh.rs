@@ -2,7 +2,7 @@ use tauri::{AppHandle, State};
 
 use crate::command_exec::{CancelReason, CommandSource, CommandTicket, SubmitOutcome};
 use crate::config::connections::SavedConnection;
-use crate::config::keychain;
+use crate::config::keychain::{self, SecretSlot};
 use crate::emit_event;
 use crate::error::AppError;
 use crate::ssh::auth::{AuthMethod, JumpConfig};
@@ -10,16 +10,6 @@ use crate::ssh::connection::ConnectionConfig;
 use crate::AppState;
 use serde_json::json;
 use std::time::Duration;
-
-/// Keychain account for jump host password: `jump:{connection_id}`
-fn jump_password_account(connection_id: &str) -> String {
-    format!("jump:{}", connection_id)
-}
-
-/// Keychain account for jump host private-key passphrase: `jump:pk:{connection_id}`
-fn jump_passphrase_account(connection_id: &str) -> String {
-    format!("jump:pk:{}", connection_id)
-}
 
 /// Build runtime jump config from a saved connection + keychain secrets.
 /// Returns `Ok(None)` when jump is not enabled.
@@ -50,12 +40,13 @@ pub(crate) fn build_jump_config(
     let auth_method = match method {
         "withTarget" => clone_auth_method(target_auth),
         "Password" => {
-            let password = keychain::get_password(&jump_password_account(connection_id))?
+            let password = keychain::get(&SecretSlot::JumpPassword(connection_id.to_string()))?
                 .ok_or_else(|| AppError::Config("未找到已保存的跳板机密码".into()))?;
             AuthMethod::Password { password }
         }
         "PrivateKey" => {
-            let passphrase = keychain::get_password(&jump_passphrase_account(connection_id))?;
+            let passphrase =
+                keychain::get(&SecretSlot::JumpKeyPassphrase(connection_id.to_string()))?;
             build_private_key_auth(
                 saved.jump_key_id.as_deref(),
                 saved.jump_key_path.as_deref(),
@@ -134,12 +125,12 @@ fn build_private_key_auth(
 pub(crate) fn build_connect_auth_method(saved: &SavedConnection) -> Result<AuthMethod, AppError> {
     match saved.auth_method.as_str() {
         "Password" => {
-            let password = keychain::get_password(&saved.id)?
+            let password = keychain::get(&SecretSlot::SshPassword(saved.id.clone()))?
                 .ok_or_else(|| AppError::Config("未找到已保存的密码".into()))?;
             Ok(AuthMethod::Password { password })
         }
         "PrivateKey" => {
-            let passphrase = keychain::get_password(&format!("pk:{}", saved.id))?;
+            let passphrase = keychain::get(&SecretSlot::SshKeyPassphrase(saved.id.clone()))?;
             build_private_key_auth(
                 saved.key_id.as_deref(),
                 saved.key_path.as_deref(),
@@ -356,7 +347,7 @@ pub async fn ssh_connect_with_saved_password(
             .clone()
     };
 
-    let password = keychain::get_password(&connection_id)?
+    let password = keychain::get(&SecretSlot::SshPassword(connection_id.clone()))?
         .ok_or_else(|| AppError::Config("未找到已保存的密码".into()))?;
 
     let auth_method = AuthMethod::Password { password };
@@ -396,7 +387,7 @@ pub async fn ssh_connect_with_saved_passphrase(
             .clone()
     };
 
-    let passphrase = keychain::get_password(&format!("pk:{}", connection_id))?;
+    let passphrase = keychain::get(&SecretSlot::SshKeyPassphrase(connection_id.clone()))?;
     let auth_method = build_private_key_auth(
         saved.key_id.as_deref(),
         saved.key_path.as_deref(),
@@ -440,12 +431,13 @@ pub(crate) fn build_saved_connection_config(
 ) -> Result<ConnectionConfig, AppError> {
     let auth_method = match saved.auth_method.as_str() {
         "Password" => {
-            let password = keychain::get_password(connection_id)?
+            let password = keychain::get(&SecretSlot::SshPassword(connection_id.to_string()))?
                 .ok_or_else(|| AppError::Config("未找到已保存的密码".into()))?;
             AuthMethod::Password { password }
         }
         "PrivateKey" => {
-            let passphrase = keychain::get_password(&format!("pk:{}", connection_id))?;
+            let passphrase =
+                keychain::get(&SecretSlot::SshKeyPassphrase(connection_id.to_string()))?;
             build_private_key_auth(
                 saved.key_id.as_deref(),
                 saved.key_path.as_deref(),

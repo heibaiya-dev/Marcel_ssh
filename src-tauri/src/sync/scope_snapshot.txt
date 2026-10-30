@@ -1,0 +1,158 @@
+# 跨设备同步：每个配置字段的作用域快照（自动生成，别手改）。
+#
+# 列：同步源 <TAB> 字段路径（id 段记作 *）<TAB> 作用域（shared / local / platform）
+#
+# 更新：UPDATE_SYNC_SNAPSHOT=1 cargo test --lib sync::scope_guard
+# 更新之后看一眼 diff：那是新增 / 改动的字段清单，逐条确认作用域是不是想要的。
+connections	connections / (顺序)	shared
+connections	connections / * / authMethod	shared
+connections	connections / * / group	shared
+connections	connections / * / host	shared
+connections	connections / * / id	shared
+connections	connections / * / jumpAuthMethod	shared
+connections	connections / * / jumpHost	shared
+connections	connections / * / jumpKeyId	local
+connections	connections / * / jumpKeyPath	local
+connections	connections / * / jumpPort	shared
+connections	connections / * / jumpUsername	shared
+connections	connections / * / keyId	local
+connections	connections / * / keyPath	local
+connections	connections / * / lastConnected	local
+connections	connections / * / name	shared
+connections	connections / * / port	shared
+connections	connections / * / remotePlatform	shared
+connections	connections / * / useJump	shared
+connections	connections / * / username	shared
+knownHosts	entries / * / algorithm	shared
+knownHosts	entries / * / fingerprint_sha256	shared
+knownHosts	entries / * / first_seen	local
+knownHosts	entries / * / last_seen	local
+knownHosts	version	local
+mcpServers	servers / (顺序)	shared
+mcpServers	servers / * / createdAt	shared
+mcpServers	servers / * / enabled	shared
+mcpServers	servers / * / headers / *	local
+mcpServers	servers / * / id	shared
+mcpServers	servers / * / name	shared
+mcpServers	servers / * / trusted	local
+mcpServers	servers / * / updatedAt	shared
+mcpServers	servers / * / url	shared
+quickCommands	commands / (顺序)	shared
+quickCommands	commands / * / commands	shared
+quickCommands	commands / * / createdAt	shared
+quickCommands	commands / * / id	shared
+quickCommands	commands / * / insertOnly	shared
+quickCommands	commands / * / intervalMs	shared
+quickCommands	commands / * / name	shared
+quickCommands	commands / * / scope	shared
+quickCommands	commands / * / sessionKey	shared
+quickCommands	commands / * / updatedAt	shared
+settings	agentModeSettings / autoApprove	shared
+settings	agentModeSettings / maxToolRounds	shared
+settings	agentModeSettings / systemPromptAppend	shared
+settings	archiveRetentionDays	shared
+settings	authorizedCapabilities	local
+settings	autoUpdate	local
+settings	commandTimeoutSecs	shared
+settings	customProtectedPaths	shared
+settings	customRiskRules / (顺序)	shared
+settings	customRiskRules / * / argContains	shared
+settings	customRiskRules / * / command	shared
+settings	customRiskRules / * / enabled	shared
+settings	customRiskRules / * / id	shared
+settings	customRiskRules / * / level	shared
+settings	customRiskRules / * / message	shared
+settings	customRiskRules / * / name	shared
+settings	defaultAgentMode	shared
+settings	disableAllInjections	local
+settings	disabledPlugins	local
+settings	experimentalSettings / disabledTools	shared
+settings	experimentalSettings / enabledTools	shared
+settings	experimentalSettings / multiHostConnectionIds	shared
+settings	fileManagerPath	local
+settings	fileManagerPaths	local
+settings	fileManagerShowHidden	shared
+settings	fileManagerTreeUserHidden	local
+settings	fileManagerTreeWidth	local
+settings	foldCompletedTurns	shared
+settings	folderUploadCompressionLevel	shared
+settings	fontFamily	platform
+settings	fontSize	platform
+settings	hasCompletedOnboarding	local
+settings	hideThinkingDisplay	shared
+settings	llmConfig / baseUrl	local
+settings	llmConfig / demoteNonLeadingSystem	local
+settings	llmConfig / extraBody	local
+settings	llmConfig / firstByteTimeoutSecs	local
+settings	llmConfig / maxRetries	local
+settings	llmConfig / model	local
+settings	llmConfig / providerType	local
+settings	llmConfig / retryDelaySecs	local
+settings	llmConfig / retryHttpStatuses	local
+settings	llmConfig / retryOnTimeout	local
+settings	llmConfig / temperature	local
+settings	llmConfig / vision	local
+settings	llmRegistry / channels / (顺序)	shared
+settings	llmRegistry / channels / * / baseUrl	shared
+settings	llmRegistry / channels / * / enabled	shared
+settings	llmRegistry / channels / * / id	shared
+settings	llmRegistry / channels / * / kind	shared
+settings	llmRegistry / channels / * / models / (顺序)	shared
+settings	llmRegistry / channels / * / models / * / contextWindow	shared
+settings	llmRegistry / channels / * / models / * / id	shared
+settings	llmRegistry / channels / * / models / * / maxOutputTokens	shared
+settings	llmRegistry / channels / * / models / * / modelName	shared
+settings	llmRegistry / channels / * / models / * / name	shared
+settings	llmRegistry / channels / * / name	shared
+settings	llmRegistry / version	shared
+settings	memorySettings / autoReflect	shared
+settings	memorySettings / enabled	shared
+settings	mobileBackgroundSettings / keepAlive	local
+settings	mobileBackgroundSettings / keepAliveMinutes	local
+settings	mobileNotificationSettings / agentError	platform
+settings	mobileNotificationSettings / agentTaskDone	platform
+settings	mobileNotificationSettings / enabled	platform
+settings	notificationSettings / enabled	platform
+settings	notificationSettings / notificationVolume	platform
+settings	notificationSettings / sound	platform
+settings	panelHeight	local
+settings	privacyMode	shared
+settings	riskRuleOverrides / shell.rm	shared
+settings	terminalColors / background	shared
+settings	terminalColors / black	shared
+settings	terminalColors / blue	shared
+settings	terminalColors / brightBlack	shared
+settings	terminalColors / brightBlue	shared
+settings	terminalColors / brightCyan	shared
+settings	terminalColors / brightGreen	shared
+settings	terminalColors / brightMagenta	shared
+settings	terminalColors / brightRed	shared
+settings	terminalColors / brightWhite	shared
+settings	terminalColors / brightYellow	shared
+settings	terminalColors / cursor	shared
+settings	terminalColors / cursorAccent	shared
+settings	terminalColors / cyan	shared
+settings	terminalColors / foreground	shared
+settings	terminalColors / green	shared
+settings	terminalColors / magenta	shared
+settings	terminalColors / red	shared
+settings	terminalColors / selectionBackground	shared
+settings	terminalColors / white	shared
+settings	terminalColors / yellow	shared
+settings	uiTheme / cornerRadius	shared
+settings	uiTheme / fontScale	shared
+settings	uiTheme / zones / bg	shared
+settings	uiTheme / zones / fg	shared
+settings	updateMode	local
+settings	workspaceLayout / activeTab	local
+settings	workspaceLayout / sizes	local
+skills	skills / (顺序)	shared
+skills	skills / * / createdAt	shared
+skills	skills / * / description	shared
+skills	skills / * / enabled	shared
+skills	skills / * / id	shared
+skills	skills / * / name	shared
+skills	skills / * / position	shared
+skills	skills / * / prompt	shared
+skills	skills / * / resources	shared
+skills	skills / * / updatedAt	shared

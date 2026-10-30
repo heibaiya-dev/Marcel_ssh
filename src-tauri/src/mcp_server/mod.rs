@@ -21,10 +21,9 @@ pub mod tools;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
-
 use crate::command_exec::CommandExecutionManager;
 use crate::config::connections::ConnectionStore;
+use crate::data::JsonStore;
 use crate::error::AppError;
 use crate::SshManager;
 
@@ -51,7 +50,7 @@ impl Default for McpServerConfig {
 
 /// MCP Server 实例
 ///
-/// `connection_store` 持**共享的 RwLock**而不是快照：`create_connection`
+/// `connection_store` 持**共享的 `JsonStore`**而不是快照：`create_connection`
 /// 动态创建的临时连接要能被同一进程内的 `list_connections` 看见，
 /// 也要能被后续 `ssh_execute` 解析到。快照会让临时连接当场失联。
 ///
@@ -61,7 +60,7 @@ impl Default for McpServerConfig {
 pub struct McpServer {
     config: McpServerConfig,
     ssh_manager: Arc<SshManager>,
-    connection_store: Arc<RwLock<ConnectionStore>>,
+    connection_store: JsonStore<ConnectionStore>,
     pub command_exec: Option<Arc<CommandExecutionManager>>,
     /// 配置目录：无头 agent 任务要从这里读 `settings.json` 并解析模型
     /// （见 [`agent_task::build_headless_llm`]）。缺了它就没有 `agent_task` 能力。
@@ -72,7 +71,7 @@ impl McpServer {
     pub fn new(
         config: McpServerConfig,
         ssh_manager: Arc<SshManager>,
-        connection_store: Arc<RwLock<ConnectionStore>>,
+        connection_store: JsonStore<ConnectionStore>,
     ) -> Self {
         Self {
             config,
@@ -88,11 +87,11 @@ impl McpServer {
     /// 与 CLI 的 [`Self::new`] 差别只在数据来源：这里直接复用 GUI 已经在用的
     /// `ssh_manager` / `connection_store` / `command_exec` 实例，而不是另读一份
     /// 配置文件。所以「用户在界面上新增一条连接」会立刻对 MCP 调用生效，
-    /// 不需要重启服务。`connection_store` 必须是**同一个 Arc**（锁类型也已统一
-    /// 为 tokio 的，见 `ExternalExecutor` 的字段注释）。
+    /// 不需要重启服务。`connection_store` 必须是**同一个 store**（`JsonStore` 的
+    /// `Clone` 共享同一份数据与写者锁，见 `ExternalExecutor` 的字段注释）。
     pub fn from_app_state(
         ssh_manager: Arc<SshManager>,
-        connection_store: Arc<RwLock<ConnectionStore>>,
+        connection_store: JsonStore<ConnectionStore>,
         command_exec: Arc<CommandExecutionManager>,
         config_dir: std::path::PathBuf,
     ) -> Self {
@@ -248,7 +247,7 @@ mod tests {
     fn server_info_format() {
         let cfg = McpServerConfig::default();
         let ssh_mgr = Arc::new(SshManager::new());
-        let conn_store = Arc::new(RwLock::new(ConnectionStore::new()));
+        let conn_store = JsonStore::new(&std::env::temp_dir(), ConnectionStore::new(), None);
         let server = McpServer::new(cfg, ssh_mgr, conn_store);
 
         let info = server.server_info();
@@ -260,7 +259,7 @@ mod tests {
     fn protocol_version_stable() {
         let cfg = McpServerConfig::default();
         let ssh_mgr = Arc::new(SshManager::new());
-        let conn_store = Arc::new(RwLock::new(ConnectionStore::new()));
+        let conn_store = JsonStore::new(&std::env::temp_dir(), ConnectionStore::new(), None);
         let server = McpServer::new(cfg, ssh_mgr, conn_store);
 
         assert_eq!(server.protocol_version(), "2024-11-05");

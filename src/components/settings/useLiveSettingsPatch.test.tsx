@@ -90,6 +90,29 @@ describe('useLiveSettingsPatch', () => {
     expect(useSettingsStore.getState().preview).toBeNull();
   });
 
+  it('防抖窗口里别的设备的改动同步落地：落库合并到最新设置，远端字段不被改回去', async () => {
+    const base = useSettingsStore.getState().settings;
+    act(() => liveUpdate({ fontSize: 18 }));
+
+    // 防抖等待期间收到 sync-data-applied：store 从后端重读，带上了远端改的 fontFamily
+    vi.mocked(tauri.getSettings).mockResolvedValue({
+      settings: { ...base, fontFamily: 'Remote Mono' },
+      hasApiKey: false,
+    });
+    await act(async () => {
+      await useSettingsStore.getState().refreshFromBackend();
+    });
+    expect(useSettingsStore.getState().preview?.fontSize).toBe(18);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(400);
+    });
+    expect(saveSettings).toHaveBeenCalledTimes(1);
+    const persisted = saveSettings.mock.calls[0][0] as AppSettings;
+    expect(persisted.fontSize).toBe(18);
+    expect(persisted.fontFamily).toBe('Remote Mono');
+  });
+
   it('卸载时 flush 在途改动，不等防抖', async () => {
     act(() => liveUpdate({ fontSize: 21 }));
     expect(saveSettings).not.toHaveBeenCalled();

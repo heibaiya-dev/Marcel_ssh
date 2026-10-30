@@ -481,9 +481,11 @@ mod tests {
         let server = McpServer::new(
             super::super::McpServerConfig::default(),
             Arc::new(crate::SshManager::new()),
-            Arc::new(tokio::sync::RwLock::new(
+            crate::data::JsonStore::new(
+                &std::env::temp_dir(),
                 crate::config::connections::ConnectionStore::new(),
-            )),
+                None,
+            ),
         );
         let cfg = HttpConfig {
             bind: DEFAULT_BIND.parse().unwrap(),

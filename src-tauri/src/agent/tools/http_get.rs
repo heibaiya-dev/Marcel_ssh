@@ -38,7 +38,7 @@ use crate::agent::tools::web_result::{
     is_blank_content, is_bot_block, truncate_error_body, FallbackNote, WebBackend,
 };
 use crate::agent::tools::{truncate_output, AgentTool, ToolContext, ToolOutput};
-use crate::config::keychain;
+use crate::config::keychain::{self, SecretSlot};
 use crate::config::settings::{
     CustomFetchApi, FetchApiProtocol, HttpFetchMode, WebSearchApiProvider,
 };
@@ -639,10 +639,10 @@ fn tavily_fetcher(
     format: OutputFormat,
     search_provider: WebSearchApiProvider,
 ) -> Result<RemoteFetcher, AppError> {
-    let own = keychain::get_tavily_fetch_api_key()?;
+    let own = keychain::get(&SecretSlot::TavilyFetchApiKey)?;
     // Only worth reading when it could be used; never touch the shared slot for Brave.
     let shared = if search_provider == WebSearchApiProvider::Tavily {
-        keychain::get_web_search_api_key()?
+        keychain::get(&SecretSlot::WebSearchApiKey)?
     } else {
         None
     };
@@ -701,7 +701,7 @@ fn custom_fetcher(
 ) -> Result<RemoteFetcher, AppError> {
     let endpoint = deepseek_api::validate_endpoint_url(&config.url, "custom fetch API")?;
     // The key is optional: self-hosted services are often unauthenticated.
-    let api_key = keychain::get_custom_fetch_api_key()?
+    let api_key = keychain::get(&SecretSlot::CustomFetchApiKey)?
         .map(|key| key.trim().to_string())
         .unwrap_or_default();
     Ok(RemoteFetcher {

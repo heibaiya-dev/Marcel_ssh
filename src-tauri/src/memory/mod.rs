@@ -31,6 +31,7 @@ use std::sync::{Arc, OnceLock};
 
 use tauri::AppHandle;
 
+use crate::data::DataSourceId;
 use crate::error::AppError;
 use crate::llm::manager::LlmManager;
 use crate::AppState;
@@ -48,10 +49,10 @@ pub struct MemoryManager {
 }
 
 impl MemoryManager {
-    /// 打开 `{config_dir}/memory.db`；打不开时退回内存库（记忆不落盘，但功能可用）
-    /// 并记日志，不让启动失败。
+    /// 打开 `DataSourceId::Memory`（`{config_dir}/memory.db`）；打不开时退回内存库
+    /// （记忆不落盘，但功能可用）并记日志，不让启动失败。
     pub fn open(config_dir: &Path) -> Self {
-        let path = config_dir.join("memory.db");
+        let path = DataSourceId::Memory.path(config_dir);
         let store = match MemoryStore::open(&path) {
             Ok(s) => {
                 log::info!("✓ 记忆库已加载: {}", path.display());

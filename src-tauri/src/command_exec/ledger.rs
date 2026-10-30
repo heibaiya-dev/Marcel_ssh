@@ -38,12 +38,14 @@ use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 
 use crate::config::persist::atomic_write;
+use crate::data::DataSourceId;
 
 use super::job::JobStatus;
 use super::ticket::CancelReason;
 
-/// 台账文件名（应用配置目录下）。
-pub const LEDGER_FILE_NAME: &str = "jobs.json";
+/// 台账文件名（应用配置目录下）。唯一来源是数据源登记表的 `JobLedger`，这里只是
+/// 给测试和文档引用的别名——别在别处再写一遍 `"jobs.json"` 字面量。
+pub const LEDGER_FILE_NAME: &str = DataSourceId::JobLedger.rel_path();
 
 /// 已结束作业的保留期：超过它就从台账里清掉（连同它的溢出文件）。
 /// 保留期的意义是「还能回看最近的作业」，不是永久归档；无限留着只会让

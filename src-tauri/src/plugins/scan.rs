@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::data::DataSourceId;
 use crate::plugins::manifest::{PluginManifest, ToolKind};
 
 pub fn scan_plugins(config_dir: &Path) -> Vec<PluginManifest> {
@@ -7,7 +8,7 @@ pub fn scan_plugins(config_dir: &Path) -> Vec<PluginManifest> {
 }
 
 pub fn scan_plugins_filtered(config_dir: &Path, disabled: &[String]) -> Vec<PluginManifest> {
-    let plugins_dir = config_dir.join("plugins");
+    let plugins_dir = DataSourceId::Plugins.path(config_dir);
     let mut result = vec![];
 
     let entries = match std::fs::read_dir(&plugins_dir) {

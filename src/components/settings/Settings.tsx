@@ -6,6 +6,7 @@ import { useRiskRuleFocusStore } from '@/stores/riskRuleFocusStore';
 import { getErrorMessage } from '@/lib/errors';
 import type { AppSettings } from '@/lib/types';
 import { resolveSettingsLayout } from '@/lib/settingsLayout';
+import { deepEqual, threeWayMerge } from '@/lib/settingsMerge';
 import { SearchRegistryProvider, SettingsLayoutProvider } from './helpers';
 import { SettingsActionsProvider } from './SettingsActionsContext';
 import { useValidators } from './SettingsActionsContext';
@@ -34,7 +35,11 @@ export default function Settings() {
   const [shellWidth, setShellWidth] = useState(1200);
   const savedNoticeTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const saveErrorTimerRef = useRef<ReturnType<typeof setTimeout>>();
-  /** 上次已同步进 draft 的 store 快照；用于区分「用户本地改动」与「外部 store 刷新」 */
+  /**
+   * 上次已同步进 draft 的 store 快照 = 草稿的「出发点」。
+   * 用于区分「用户本地改动」与「外部 store 刷新」（跨设备同步落地的改动也走这条路），
+   * 也是保存时做三方合并的 base。
+   */
   const lastSyncedStoreRef = useRef<AppSettings | null>(
     useSettingsStore.getState().loaded ? useSettingsStore.getState().settings : null,
   );
@@ -72,9 +77,11 @@ export default function Settings() {
     [storeSetPreview]
   );
 
-  // storeSettings 变化：初次加载 / 外部刷新 store。
+  // storeSettings 变化：初次加载 / 外部刷新 store（含跨设备同步把别的设备的改动落到本机）。
   // layout 阶段跟进，避免 paint 一帧 draft 落后 → 闪「未保存的更改」。
-  // 字段级跟进：用户未改过的顶层字段跟进刷新，改过的保留（避免外部覆盖本地编辑）。
+  // 三方合并：用户没改过的字段跟进最新，改过的保留——且逐层到叶子：同步来的是
+  // agentModeSettings.listMode、用户改的是 agentModeSettings.maxToolRounds 时两个都保留
+  // （旧版按顶层字段合并，整个 agentModeSettings 会被草稿里的旧版本盖掉）。
   useLayoutEffect(() => {
     if (!loaded) return;
     const prevStore = lastSyncedStoreRef.current;
@@ -82,22 +89,9 @@ export default function Settings() {
     setDraft((current) => {
       if (current === null) return storeSettings;
       if (prevStore === null) return storeSettings;
-      // 整对象相同：直接跟进
-      if (JSON.stringify(current) === JSON.stringify(prevStore)) {
-        return storeSettings;
-      }
-      // 字段级合并：未改的顶层字段跟进 sync，改过的保留
-      // 用 Record<string, unknown> 中间层规避 keyof 联合类型索引赋值的 TS 限制
-      const cur = current as unknown as Record<string, unknown>;
-      const prev = prevStore as unknown as Record<string, unknown>;
-      const next = storeSettings as unknown as Record<string, unknown>;
-      const merged: Record<string, unknown> = { ...cur };
-      for (const key of Object.keys(storeSettings)) {
-        if (JSON.stringify(cur[key]) === JSON.stringify(prev[key])) {
-          merged[key] = next[key];
-        }
-      }
-      return merged as unknown as AppSettings;
+      // 没有未保存的改动：直接跟进
+      if (deepEqual(current, prevStore)) return storeSettings;
+      return threeWayMerge(prevStore, current, storeSettings);
     });
   }, [loaded, storeSettings]);
 
@@ -115,7 +109,7 @@ export default function Settings() {
   const layout = useMemo(() => resolveSettingsLayout(shellWidth), [shellWidth]);
 
   const dirty = useMemo(
-    () => (draft ? JSON.stringify(draft) !== JSON.stringify(storeSettings) : false),
+    () => (draft ? !deepEqual(draft, storeSettings) : false),
     [draft, storeSettings]
   );
 
@@ -149,7 +143,9 @@ export default function Settings() {
     }
     setSaving(true);
     try {
-      await storeSave(draft);
+      // 带上草稿的出发点：只把用户在草稿里真正改过的字段合并到最新设置上再保存，
+      // 不会把保存前一刻刚同步来的别的设备的改动改回去。
+      await storeSave(draft, lastSyncedStoreRef.current ?? undefined);
       setSavedNotice('已保存');
       clearTimeout(savedNoticeTimerRef.current);
       savedNoticeTimerRef.current = setTimeout(() => setSavedNotice(null), 2000);

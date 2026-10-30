@@ -1,6 +1,9 @@
 import { Bot, Folder, Settings, Terminal } from 'lucide-react';
 import { MOBILE_TABS, type MobileTabId } from './tabs';
 import { useTaskStore } from '@/stores/taskStore';
+import { useSyncStore } from '@/stores/syncStore';
+import { needsAttention } from '@/lib/syncModel';
+import { StatusDot } from '@/components/settings/sync/syncUi';
 import { getActiveRunningTasks } from '@/stores/agentStatusSelectors';
 import { AgentStatusIndicator } from '@/components/agent/AgentStatusIndicator';
 
@@ -24,6 +27,8 @@ export default function MobileTabBar({
   const unreadCompletedConversations = useTaskStore(
     (s) => s.unreadCompletedConversations,
   );
+  // 同步需要处理时，「设置」图标上亮一个点——手机没有顶栏，这是它唯一不打扰又够显眼的位置。
+  const syncState = useSyncStore((s) => s.status?.state);
   const runningTasks = getActiveRunningTasks(tasks);
   const hasRunningAgent = runningTasks.length > 0;
   const hasWaitingApproval = runningTasks.some(
@@ -62,6 +67,12 @@ export default function MobileTabBar({
           >
             <div className="relative">
               <Icon className="h-5 w-5" strokeWidth={active ? 2.25 : 1.75} />
+              {tab.id === 'settings' && needsAttention(syncState) && (
+                <span className="absolute -top-0.5 -right-1.5">
+                  <StatusDot tone={syncState === 'error' ? 'error' : 'warn'} />
+                  <span className="sr-only">同步需要处理</span>
+                </span>
+              )}
               {tab.id === 'agent' && (
                 <span className="absolute -top-1 -right-2">
                   <AgentStatusIndicator status={agentTabVisualStatus} size="xs" />

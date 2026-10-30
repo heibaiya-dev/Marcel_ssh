@@ -1,11 +1,10 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::config::persist::JsonPersistable;
 use crate::error::AppError;
 use crate::mcp::manager::McpServerRuntimeStatus;
 use crate::mcp::protocol::McpToolInfo;
-use crate::mcp::store::{McpServerConfig, McpServerInput, McpServerStore};
+use crate::mcp::store::{McpServerConfig, McpServerInput};
 use crate::AppState;
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,16 +30,13 @@ pub async fn mcp_add_server(
 ) -> Result<McpServerConfig, AppError> {
     let server = McpServerConfig::new(input)?;
     let cloned = server.clone();
-    let path = McpServerStore::default_file(&state.config_dir);
-    let candidate = {
-        let store = state.mcp_store.write().await;
-        let mut candidate = store.clone();
-        candidate.add(server);
-        candidate
-    };
-    // fsync 是同步系统调用：出写锁后再落盘（对齐 settings 的 block_in_place 写法）
-    tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-    *state.mcp_store.write().await = candidate;
+    state
+        .mcp_store
+        .mutate(|store| {
+            store.add(server);
+            Ok(())
+        })
+        .await?;
 
     Ok(cloned)
 }
@@ -51,17 +47,11 @@ pub async fn mcp_update_server(
     id: String,
     input: McpServerInput,
 ) -> Result<(), AppError> {
-    let path = McpServerStore::default_file(&state.config_dir);
-    {
-        let candidate = {
-            let store = state.mcp_store.write().await;
-            let mut candidate = store.clone();
-            candidate.update(&id, input)?;
-            candidate
-        };
-        tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-        *state.mcp_store.write().await = candidate;
-    }
+    state
+        .mcp_store
+        .mutate(|store| store.update(&id, input))
+        .await?;
+    // 落盘之后才清缓存：写盘失败时配置没变，缓存也该留着。
     state.mcp_manager.clear_cache(&id).await;
 
     Ok(())
@@ -69,17 +59,7 @@ pub async fn mcp_update_server(
 
 #[tauri::command]
 pub async fn mcp_delete_server(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    let path = McpServerStore::default_file(&state.config_dir);
-    {
-        let candidate = {
-            let store = state.mcp_store.write().await;
-            let mut candidate = store.clone();
-            candidate.delete(&id)?;
-            candidate
-        };
-        tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-        *state.mcp_store.write().await = candidate;
-    }
+    state.mcp_store.mutate(|store| store.delete(&id)).await?;
     state.mcp_manager.clear_cache(&id).await;
 
     Ok(())
@@ -87,17 +67,7 @@ pub async fn mcp_delete_server(state: State<'_, AppState>, id: String) -> Result
 
 #[tauri::command]
 pub async fn mcp_toggle_server(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    let path = McpServerStore::default_file(&state.config_dir);
-    {
-        let candidate = {
-            let store = state.mcp_store.write().await;
-            let mut candidate = store.clone();
-            candidate.toggle(&id)?;
-            candidate
-        };
-        tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-        *state.mcp_store.write().await = candidate;
-    }
+    state.mcp_store.mutate(|store| store.toggle(&id)).await?;
     // enabled 不进 tools cache key；Agent 只注册 store 里 enabled 的 server。
     // 不清 cache，避免关/开闪空与无意义重刷。
 

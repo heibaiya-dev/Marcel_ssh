@@ -27,6 +27,7 @@ export type MobileSettingsCategoryId =
   | 'commands-skills'
   | 'mcp-server'
   | 'notification-background'
+  | 'sync'
   | 'about';
 
 export interface MobileSettingsCategory {
@@ -80,6 +81,11 @@ export const MOBILE_SETTINGS_CATEGORIES: readonly MobileSettingsCategory[] = [
     id: 'notification-background',
     title: '通知与后台',
     description: 'Agent 事件提醒与后台保活（仅 Android）',
+  },
+  {
+    id: 'sync',
+    title: '跨设备同步',
+    description: '端到端加密，在你的设备之间同步配置',
   },
   {
     id: 'about',

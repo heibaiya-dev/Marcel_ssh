@@ -1,8 +1,7 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::config::keychain;
-use crate::config::persist::JsonPersistable;
+use crate::config::keychain::{self, SecretSlot};
 use crate::config::settings::AppSettings;
 use crate::error::AppError;
 use crate::llm::manager::LlmManager;
@@ -74,10 +73,7 @@ pub fn compute_channel_key_status(settings: &AppSettings) -> Vec<ChannelKeyStatu
         .iter()
         .map(|c| {
             let has_key = !c.api_key.is_empty()
-                || keychain::get_llm_channel_key(&c.id)
-                    .ok()
-                    .flatten()
-                    .is_some();
+                || keychain::has(&SecretSlot::LlmChannel(c.id.clone())).unwrap_or(false);
             ChannelKeyStatus {
                 channel_id: c.id.clone(),
                 has_key,
@@ -90,25 +86,16 @@ pub fn compute_channel_key_status(settings: &AppSettings) -> Vec<ChannelKeyStatu
 #[tauri::command]
 pub async fn config_get_settings(state: State<'_, AppState>) -> Result<SettingsResponse, AppError> {
     let settings = state.settings.read().await.clone();
-    let has_api_key = keychain::get_llm_api_key().ok().flatten().is_some();
-    let has_web_search_api_key = keychain::get_web_search_api_key().ok().flatten().is_some();
-    let has_deepseek_tools_api_key = keychain::get_deepseek_tools_api_key()
-        .ok()
-        .flatten()
-        .is_some();
-    let has_custom_search_api_key = keychain::get_custom_search_api_key()
-        .ok()
-        .flatten()
-        .is_some();
-    let has_custom_fetch_api_key = keychain::get_custom_fetch_api_key()
-        .ok()
-        .flatten()
-        .is_some();
-    let has_tavily_fetch_api_key = keychain::get_tavily_fetch_api_key()
-        .ok()
-        .flatten()
-        .is_some();
-    let has_jev_api_key = keychain::get_jev_api_key().ok().flatten().is_some();
+    // 各功能 Key 的有无由槽位表统一探测，字段名 / 语义与改造前一致：
+    // 这里的 `has_api_key` 只看旧版单配置 Key（渠道维度另走 `channel_key_status`）。
+    let flags = keychain::FeatureKeyFlags::probe();
+    let has_api_key = flags.legacy_llm_api_key;
+    let has_web_search_api_key = flags.web_search_api_key;
+    let has_deepseek_tools_api_key = flags.deepseek_tools_api_key;
+    let has_custom_search_api_key = flags.custom_search_api_key;
+    let has_custom_fetch_api_key = flags.custom_fetch_api_key;
+    let has_tavily_fetch_api_key = flags.tavily_fetch_api_key;
+    let has_jev_api_key = flags.jev_api_key;
     let channel_key_status = compute_channel_key_status(&settings);
     // Take the warning so the user only sees it once (after a single load).
     let warning = state.settings_warning.write().take();
@@ -126,31 +113,23 @@ pub async fn config_get_settings(state: State<'_, AppState>) -> Result<SettingsR
     })
 }
 
-/// Save updated application settings. Persists to disk.
+/// 设置落盘前的「迁移 / 去重 / 归一化 / 校验」，**保存命令与跨设备同步落地共用**。
 ///
-/// 多渠道模型服务：
-/// - 各渠道 API Key 独立存入系统密钥链（account = `llm_channel_{id}`），
-///   `ChannelConfig.api_key` 不落盘（`skip_serializing`）；
-/// - 前端回传掩码/空值时保留旧内存 key；
-/// - 被删除渠道的密钥从 keychain 清理，避免孤儿条目。
-#[tauri::command]
-pub async fn config_save_settings(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    settings: AppSettings,
-) -> Result<(), AppError> {
+/// 顺序与效果就是原来 `config_save_settings` 里那一串，一字不改地搬了出来：
+/// - 旧单配置 `llmConfig` 的兜底迁移（前端理论上不会再带旧字段，防御旧端 / 历史数据）；
+/// - 更新方式三态：`autoUpdate` 只是旧版本客户端读的兼容镜像，真值以 `updateMode` 为准；
+/// - 去重同 id 重复模型 / 归一化思考强度档位 / 子 agent 候选清单（自愈兜底）；
+/// - 校验多渠道配置（渠道重试参数、引用完整性与模型 ID 唯一性）。
+///
+/// 校验失败返回 `Err`，候选值不应被提交。
+pub fn normalize_settings_for_save(candidate: &mut AppSettings) -> Result<(), AppError> {
     // 兜底迁移（理论上前端不会再带旧字段，防御旧端/历史数据）
-    let mut candidate = settings;
-    migrate_legacy_settings(&mut candidate);
+    migrate_legacy_settings(candidate);
 
     // 更新方式三态（auto / notify / off）：`autoUpdate` 只是给旧版本客户端读的
     // 兼容镜像，真值以 `updateMode` 为准，保存前统一派生，避免落盘出现
     // 「模式说关闭、镜像说开着」的矛盾配置。
     candidate.sync_update_mode_mirror();
-    let (previous_update_mode, previous_disabled_plugins) = {
-        let store = state.settings.read().await;
-        (store.update_mode, store.disabled_plugins.clone())
-    };
 
     // 自愈兜底：去重同 id 重复模型（历史「保存渠道」合并 bug 可能仍让前端
     // 内存里带重复条目；先去重再校验，避免合法保存被重复数据拦住）
@@ -171,14 +150,40 @@ pub async fn config_save_settings(
     }
 
     // 校验多渠道配置（含渠道重试参数、引用完整性与模型 ID 唯一性）
-    candidate.llm_registry.validate()?;
+    candidate.llm_registry.validate()
+}
+
+/// Save updated application settings. Persists to disk.
+///
+/// 多渠道模型服务：
+/// - 各渠道 API Key 独立存入系统密钥链（account = `llm_channel_{id}`），
+///   `ChannelConfig.api_key` 不落盘（`skip_serializing`）；
+/// - 前端回传掩码/空值时保留旧内存 key；
+/// - 被删除渠道的密钥从 keychain 清理，避免孤儿条目。
+#[tauri::command]
+pub async fn config_save_settings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<(), AppError> {
+    // 去重 / 归一化 / 校验：与跨设备同步落地共用同一个函数（`normalize_settings_for_save`），
+    // 「保存」和「同步来的」两条路径得到的设置满足同样的不变量。
+    let mut candidate = settings;
+    normalize_settings_for_save(&mut candidate)?;
+    let (previous_update_mode, previous_disabled_plugins) = {
+        let store = state.settings.read().await;
+        (store.update_mode, store.disabled_plugins.clone())
+    };
 
     // 密钥链写入：每个渠道独立。掩码/空值 = 保留旧 key（不写）。
     {
         let store = state.settings.read().await;
         for channel in &mut candidate.llm_registry.channels {
             if !channel.api_key.is_empty() && !is_masked_key(&channel.api_key) {
-                keychain::save_llm_channel_key(&channel.id, &channel.api_key)?;
+                keychain::set(
+                    &SecretSlot::LlmChannel(channel.id.clone()),
+                    &channel.api_key,
+                )?;
                 log::info!("已将渠道 [{}] 的 API Key 保存到密钥链", channel.name);
             } else if channel.api_key.is_empty() || is_masked_key(&channel.api_key) {
                 // 保留内存旧 key（若存在）；api_key 不落盘，掩码值只在内存停留
@@ -202,18 +207,15 @@ pub async fn config_save_settings(
                 .iter()
                 .any(|c| c.id == old.id)
             {
-                let _ = keychain::delete_llm_channel_key(&old.id);
+                let _ = keychain::delete(&SecretSlot::LlmChannel(old.id.clone()));
             }
         }
     }
 
-    // 先持久化候选快照，成功后才提交内存；写盘失败保持旧状态。
-    let path = AppSettings::default_file(&state.config_dir);
-    tokio::task::block_in_place(|| candidate.save_to_path(&path))?;
-    let mut store = state.settings.write().await;
-    *store = candidate.clone();
-    let snapshot = candidate;
-    drop(store);
+    // 先持久化候选快照，成功后才提交内存；写盘失败保持旧状态（`replace` 保证）。
+    // 没变化时不写盘（但候选值照常换入内存：渠道 `api_key` 等不进序列化的字段要生效）。
+    let snapshot = candidate.clone();
+    state.settings.replace(candidate).await?;
 
     // 更新方式变了 → 让更新器立刻按新模式行事：切到「关闭」要停掉进行中的
     // 下载并收回提示，从「关闭」切回来要马上检查一次（否则用户刚打开开关还要
@@ -314,12 +316,13 @@ pub async fn llm_list_models(
 
     let resolved_key = match api_key {
         Some(k) if !k.is_empty() && !is_masked_key(&k) => k,
-        _ => match channel_id
-            .as_deref()
-            .and_then(|id| keychain::get_llm_channel_key(id).ok().flatten())
-        {
+        _ => match channel_id.as_deref().and_then(|id| {
+            keychain::get(&SecretSlot::LlmChannel(id.to_string()))
+                .ok()
+                .flatten()
+        }) {
             Some(k) => k,
-            None => match keychain::get_llm_api_key()? {
+            None => match keychain::get(&SecretSlot::LegacyLlmApiKey)? {
                 Some(k) => k,
                 None => {
                     return Err(AppError::Llm(

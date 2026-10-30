@@ -26,6 +26,7 @@ describe('MOBILE_SETTINGS_CATEGORIES', () => {
       'commands-skills',
       'mcp-server',
       'notification-background',
+      'sync',
       'about',
     ]);
   });
@@ -41,6 +42,7 @@ describe('MOBILE_SETTINGS_CATEGORIES', () => {
     expect(getMobileSettingsCategory('conversations')?.title).toBe('会话与归档');
     expect(getMobileSettingsCategory('commands-skills')?.title).toBe('快捷命令与技能');
     expect(getMobileSettingsCategory('notification-background')?.title).toBe('通知与后台');
+    expect(getMobileSettingsCategory('sync')?.title).toBe('跨设备同步');
     expect(getMobileSettingsCategory('nope')).toBeUndefined();
   });
 

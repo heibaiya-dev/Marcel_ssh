@@ -14,11 +14,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
-
 use crate::command_exec::CommandExecutionManager;
 use crate::config::connections::ConnectionStore;
 use crate::config::persist::JsonPersistable;
+use crate::data::JsonStore;
 use crate::mcp_server::stdio_transport;
 use crate::mcp_server::{McpServer, McpServerConfig};
 use crate::SshManager;
@@ -74,7 +73,8 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let connection_store = Arc::new(RwLock::new(connection_store));
+    // 无头模式没有同步引擎，不广播（`None`）；临时连接走 `mutate_transient`，从不写盘。
+    let connection_store = JsonStore::new(&config_dir, connection_store, None);
 
     // 主机密钥库：**必须与 GUI 同一个文件**。
     //
@@ -85,8 +85,9 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
     // 「指纹不匹配一律拒绝」这条跨进程永远不会触发——服务器被换钥（MITM）
     // 会被静默接受，随后用密钥链里的凭据完成认证。必须读真实那份。
     let known_hosts = {
-        let path = config_dir.join("known_hosts.json");
-        match crate::ssh::known_hosts::KnownHostsStore::load(path.clone()).await {
+        let path = crate::data::DataSourceId::KnownHosts.path(&config_dir);
+        match crate::ssh::known_hosts::KnownHostsStore::load_in_config_dir(&config_dir, None).await
+        {
             Ok(store) => {
                 eprintln!("[Marcel SSH] Loaded known_hosts from {}", path.display());
                 store

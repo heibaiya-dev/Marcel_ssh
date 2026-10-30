@@ -70,6 +70,11 @@ import type {
   TruncateConversationResult,
   JobInfo,
   RemotePlatform,
+  SyncCreateResult,
+  SyncDevice,
+  SyncHistoryEntry,
+  SyncStatus,
+  SyncStorageConfig,
 } from "./types";
 
 // SSH commands
@@ -1700,4 +1705,79 @@ export async function pluginUpdate(
 /** Remove an installed plugin (directory + settings residue). */
 export async function pluginUninstall(pluginId: string): Promise<void> {
   return invoke("plugin_uninstall", { pluginId });
+}
+
+// ───── 跨设备同步（命令契约见 scratch/sync/phase1-spec.md 4.9）─────
+//
+// 恢复密钥 / 同步码 / 存储密码都是机密：这里只做透传，不缓存、不打日志；
+// 调用方（syncStore / 向导）也只在局部状态里短暂持有。
+
+export async function syncGetStatus(): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_get_status");
+}
+
+/** 连通性 + 权限自检（写 / 读 / 删一个探针文件）。`secret` = 存储密码（WebDAV 的应用密码），SFTP 传 null。 */
+export async function syncTestStorage(
+  storage: SyncStorageConfig,
+  secret: string | null,
+): Promise<void> {
+  return invoke("sync_test_storage", { storage, secret });
+}
+
+export async function syncCreate(
+  storage: SyncStorageConfig,
+  secret: string | null,
+): Promise<SyncCreateResult> {
+  return invoke<SyncCreateResult>("sync_create", { storage, secret });
+}
+
+export async function syncJoin(syncCode: string): Promise<void> {
+  return invoke("sync_join", { syncCode });
+}
+
+export async function syncJoinManual(
+  storage: SyncStorageConfig,
+  secret: string | null,
+  recoveryKey: string,
+): Promise<void> {
+  return invoke("sync_join_manual", { storage, secret, recoveryKey });
+}
+
+export async function syncNow(): Promise<void> {
+  return invoke("sync_now");
+}
+
+export async function syncGetSyncCode(): Promise<string> {
+  return invoke<string>("sync_get_sync_code");
+}
+
+export async function syncGetRecoveryKey(): Promise<string> {
+  return invoke<string>("sync_get_recovery_key");
+}
+
+export async function syncSetDeviceName(name: string): Promise<void> {
+  return invoke("sync_set_device_name", { name });
+}
+
+export async function syncListDevices(): Promise<SyncDevice[]> {
+  return invoke<SyncDevice[]>("sync_list_devices");
+}
+
+export async function syncListHistory(limit: number): Promise<SyncHistoryEntry[]> {
+  return invoke<SyncHistoryEntry[]>("sync_list_history", { limit });
+}
+
+/** 把该条记录的路径改回旧值（后端走一次本机 mutate，自然被捕获成新的改动再同步出去）。 */
+export async function syncUndo(entryId: string): Promise<void> {
+  return invoke("sync_undo", { entryId });
+}
+
+/** `accept=true` 放行大量删除；`false` 撤销本机删除（从云端镜像写回）。 */
+export async function syncConfirmHeld(accept: boolean): Promise<void> {
+  return invoke("sync_confirm_held", { accept });
+}
+
+/** 停止同步；`wipeRemote` 同时删掉云端本应用的同步文件。本机配置数据不动。 */
+export async function syncDisable(wipeRemote: boolean): Promise<void> {
+  return invoke("sync_disable", { wipeRemote });
 }

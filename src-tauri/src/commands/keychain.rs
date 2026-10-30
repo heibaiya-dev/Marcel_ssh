@@ -1,10 +1,10 @@
-use crate::config::keychain;
+use crate::config::keychain::{self, SecretSlot};
 use crate::error::AppError;
 
 /// Save a password for a connection into the OS keychain.
 #[tauri::command]
 pub async fn config_save_password(connection_id: String, password: String) -> Result<(), AppError> {
-    keychain::save_password(&connection_id, &password)
+    keychain::set(&SecretSlot::SshPassword(connection_id), &password)
 }
 
 /// Check whether a password has been saved for a connection.
@@ -12,17 +12,13 @@ pub async fn config_save_password(connection_id: String, password: String) -> Re
 /// 安全：不将密码返回给前端，只返回是否已保存。
 #[tauri::command]
 pub async fn config_has_password(connection_id: String) -> Result<bool, AppError> {
-    match keychain::get_password(&connection_id) {
-        Ok(Some(_)) => Ok(true),
-        Ok(None) => Ok(false),
-        Err(e) => Err(e),
-    }
+    keychain::has(&SecretSlot::SshPassword(connection_id))
 }
 
 /// Remove a stored password from the keychain without deleting the connection.
 #[tauri::command]
 pub async fn config_delete_password(connection_id: String) -> Result<(), AppError> {
-    keychain::delete_password(&connection_id)
+    keychain::delete(&SecretSlot::SshPassword(connection_id))
 }
 
 /// Save a private-key passphrase for a connection into the OS keychain.
@@ -32,24 +28,20 @@ pub async fn config_save_passphrase(
     connection_id: String,
     passphrase: String,
 ) -> Result<(), AppError> {
-    keychain::save_password(&format!("pk:{}", connection_id), &passphrase)
+    keychain::set(&SecretSlot::SshKeyPassphrase(connection_id), &passphrase)
 }
 
 /// Check whether a private-key passphrase has been saved for a connection.
 /// 安全：不将 passphrase 返回给前端，只返回是否已保存。
 #[tauri::command]
 pub async fn config_has_passphrase(connection_id: String) -> Result<bool, AppError> {
-    match keychain::get_password(&format!("pk:{}", connection_id)) {
-        Ok(Some(_)) => Ok(true),
-        Ok(None) => Ok(false),
-        Err(e) => Err(e),
-    }
+    keychain::has(&SecretSlot::SshKeyPassphrase(connection_id))
 }
 
 /// Remove a stored private-key passphrase from the keychain.
 #[tauri::command]
 pub async fn config_delete_passphrase(connection_id: String) -> Result<(), AppError> {
-    keychain::delete_password(&format!("pk:{}", connection_id))
+    keychain::delete(&SecretSlot::SshKeyPassphrase(connection_id))
 }
 
 /// Save jump-host password (`jump:{connection_id}`).
@@ -58,23 +50,19 @@ pub async fn config_save_jump_password(
     connection_id: String,
     password: String,
 ) -> Result<(), AppError> {
-    keychain::save_password(&format!("jump:{}", connection_id), &password)
+    keychain::set(&SecretSlot::JumpPassword(connection_id), &password)
 }
 
 /// Check whether a jump-host password is stored.
 #[tauri::command]
 pub async fn config_has_jump_password(connection_id: String) -> Result<bool, AppError> {
-    match keychain::get_password(&format!("jump:{}", connection_id)) {
-        Ok(Some(_)) => Ok(true),
-        Ok(None) => Ok(false),
-        Err(e) => Err(e),
-    }
+    keychain::has(&SecretSlot::JumpPassword(connection_id))
 }
 
 /// Remove jump-host password from keychain.
 #[tauri::command]
 pub async fn config_delete_jump_password(connection_id: String) -> Result<(), AppError> {
-    keychain::delete_password(&format!("jump:{}", connection_id))
+    keychain::delete(&SecretSlot::JumpPassword(connection_id))
 }
 
 /// Save jump-host private-key passphrase (`jump:pk:{connection_id}`).
@@ -83,23 +71,19 @@ pub async fn config_save_jump_passphrase(
     connection_id: String,
     passphrase: String,
 ) -> Result<(), AppError> {
-    keychain::save_password(&format!("jump:pk:{}", connection_id), &passphrase)
+    keychain::set(&SecretSlot::JumpKeyPassphrase(connection_id), &passphrase)
 }
 
 /// Check whether a jump-host passphrase is stored.
 #[tauri::command]
 pub async fn config_has_jump_passphrase(connection_id: String) -> Result<bool, AppError> {
-    match keychain::get_password(&format!("jump:pk:{}", connection_id)) {
-        Ok(Some(_)) => Ok(true),
-        Ok(None) => Ok(false),
-        Err(e) => Err(e),
-    }
+    keychain::has(&SecretSlot::JumpKeyPassphrase(connection_id))
 }
 
 /// Remove jump-host passphrase from keychain.
 #[tauri::command]
 pub async fn config_delete_jump_passphrase(connection_id: String) -> Result<(), AppError> {
-    keychain::delete_password(&format!("jump:pk:{}", connection_id))
+    keychain::delete(&SecretSlot::JumpKeyPassphrase(connection_id))
 }
 
 /// Save a per-channel LLM API key to the system keychain.
@@ -109,7 +93,7 @@ pub async fn config_save_llm_channel_api_key(
     channel_id: String,
     api_key: String,
 ) -> Result<(), AppError> {
-    keychain::save_llm_channel_key(&channel_id, &api_key)?;
+    keychain::set(&SecretSlot::LlmChannel(channel_id), &api_key)?;
     Ok(())
 }
 
@@ -119,35 +103,35 @@ pub async fn config_save_llm_channel_api_key(
 /// Remove a per-channel LLM API key from the system keychain.
 #[tauri::command]
 pub async fn config_delete_llm_channel_api_key(channel_id: String) -> Result<(), AppError> {
-    keychain::delete_llm_channel_key(&channel_id)?;
+    keychain::delete(&SecretSlot::LlmChannel(channel_id))?;
     Ok(())
 }
 
 /// Save the web search API key to the system keychain.
 #[tauri::command]
 pub async fn config_save_web_search_api_key(api_key: String) -> Result<(), AppError> {
-    keychain::save_web_search_api_key(&api_key)?;
+    keychain::set(&SecretSlot::WebSearchApiKey, &api_key)?;
     Ok(())
 }
 
 /// Remove the web search API key from the system keychain.
 #[tauri::command]
 pub async fn config_delete_web_search_api_key() -> Result<(), AppError> {
-    keychain::delete_web_search_api_key()?;
+    keychain::delete(&SecretSlot::WebSearchApiKey)?;
     Ok(())
 }
 
 /// Save the custom search API key to the system keychain. 原始 Key 永不回传 WebView。
 #[tauri::command]
 pub async fn config_save_custom_search_api_key(api_key: String) -> Result<(), AppError> {
-    keychain::save_custom_search_api_key(&api_key)?;
+    keychain::set(&SecretSlot::CustomSearchApiKey, &api_key)?;
     Ok(())
 }
 
 /// Remove the custom search API key from the system keychain.
 #[tauri::command]
 pub async fn config_delete_custom_search_api_key() -> Result<(), AppError> {
-    keychain::delete_custom_search_api_key()?;
+    keychain::delete(&SecretSlot::CustomSearchApiKey)?;
     Ok(())
 }
 
@@ -155,14 +139,14 @@ pub async fn config_delete_custom_search_api_key() -> Result<(), AppError> {
 /// 原始 Key 永不回传 WebView，前端只通过 `hasCustomFetchApiKey` 知道配没配。
 #[tauri::command]
 pub async fn config_save_custom_fetch_api_key(api_key: String) -> Result<(), AppError> {
-    keychain::save_custom_fetch_api_key(&api_key)?;
+    keychain::set(&SecretSlot::CustomFetchApiKey, &api_key)?;
     Ok(())
 }
 
 /// Remove the custom page-fetch service key from the system keychain.
 #[tauri::command]
 pub async fn config_delete_custom_fetch_api_key() -> Result<(), AppError> {
-    keychain::delete_custom_fetch_api_key()?;
+    keychain::delete(&SecretSlot::CustomFetchApiKey)?;
     Ok(())
 }
 
@@ -170,14 +154,14 @@ pub async fn config_delete_custom_fetch_api_key() -> Result<(), AppError> {
 /// 原始 Key 永不回传 WebView，前端只通过 `hasTavilyFetchApiKey` 知道配没配。
 #[tauri::command]
 pub async fn config_save_tavily_fetch_api_key(api_key: String) -> Result<(), AppError> {
-    keychain::save_tavily_fetch_api_key(&api_key)?;
+    keychain::set(&SecretSlot::TavilyFetchApiKey, &api_key)?;
     Ok(())
 }
 
 /// Remove the Tavily page-fetch key from the system keychain.
 #[tauri::command]
 pub async fn config_delete_tavily_fetch_api_key() -> Result<(), AppError> {
-    keychain::delete_tavily_fetch_api_key()?;
+    keychain::delete(&SecretSlot::TavilyFetchApiKey)?;
     Ok(())
 }
 
@@ -185,14 +169,14 @@ pub async fn config_delete_tavily_fetch_api_key() -> Result<(), AppError> {
 /// 原始 Key 永不回传 WebView，前端只通过 `hasDeepseekToolsApiKey` 知道配没配。
 #[tauri::command]
 pub async fn config_save_deepseek_tools_api_key(api_key: String) -> Result<(), AppError> {
-    keychain::save_deepseek_tools_api_key(&api_key)?;
+    keychain::set(&SecretSlot::DeepseekToolsApiKey, &api_key)?;
     Ok(())
 }
 
 /// Remove the DeepSeek tools API key from the system keychain.
 #[tauri::command]
 pub async fn config_delete_deepseek_tools_api_key() -> Result<(), AppError> {
-    keychain::delete_deepseek_tools_api_key()?;
+    keychain::delete(&SecretSlot::DeepseekToolsApiKey)?;
     Ok(())
 }
 
@@ -202,13 +186,13 @@ pub async fn config_delete_deepseek_tools_api_key() -> Result<(), AppError> {
 /// 前端只能通过 `SettingsResponse.hasJevApiKey` 知道配没配。
 #[tauri::command]
 pub async fn config_save_jev_api_key(api_key: String) -> Result<(), AppError> {
-    keychain::save_jev_api_key(&api_key)?;
+    keychain::set(&SecretSlot::JevApiKey, &api_key)?;
     Ok(())
 }
 
 /// Remove the TypeSafe (Jev) API key from the system keychain.
 #[tauri::command]
 pub async fn config_delete_jev_api_key() -> Result<(), AppError> {
-    keychain::delete_jev_api_key()?;
+    keychain::delete(&SecretSlot::JevApiKey)?;
     Ok(())
 }

@@ -63,6 +63,13 @@ fs4 = "0.8"
 # 私钥库（ssh/key_store.rs）：导入的私钥用 AES-256-GCM 加密后再落盘。
 # 选 RustCrypto 而非 ring 是因为它纯 Rust，Android 交叉编译不会有构建脚本意外。
 aes-gcm = "0.10"
+# 跨设备同步（sync/core）：恢复密钥 → KEK 的派生（HKDF-SHA256，与上面的 sha2 0.10 同代），
+# 以及远端文件密文信封里的 deflate 压缩。两者都是纯 Rust，Android 交叉编译无额外原生依赖。
+hkdf = "0.12"
+flate2 = "1"
+# 跨设备同步的 WebDAV 适配器（sync/storage/webdav.rs）解析 PROPFIND 返回的 multistatus XML。
+# 选 0.37：Cargo.lock 里本来就有它（tauri 依赖链），不会多编一份。
+quick-xml = "0.37"
 
 
 

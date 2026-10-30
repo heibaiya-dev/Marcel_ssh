@@ -7,6 +7,7 @@ use tauri::{AppHandle, Manager, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::command_exec::{CancelReason, CommandSource, CommandTicket, SubmitOutcome};
+use crate::data::DataSourceId;
 use crate::emit_event;
 use crate::error::AppError;
 use crate::util::{is_content_uri, shell_escape, validate_local_path, validate_sftp_remote_path};
@@ -1748,7 +1749,6 @@ pub async fn sftp_cleanup_temp_dir(temp_dir: String) -> Result<(), AppError> {
 // ──────────── 图片预览（下载到临时目录后由 WebView 通过 asset 协议加载） ────────────
 
 const MAX_PREVIEW_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
-const PREVIEW_TEMP_DIR_PREFIX: &str = "marcel-previews";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1813,7 +1813,7 @@ pub async fn sftp_preview_image(
         .path()
         .app_data_dir()
         .map_err(|e| AppError::Ssh(format!("获取 app_data_dir 失败: {}", e)))?;
-    let temp_root = app_data.join(PREVIEW_TEMP_DIR_PREFIX);
+    let temp_root = DataSourceId::Previews.path(&app_data);
     std::fs::create_dir_all(&temp_root)
         .map_err(|e| AppError::Ssh(format!("创建预览临时根目录失败: {}", e)))?;
     let temp_dir = temp_root.join(&preview_id);
@@ -1927,7 +1927,7 @@ pub async fn sftp_preview_cleanup(
         .path()
         .app_data_dir()
         .map_err(|e| AppError::Ssh(format!("获取 app_data_dir 失败: {}", e)))?;
-    let temp_root = app_data.join(PREVIEW_TEMP_DIR_PREFIX);
+    let temp_root = DataSourceId::Previews.path(&app_data);
 
     if let Some(p) = local_path {
         let path = Path::new(&p);
@@ -2011,8 +2011,7 @@ mod tests {
     use super::{
         cleanup_stale_download_temp_files, encode_file_content, error_text,
         extract_failure_message, has_utf8_bom, is_system_path, progress_due, AppError, Duration,
-        Path, MAX_PREVIEW_IMAGE_BYTES, PREVIEW_TEMP_DIR_PREFIX, PROGRESS_MIN_BYTES,
-        PROGRESS_MIN_INTERVAL,
+        Path, MAX_PREVIEW_IMAGE_BYTES, PROGRESS_MIN_BYTES, PROGRESS_MIN_INTERVAL,
     };
 
     #[test]
@@ -2134,6 +2133,9 @@ mod tests {
 
     #[test]
     fn preview_temp_dir_prefix_is_stable() {
-        assert_eq!(PREVIEW_TEMP_DIR_PREFIX, "marcel-previews");
+        assert_eq!(
+            crate::data::DataSourceId::Previews.rel_path(),
+            "marcel-previews"
+        );
     }
 }

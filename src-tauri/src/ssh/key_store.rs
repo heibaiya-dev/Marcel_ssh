@@ -28,23 +28,23 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::config::keychain;
+use crate::config::keychain::{self, SecretSlot};
+use crate::data::DataSourceId;
 use crate::error::{AppError, KeyAuthCode};
 use crate::ssh::key_material;
 
-/// 主密钥在系统密钥链里的账号名。32 字节 base64 后 44 个字符，
-/// 远小于各处凭据存储的体积上限（Windows 那条约 1280 字符）。
-const MASTER_KEY_ACCOUNT: &str = "keys:master";
+// 主密钥在系统密钥链里的槽位是 `SecretSlot::KeyStoreMaster`（账号 `keys:master`，设备绑定、
+// 档位 Local）。32 字节 base64 后 44 个字符，远小于各处凭据存储的体积上限（Windows 那条约 1280 字符）。
 const INDEX_FILE: &str = "index.json";
 /// 封装格式版本。换算法时靠它区分，不猜。
 const ENVELOPE_VERSION: u32 = 1;
 
 static KEYS_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
-/// 记录应用配置目录下的密钥库位置（`{config_dir}/keys`）。
+/// 记录应用配置目录下的密钥库位置（`DataSourceId::KeyStore`，即 `{config_dir}/keys`）。
 /// 可重复调用，只有第一次生效——与 `agent::image_store` 同一套惯例。
 pub fn init(config_dir: &Path) {
-    let root = config_dir.join("keys");
+    let root = DataSourceId::KeyStore.path(config_dir);
     if let Err(e) = std::fs::create_dir_all(&root) {
         log::warn!("创建密钥库目录失败 {}: {}", root.display(), e);
         return;
@@ -558,7 +558,7 @@ fn master_key() -> Result<Zeroizing<[u8; 32]>, AppError> {
         .lock()
         .map_err(|_| AppError::Config("密钥库主密钥锁已损坏，请重启应用".into()))?;
 
-    if let Some(encoded) = keychain::get_password(MASTER_KEY_ACCOUNT)? {
+    if let Some(encoded) = keychain::get(&SecretSlot::KeyStoreMaster)? {
         let bytes = B64.decode(encoded.trim()).map_err(|_| {
             AppError::Config("本地密钥库的主密钥格式不正确，已导入的私钥无法解密".into())
         })?;
@@ -571,7 +571,7 @@ fn master_key() -> Result<Zeroizing<[u8; 32]>, AppError> {
     let generated = Aes256Gcm::generate_key(OsRng);
     let mut key = [0u8; 32];
     key.copy_from_slice(&generated);
-    keychain::save_password(MASTER_KEY_ACCOUNT, &B64.encode(key))?;
+    keychain::set(&SecretSlot::KeyStoreMaster, &B64.encode(key))?;
     Ok(Zeroizing::new(key))
 }
 
