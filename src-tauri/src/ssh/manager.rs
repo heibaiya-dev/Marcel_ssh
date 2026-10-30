@@ -338,6 +338,7 @@ impl SshManager {
             port,
             username: username.clone(),
             connection_id,
+            headless,
             generation,
             cmd_tx,
             handle: shared_handle.clone(),
@@ -712,9 +713,19 @@ impl SshManager {
         self.connections.read().await.contains_key(session_id)
     }
 
-    /// List active session IDs.
+    /// List active session IDs（用户可见的会话）。
+    ///
+    /// **不含无头会话**（MCP 无头连接、跨设备同步的 SFTP 连接）：这个列表是前端与插件 API
+    /// 回答「现在开着哪些终端」用的，后台连接不该混进去。要看全部连接用 `get_connection`
+    /// 按 id 查，或 `sessions_for_connection`。
     pub async fn list_sessions(&self) -> Vec<String> {
-        self.connections.read().await.keys().cloned().collect()
+        self.connections
+            .read()
+            .await
+            .iter()
+            .filter(|(_, c)| !c.headless)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Get the connection_id associated with a session, if available.
@@ -1120,6 +1131,11 @@ impl SshManager {
     /// 的真实 russh 连接，让需要"会话在册"的上层流程（比如主任务的"出生即孤儿"
     /// 检查）不依赖网络也能跑通。连接上不开任何通道，也不会真的执行命令。
     pub(crate) async fn register_loopback_session(&self, session_id: &str) {
+        self.register_loopback_session_as(session_id, false).await;
+    }
+
+    /// 同 [`Self::register_loopback_session`]，可指定是否登记成无头会话。
+    pub(crate) async fn register_loopback_session_as(&self, session_id: &str, headless: bool) {
         struct MinimalSshd;
         impl russh::server::Handler for MinimalSshd {
             type Error = russh::Error;
@@ -1168,6 +1184,7 @@ impl SshManager {
                 port: 22,
                 username: "tester".into(),
                 connection_id: None,
+                headless,
                 generation: 1,
                 cmd_tx,
                 handle: Arc::new(TokioMutex::new(handle)),
@@ -1286,6 +1303,7 @@ impl SshManager {
                 port: 22,
                 username: "tester".into(),
                 connection_id: None,
+                headless: true,
                 generation: 1,
                 cmd_tx,
                 handle: Arc::new(TokioMutex::new(handle)),
@@ -1472,6 +1490,7 @@ mod shared_sftp_tests {
                 port: 22,
                 username: "tester".into(),
                 connection_id: None,
+                headless: false,
                 generation: 1,
                 cmd_tx,
                 handle: Arc::new(TokioMutex::new(handle)),
@@ -1479,6 +1498,20 @@ mod shared_sftp_tests {
                 sftp_meta: SharedSlot::new(),
             }),
         );
+    }
+
+    /// 对外的会话列表（前端 / 插件 API 用）不含无头会话：跨设备同步的 SFTP 连接、MCP 无头连接
+    /// 都是后台连接，混进「现在开着哪些终端」只会误导插件的 `session.active`。
+    /// 无头会话本身仍然在册，按 id 取连接照常可用（同步的 SFTP 读写靠它）。
+    #[tokio::test]
+    async fn list_sessions_hides_headless_sessions_but_keeps_them_registered() {
+        let manager = SshManager::with_known_hosts(KnownHostsStore::in_memory());
+        manager.register_loopback_session_as("term", false).await;
+        manager.register_loopback_session_as("bg", true).await;
+
+        assert_eq!(manager.list_sessions().await, vec!["term".to_string()]);
+        assert!(manager.is_connected("bg").await, "无头会话仍然在册");
+        assert!(manager.get_connection("bg").await.is_some());
     }
 
     async fn list_root(

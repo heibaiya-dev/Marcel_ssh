@@ -153,6 +153,26 @@ pub enum SecretSlot {
     /// **设备绑定**：它只在生成它的这台设备上有效，密文换设备解不开，所以是 `Local`，
     /// 以后的机密同步绝不能把它导出去（导过去也没用，反而多一份泄露面）。
     KeyStoreMaster,
+    /// 跨设备同步的数据密钥 DK（账号 `sync2_data_key`，32 字节的 base64）。
+    ///
+    /// 加密所有同步文件的密钥。**设备本机保存，不进任何同步**：它由恢复密钥在每台新设备上
+    /// 重新解出，没有必要、也不应该再多一条泄露途径。
+    SyncDataKey,
+    /// 跨设备同步的恢复密钥（账号 `sync2_recovery_key`，32 位规范形式）。
+    ///
+    /// 存在本机是为了让用户随时能在「同步」页重新查看它、并给新设备生成同步码。
+    SyncRecoveryKey,
+    /// 同步存储的密码（账号 `sync2_storage_password`）：WebDAV 的应用密码。SFTP 存储复用那台
+    /// 服务器连接自己的密码，不用这个槽位。
+    SyncStoragePassword,
+    /// 旧版同步遗留（账号 `sync_key`）：启动时清理，不再读取。
+    LegacySyncKey,
+    /// 旧版同步遗留（账号 `sync_device_api_key`）：启动时清理，不再读取。
+    LegacySyncDeviceApiKey,
+    /// 旧版同步遗留（账号 `sync_device_id`）：启动时清理，不再读取。
+    LegacySyncDeviceId,
+    /// 旧版同步遗留（账号 `sync_server_url`）：启动时清理，不再读取。
+    LegacySyncServerUrl,
 }
 
 impl SecretSlot {
@@ -172,6 +192,13 @@ impl SecretSlot {
             SecretSlot::JumpPassword(id) => Cow::Owned(format!("jump:{}", id)),
             SecretSlot::JumpKeyPassphrase(id) => Cow::Owned(format!("jump:pk:{}", id)),
             SecretSlot::KeyStoreMaster => Cow::Borrowed("keys:master"),
+            SecretSlot::SyncDataKey => Cow::Borrowed("sync2_data_key"),
+            SecretSlot::SyncRecoveryKey => Cow::Borrowed("sync2_recovery_key"),
+            SecretSlot::SyncStoragePassword => Cow::Borrowed("sync2_storage_password"),
+            SecretSlot::LegacySyncKey => Cow::Borrowed("sync_key"),
+            SecretSlot::LegacySyncDeviceApiKey => Cow::Borrowed("sync_device_api_key"),
+            SecretSlot::LegacySyncDeviceId => Cow::Borrowed("sync_device_id"),
+            SecretSlot::LegacySyncServerUrl => Cow::Borrowed("sync_server_url"),
         }
     }
 
@@ -191,7 +218,15 @@ impl SecretSlot {
             | SecretSlot::SshKeyPassphrase(_)
             | SecretSlot::JumpPassword(_)
             | SecretSlot::JumpKeyPassphrase(_) => SyncTier::Secret,
-            SecretSlot::KeyStoreMaster => SyncTier::Local,
+            // 同步自己的密钥与旧版遗留：都只对这台设备有意义，绝不进机密同步。
+            SecretSlot::KeyStoreMaster
+            | SecretSlot::SyncDataKey
+            | SecretSlot::SyncRecoveryKey
+            | SecretSlot::SyncStoragePassword
+            | SecretSlot::LegacySyncKey
+            | SecretSlot::LegacySyncDeviceApiKey
+            | SecretSlot::LegacySyncDeviceId
+            | SecretSlot::LegacySyncServerUrl => SyncTier::Local,
         }
     }
 
@@ -212,6 +247,13 @@ impl SecretSlot {
             SecretSlot::JumpPassword(_) => "跳板机密码",
             SecretSlot::JumpKeyPassphrase(_) => "跳板机私钥口令",
             SecretSlot::KeyStoreMaster => "私钥库主密钥",
+            SecretSlot::SyncDataKey => "同步数据密钥",
+            SecretSlot::SyncRecoveryKey => "同步恢复密钥",
+            SecretSlot::SyncStoragePassword => "同步存储密码",
+            SecretSlot::LegacySyncKey => "旧版同步密钥",
+            SecretSlot::LegacySyncDeviceApiKey => "旧版同步设备密钥",
+            SecretSlot::LegacySyncDeviceId => "旧版同步设备标识",
+            SecretSlot::LegacySyncServerUrl => "旧版同步服务器地址",
         }
     }
 
@@ -243,6 +285,32 @@ impl SecretSlot {
             SecretSlot::TavilyFetchApiKey,
             SecretSlot::JevApiKey,
             SecretSlot::KeyStoreMaster,
+            SecretSlot::SyncDataKey,
+            SecretSlot::SyncRecoveryKey,
+            SecretSlot::SyncStoragePassword,
+            SecretSlot::LegacySyncKey,
+            SecretSlot::LegacySyncDeviceApiKey,
+            SecretSlot::LegacySyncDeviceId,
+            SecretSlot::LegacySyncServerUrl,
+        ]
+    }
+
+    /// 当前版本同步功能自己用的槽位（停止同步时整体清掉）。
+    pub fn sync_slots() -> [SecretSlot; 3] {
+        [
+            SecretSlot::SyncDataKey,
+            SecretSlot::SyncRecoveryKey,
+            SecretSlot::SyncStoragePassword,
+        ]
+    }
+
+    /// 旧版同步遗留的槽位：启动时清理（见 `sync::init` 的残留清理），之后再没有读者。
+    pub fn legacy_sync_slots() -> [SecretSlot; 4] {
+        [
+            SecretSlot::LegacySyncKey,
+            SecretSlot::LegacySyncDeviceApiKey,
+            SecretSlot::LegacySyncDeviceId,
+            SecretSlot::LegacySyncServerUrl,
         ]
     }
 }
@@ -359,6 +427,13 @@ mod tests {
             (SecretSlot::JumpPassword("c1".into()), "jump:c1"),
             (SecretSlot::JumpKeyPassphrase("c1".into()), "jump:pk:c1"),
             (SecretSlot::KeyStoreMaster, "keys:master"),
+            (SecretSlot::SyncDataKey, "sync2_data_key"),
+            (SecretSlot::SyncRecoveryKey, "sync2_recovery_key"),
+            (SecretSlot::SyncStoragePassword, "sync2_storage_password"),
+            (SecretSlot::LegacySyncKey, "sync_key"),
+            (SecretSlot::LegacySyncDeviceApiKey, "sync_device_api_key"),
+            (SecretSlot::LegacySyncDeviceId, "sync_device_id"),
+            (SecretSlot::LegacySyncServerUrl, "sync_server_url"),
         ];
         for (slot, expected) in &snapshot {
             assert_eq!(slot.account(), *expected, "槽位 {:?} 的账号名变了", slot);
@@ -432,11 +507,44 @@ mod tests {
     #[test]
     fn every_other_slot_is_secret_tier() {
         for slot in all_samples() {
-            if slot == SecretSlot::KeyStoreMaster {
-                continue;
+            let local = matches!(
+                slot,
+                SecretSlot::KeyStoreMaster
+                    | SecretSlot::SyncDataKey
+                    | SecretSlot::SyncRecoveryKey
+                    | SecretSlot::SyncStoragePassword
+                    | SecretSlot::LegacySyncKey
+                    | SecretSlot::LegacySyncDeviceApiKey
+                    | SecretSlot::LegacySyncDeviceId
+                    | SecretSlot::LegacySyncServerUrl
+            );
+            if local {
+                assert_eq!(slot.tier(), SyncTier::Local, "{:?} 应为 Local 档", slot);
+            } else {
+                assert_eq!(slot.tier(), SyncTier::Secret, "{:?} 应为 Secret 档", slot);
             }
-            assert_eq!(slot.tier(), SyncTier::Secret, "{:?} 应为 Secret 档", slot);
         }
+    }
+
+    /// 同步自己的 / 旧版遗留的槽位清单与账号名（旧版账号名是历史遗留，清理时必须逐字对上）。
+    #[test]
+    fn sync_slot_groups_list_the_right_accounts() {
+        let accounts = |slots: &[SecretSlot]| -> Vec<String> {
+            slots.iter().map(|s| s.account().into_owned()).collect()
+        };
+        assert_eq!(
+            accounts(&SecretSlot::sync_slots()),
+            ["sync2_data_key", "sync2_recovery_key", "sync2_storage_password"]
+        );
+        assert_eq!(
+            accounts(&SecretSlot::legacy_sync_slots()),
+            [
+                "sync_key",
+                "sync_device_api_key",
+                "sync_device_id",
+                "sync_server_url"
+            ]
+        );
     }
 
     #[test]
@@ -463,7 +571,14 @@ mod tests {
                 | SecretSlot::CustomFetchApiKey
                 | SecretSlot::TavilyFetchApiKey
                 | SecretSlot::JevApiKey
-                | SecretSlot::KeyStoreMaster => true,
+                | SecretSlot::KeyStoreMaster
+                | SecretSlot::SyncDataKey
+                | SecretSlot::SyncRecoveryKey
+                | SecretSlot::SyncStoragePassword
+                | SecretSlot::LegacySyncKey
+                | SecretSlot::LegacySyncDeviceApiKey
+                | SecretSlot::LegacySyncDeviceId
+                | SecretSlot::LegacySyncServerUrl => true,
                 SecretSlot::LlmChannel(_)
                 | SecretSlot::SshPassword(_)
                 | SecretSlot::SshKeyPassphrase(_)

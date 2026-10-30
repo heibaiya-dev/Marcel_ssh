@@ -91,6 +91,7 @@ fn registry_snapshot_pins_paths_and_tiers() {
         (Previews, "marcel-previews", Dir, Local, BaseDir::AppData),
         (SysopenTemp, "marcel-sysopen", Dir, Local, BaseDir::AppData),
         (UpdateCache, "update", Dir, Local, BaseDir::AppCache),
+        (SyncState, "sync", Dir, Local, BaseDir::Config),
     ];
     assert_eq!(
         table.len(),
@@ -118,6 +119,38 @@ fn path_joins_onto_the_given_base() {
         DataSourceId::JobLedger.path(&local),
         Path::new("base").join("local_command").join("jobs.json")
     );
+}
+
+/// 同步源 key 是写进远端文件的字符串，改一个字等于和所有旧设备「断交」：钉死。
+/// 并且只有普通配置档有 key（其余档不在一期同步范围里）。
+#[test]
+fn sync_keys_are_pinned_and_only_config_tier_has_one() {
+    let expected: &[(DataSourceId, &str)] = &[
+        (DataSourceId::Settings, "settings"),
+        (DataSourceId::Connections, "connections"),
+        (DataSourceId::QuickCommands, "quickCommands"),
+        (DataSourceId::Skills, "skills"),
+        (DataSourceId::McpServers, "mcpServers"),
+        (DataSourceId::KnownHosts, "knownHosts"),
+    ];
+    for (id, key) in expected {
+        assert_eq!(id.sync_key(), Some(*key), "{id:?} 的同步源 key 变了");
+    }
+    let mut seen = HashSet::new();
+    for id in DataSourceId::ALL {
+        match id.sync_key() {
+            Some(key) => {
+                assert_eq!(id.tier(), SyncTier::Config, "{id:?} 有同步源 key 却不是 Config 档");
+                assert!(seen.insert(key), "同步源 key 重复: {key}");
+            }
+            None => assert_ne!(
+                id.tier(),
+                SyncTier::Config,
+                "{id:?} 是 Config 档却没有同步源 key（会被同步引擎漏掉）"
+            ),
+        }
+    }
+    assert_eq!(seen.len(), expected.len());
 }
 
 /// 5 份 JSON 配置的 `SOURCE` 必须指向各自的登记项，且都是 Config 档。

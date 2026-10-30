@@ -17,6 +17,7 @@
 
 pub mod bus;
 pub mod json_store;
+pub mod legacy;
 
 #[cfg(test)]
 mod tests;
@@ -122,6 +123,8 @@ data_sources! {
     SysopenTemp,
     /// `update/`：更新安装包下载缓存。
     UpdateCache,
+    /// `sync/`：跨设备同步的本机状态（设备 id、游标、镜像、基线、待上传队列、同步记录）。
+    SyncState,
 }
 
 impl DataSourceId {
@@ -252,6 +255,15 @@ impl DataSourceId {
                 kind: Dir,
                 describe: "应用更新安装包的下载缓存",
             },
+            // 同步引擎自己的账本：设备 id、对每台设备读到哪、镜像与基线都只对这台设备有意义，
+            // 搬到别的设备上反而会让对方以为「这些我都读过了」，所以绝不同步。
+            DataSourceId::SyncState => SourceSpec {
+                tier: Local,
+                base: BaseDir::Config,
+                rel_path: "sync",
+                kind: Dir,
+                describe: "跨设备同步的本机状态（设备标识、读取进度、镜像、待上传队列、同步记录）",
+            },
         }
     }
 
@@ -278,6 +290,33 @@ impl DataSourceId {
     /// 中文一句话说明（给设置页 / 同步页 / 日志用）。
     pub const fn describe(self) -> &'static str {
         self.spec().describe
+    }
+
+    /// 跨设备同步里这份数据的**同步源 key**（写进远端文件的字符串，**跨版本稳定，不能改**）。
+    ///
+    /// 只有普通配置档（[`SyncTier::Config`]）有 key，其余档返回 `None`——对话与记忆、机密、
+    /// 本机专属数据不在一期同步范围内。`match` 不写 `_ =>`：新增登记项必须表态。
+    pub const fn sync_key(self) -> Option<&'static str> {
+        match self {
+            DataSourceId::Settings => Some("settings"),
+            DataSourceId::Connections => Some("connections"),
+            DataSourceId::QuickCommands => Some("quickCommands"),
+            DataSourceId::Skills => Some("skills"),
+            DataSourceId::McpServers => Some("mcpServers"),
+            DataSourceId::KnownHosts => Some("knownHosts"),
+            DataSourceId::KeyStore
+            | DataSourceId::Conversations
+            | DataSourceId::Images
+            | DataSourceId::Memory
+            | DataSourceId::JobLedger
+            | DataSourceId::JobsTemp
+            | DataSourceId::LocalCommand
+            | DataSourceId::Plugins
+            | DataSourceId::Previews
+            | DataSourceId::SysopenTemp
+            | DataSourceId::UpdateCache
+            | DataSourceId::SyncState => None,
+        }
     }
 
     /// 取这份数据的磁盘路径。

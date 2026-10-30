@@ -1123,12 +1123,28 @@ impl JsonPersistable for AppSettings {
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
-        let mut parsed: Self = serde_json::from_str(&raw)
+        Self::parse_with_migrations(&raw)
+    }
+}
+
+impl AppSettings {
+    /// 原始 JSON 文本 → 设置，并补上依赖原文的几项迁移（`updateMode` / `toolApprovalLevels` /
+    /// `commandList`：要区分「键缺失」与「显式写了默认值」，所以要看原文）。
+    ///
+    /// **读配置文件与跨设备同步落地共用这一个入口**——同步落地出来的 JSON 也要走完全一样的
+    /// 迁移，否则「从文件读」和「从云端合并」会得到不同的设置。
+    pub fn parse_with_migrations(raw: &str) -> Result<Self, crate::error::AppError> {
+        let mut parsed: Self = serde_json::from_str(raw)
             .map_err(|e| crate::error::AppError::Config(format!("解析配置文件失败: {}", e)))?;
-        parsed.migrate_update_mode_from_legacy(&raw);
-        parsed.migrate_tool_approval_from_legacy(&raw);
-        parsed.migrate_command_list_from_legacy(&raw);
+        parsed.migrate_update_mode_from_legacy(raw);
+        parsed.migrate_tool_approval_from_legacy(raw);
+        parsed.migrate_command_list_from_legacy(raw);
         Ok(parsed)
+    }
+
+    /// [`Self::parse_with_migrations`] 的 JSON 值版本（同步落地用）。
+    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, crate::error::AppError> {
+        Self::parse_with_migrations(&value.to_string())
     }
 }
 

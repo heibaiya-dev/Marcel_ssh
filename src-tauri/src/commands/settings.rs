@@ -113,31 +113,23 @@ pub async fn config_get_settings(state: State<'_, AppState>) -> Result<SettingsR
     })
 }
 
-/// Save updated application settings. Persists to disk.
+/// 设置落盘前的「迁移 / 去重 / 归一化 / 校验」，**保存命令与跨设备同步落地共用**。
 ///
-/// 多渠道模型服务：
-/// - 各渠道 API Key 独立存入系统密钥链（account = `llm_channel_{id}`），
-///   `ChannelConfig.api_key` 不落盘（`skip_serializing`）；
-/// - 前端回传掩码/空值时保留旧内存 key；
-/// - 被删除渠道的密钥从 keychain 清理，避免孤儿条目。
-#[tauri::command]
-pub async fn config_save_settings(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    settings: AppSettings,
-) -> Result<(), AppError> {
+/// 顺序与效果就是原来 `config_save_settings` 里那一串，一字不改地搬了出来：
+/// - 旧单配置 `llmConfig` 的兜底迁移（前端理论上不会再带旧字段，防御旧端 / 历史数据）；
+/// - 更新方式三态：`autoUpdate` 只是旧版本客户端读的兼容镜像，真值以 `updateMode` 为准；
+/// - 去重同 id 重复模型 / 归一化思考强度档位 / 子 agent 候选清单（自愈兜底）；
+/// - 校验多渠道配置（渠道重试参数、引用完整性与模型 ID 唯一性）。
+///
+/// 校验失败返回 `Err`，候选值不应被提交。
+pub fn normalize_settings_for_save(candidate: &mut AppSettings) -> Result<(), AppError> {
     // 兜底迁移（理论上前端不会再带旧字段，防御旧端/历史数据）
-    let mut candidate = settings;
-    migrate_legacy_settings(&mut candidate);
+    migrate_legacy_settings(candidate);
 
     // 更新方式三态（auto / notify / off）：`autoUpdate` 只是给旧版本客户端读的
     // 兼容镜像，真值以 `updateMode` 为准，保存前统一派生，避免落盘出现
     // 「模式说关闭、镜像说开着」的矛盾配置。
     candidate.sync_update_mode_mirror();
-    let (previous_update_mode, previous_disabled_plugins) = {
-        let store = state.settings.read().await;
-        (store.update_mode, store.disabled_plugins.clone())
-    };
 
     // 自愈兜底：去重同 id 重复模型（历史「保存渠道」合并 bug 可能仍让前端
     // 内存里带重复条目；先去重再校验，避免合法保存被重复数据拦住）
@@ -158,7 +150,30 @@ pub async fn config_save_settings(
     }
 
     // 校验多渠道配置（含渠道重试参数、引用完整性与模型 ID 唯一性）
-    candidate.llm_registry.validate()?;
+    candidate.llm_registry.validate()
+}
+
+/// Save updated application settings. Persists to disk.
+///
+/// 多渠道模型服务：
+/// - 各渠道 API Key 独立存入系统密钥链（account = `llm_channel_{id}`），
+///   `ChannelConfig.api_key` 不落盘（`skip_serializing`）；
+/// - 前端回传掩码/空值时保留旧内存 key；
+/// - 被删除渠道的密钥从 keychain 清理，避免孤儿条目。
+#[tauri::command]
+pub async fn config_save_settings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<(), AppError> {
+    // 去重 / 归一化 / 校验：与跨设备同步落地共用同一个函数（`normalize_settings_for_save`），
+    // 「保存」和「同步来的」两条路径得到的设置满足同样的不变量。
+    let mut candidate = settings;
+    normalize_settings_for_save(&mut candidate)?;
+    let (previous_update_mode, previous_disabled_plugins) = {
+        let store = state.settings.read().await;
+        (store.update_mode, store.disabled_plugins.clone())
+    };
 
     // 密钥链写入：每个渠道独立。掩码/空值 = 保留旧 key（不写）。
     {

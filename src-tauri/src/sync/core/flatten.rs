@@ -85,7 +85,10 @@ pub fn flatten_scoped(
 }
 
 /// 用**给定登记表**（不再学习）展开。`diff` 要用「基线当时的登记表」展开基线，所以单独暴露。
-pub(super) fn flatten_with(
+///
+/// `rules = None` = 不过滤任何作用域：新字段守护快照（`sync::scope_guard`）靠它把 Local 叶子也
+/// 展开出来，否则快照里只剩 Shared，作用域改错了也看不出来。
+pub(crate) fn flatten_with(
     doc: &Value,
     idmaps: &IdMapRegistry,
     rules: Option<&ScopeRules>,

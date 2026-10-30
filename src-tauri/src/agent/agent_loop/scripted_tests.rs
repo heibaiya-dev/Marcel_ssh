@@ -330,30 +330,51 @@ fn isolated_state_with(
         dir.join("local"),
         CommandExecutionManager::LOCAL_JOB_ID_PREFIX,
     );
+    let ssh_manager = SshManager::with_known_hosts(KnownHostsStore::in_memory());
+    let connection_store =
+        JsonStore::new(dir, crate::config::connections::ConnectionStore::new(), None);
+    let settings_store = JsonStore::new(dir, settings, None);
+    let quick_command_store = JsonStore::new(
+        dir,
+        crate::config::quick_commands::QuickCommandStore::new(),
+        None,
+    );
+    let skill_store = JsonStore::new(dir, crate::skills::store::SkillStore::new(), None);
+    let mcp_store = JsonStore::new(dir, crate::mcp::store::McpServerStore::new(), None);
+    let mcp_manager = Arc::new(crate::mcp::manager::McpManager::new());
+    let data_changes = DataChangeBus::new();
+    // 跨设备同步 manager：测试里从不 `start`，只是 AppState 的必填字段。
+    let sync = crate::sync::SyncManager::new(crate::sync::SyncWiring {
+        config_dir: dir.to_path_buf(),
+        stores: crate::sync::sources::SourceStores {
+            settings: settings_store.clone(),
+            connections: connection_store.clone(),
+            quick_commands: quick_command_store.clone(),
+            skills: skill_store.clone(),
+            mcp_servers: mcp_store.clone(),
+            known_hosts: KnownHostsStore::in_memory(),
+            mcp_manager: mcp_manager.clone(),
+        },
+        ssh_manager: ssh_manager.clone(),
+        data_changes: data_changes.clone(),
+        load_failures: Vec::new(),
+    });
     AppState {
-        ssh_manager: SshManager::with_known_hosts(KnownHostsStore::in_memory()),
+        ssh_manager,
         agent_tasks: Default::default(),
         plans: Default::default(),
         session_models: Default::default(),
         session_efforts: Default::default(),
-        connection_store: JsonStore::new(
-            dir,
-            crate::config::connections::ConnectionStore::new(),
-            None,
-        ),
-        settings: JsonStore::new(dir, settings, None),
-        quick_command_store: JsonStore::new(
-            dir,
-            crate::config::quick_commands::QuickCommandStore::new(),
-            None,
-        ),
+        connection_store,
+        settings: settings_store,
+        quick_command_store,
         conversation_db: Arc::new(
             ConversationDb::new(DataSourceId::Conversations.path(dir)).expect("temporary SQLite"),
         ),
-        skill_store: JsonStore::new(dir, crate::skills::store::SkillStore::new(), None),
-        mcp_store: JsonStore::new(dir, crate::mcp::store::McpServerStore::new(), None),
-        data_changes: DataChangeBus::new(),
-        mcp_manager: Arc::new(crate::mcp::manager::McpManager::new()),
+        skill_store,
+        mcp_store,
+        data_changes,
+        mcp_manager,
         config_dir: dir.to_path_buf(),
         agent_interaction: AgentInteractionManager::new(),
         task_cancel: Default::default(),
@@ -374,6 +395,7 @@ fn isolated_state_with(
         memory: Arc::new(crate::memory::MemoryManager::with_store(
             crate::memory::MemoryStore::in_memory(),
         )),
+        sync,
     }
 }
 

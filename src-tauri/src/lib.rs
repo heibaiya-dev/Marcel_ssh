@@ -210,6 +210,9 @@ pub struct AppState {
     pub agent_transfer_by_task: crate::child_resources::ChildResources,
     /// 长期记忆（`memory/` 模块）：记忆库、注入快照、后台复盘调度、整理助手。
     pub memory: std::sync::Arc<crate::memory::MemoryManager>,
+    /// 跨设备同步（`sync/` 模块）的 manager：actor + 定时器 + 命令。`setup` 里 `start`；
+    /// 没开启同步时只做「旧版残留清理」并空转等命令。
+    pub sync: crate::sync::SyncManager,
 }
 
 impl AppState {
@@ -241,6 +244,9 @@ impl AppState {
 
         // Captured during phase-2 fallbacks; surfaced via AppState.settings_warning.
         let mut settings_warning: Option<String> = None;
+        // 加载失败、被迫改用默认值的配置：跨设备同步据此改从镜像恢复，而不是把
+        // 「全变成默认值」当成用户的删除推给其它设备。
+        let mut load_failures: Vec<DataSourceId> = Vec::new();
 
         // ── Phase 1: parallel loads (all independent) ──────────────────────
         let (
@@ -329,10 +335,14 @@ impl AppState {
             Ok(Ok(store)) => store,
             Ok(Err(e)) => {
                 log::warn!("无法加载连接配置，使用默认值：{}", e);
+                // 先隔离原文件：开着同步时会从镜像恢复并覆盖它
+                backup_config_on_load_failure(&ConnectionStore::default_file(&config_dir));
+                load_failures.push(DataSourceId::Connections);
                 ConnectionStore::new()
             }
             Err(join_err) => {
                 log::warn!("连接配置加载任务失败：{}", join_err);
+                load_failures.push(DataSourceId::Connections);
                 ConnectionStore::new()
             }
         };
@@ -353,6 +363,7 @@ impl AppState {
                     None => format!("配置文件加载失败: {}。当前使用默认设置。", e),
                 };
                 append_load_warning(&mut settings_warning, msg);
+                load_failures.push(DataSourceId::Settings);
                 AppSettings::default()
             }
             Err(join_err) => {
@@ -361,6 +372,7 @@ impl AppState {
                     &mut settings_warning,
                     format!("应用设置加载任务失败: {}。当前使用默认设置。", join_err),
                 );
+                load_failures.push(DataSourceId::Settings);
                 AppSettings::default()
             }
         };
@@ -494,6 +506,7 @@ impl AppState {
                     None => format!("技能配置加载失败: {}。本次未加载任何技能。", e),
                 };
                 append_load_warning(&mut settings_warning, msg);
+                load_failures.push(DataSourceId::Skills);
                 (SkillStore::new(), true)
             }
             Err(join_err) => {
@@ -504,6 +517,7 @@ impl AppState {
                     &mut settings_warning,
                     format!("技能配置加载任务失败: {}。本次未加载任何技能。", join_err),
                 );
+                load_failures.push(DataSourceId::Skills);
                 (SkillStore::new(), true)
             }
         };
@@ -546,10 +560,13 @@ impl AppState {
             Ok(Ok(store)) => store,
             Ok(Err(e)) => {
                 log::warn!("Failed to load quick commands, using defaults: {}", e);
+                backup_config_on_load_failure(&QuickCommandStore::default_file(&config_dir));
+                load_failures.push(DataSourceId::QuickCommands);
                 QuickCommandStore::new()
             }
             Err(join_err) => {
                 log::warn!("Quick commands 加载任务失败：{}", join_err);
+                load_failures.push(DataSourceId::QuickCommands);
                 QuickCommandStore::new()
             }
         };
@@ -558,10 +575,13 @@ impl AppState {
             Ok(Ok(store)) => store,
             Ok(Err(e)) => {
                 log::warn!("Failed to load MCP servers, using defaults: {}", e);
+                backup_config_on_load_failure(&McpServerStore::default_file(&config_dir));
+                load_failures.push(DataSourceId::McpServers);
                 McpServerStore::new()
             }
             Err(join_err) => {
                 log::warn!("MCP servers 加载任务失败：{}", join_err);
+                load_failures.push(DataSourceId::McpServers);
                 McpServerStore::new()
             }
         };
@@ -597,6 +617,11 @@ impl AppState {
         // 必须在 SshManager 构造后立即创建并共享同一句柄）。后台作业
         // 的输出溢出文件放在配置目录下，随体系统一管理；作业台账
         // （job 序号水位）与其余配置同目录，保证 job_id 跨运行单调。
+        // 跨设备同步要和 GUI 共用同一份 known_hosts（指纹校验是安全边界）。
+        if known_hosts.recovered_from_corruption() {
+            load_failures.push(DataSourceId::KnownHosts);
+        }
+        let known_hosts_for_sync = known_hosts.clone();
         let ssh_manager = SshManager::with_known_hosts(known_hosts);
         let command_exec = crate::command_exec::CommandExecutionManager::new(
             ssh_manager.clone(),
@@ -622,6 +647,23 @@ impl AppState {
                 DataSourceId::LocalCommand.path(&config_dir),
                 crate::command_exec::CommandExecutionManager::LOCAL_JOB_ID_PREFIX,
             );
+
+        // 跨设备同步 manager：只构造、不起任务（`setup` 里 `start`）。
+        let sync = crate::sync::SyncManager::new(crate::sync::SyncWiring {
+            config_dir: config_dir.clone(),
+            stores: crate::sync::sources::SourceStores {
+                settings: settings_arc.clone(),
+                connections: connection_store_arc.clone(),
+                quick_commands: quick_command_store_arc.clone(),
+                skills: skill_store_arc.clone(),
+                mcp_servers: mcp_store_arc.clone(),
+                known_hosts: known_hosts_for_sync,
+                mcp_manager: mcp_manager.clone(),
+            },
+            ssh_manager: ssh_manager.clone(),
+            data_changes: data_changes.clone(),
+            load_failures,
+        });
 
         let state = Self {
             ssh_manager,
@@ -655,6 +697,7 @@ impl AppState {
             agent_transfer_mutex: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             agent_transfer_by_task: crate::child_resources::ChildResources::new(),
             memory,
+            sync,
         };
 
         // 「作业活得比回合久」的资源回收钩子（见
@@ -1015,6 +1058,10 @@ pub fn run() {
             // 全平台启动；退出时静默安装只在 Windows 有意义（见下方 RunEvent::Exit）。
             crate::updater::init(app.handle());
 
+            // 跨设备同步：清理旧版同步残留，起 actor。首轮同步要等前端订阅好事件后
+            // 第一次调用 `sync_now`（或 15 秒兜底），启动期不做任何落地。
+            app.state::<AppState>().sync.start(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1223,6 +1270,21 @@ pub fn run() {
             commands::plugin_fs::plugin_fs_write,
             commands::plugin_http::plugin_http_request,
             commands::plugin_notification::plugin_send_notification,
+            // 跨设备同步
+            commands::sync::sync_get_status,
+            commands::sync::sync_test_storage,
+            commands::sync::sync_create,
+            commands::sync::sync_join,
+            commands::sync::sync_join_manual,
+            commands::sync::sync_now,
+            commands::sync::sync_get_sync_code,
+            commands::sync::sync_get_recovery_key,
+            commands::sync::sync_set_device_name,
+            commands::sync::sync_list_devices,
+            commands::sync::sync_list_history,
+            commands::sync::sync_undo,
+            commands::sync::sync_confirm_held,
+            commands::sync::sync_disable,
         ])
         .build(tauri::generate_context!())
         .expect("Fatal: failed to start Tauri application")
