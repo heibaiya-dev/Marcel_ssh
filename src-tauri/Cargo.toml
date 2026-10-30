@@ -67,6 +67,9 @@ aes-gcm = "0.10"
 # 以及远端文件密文信封里的 deflate 压缩。两者都是纯 Rust，Android 交叉编译无额外原生依赖。
 hkdf = "0.12"
 flate2 = "1"
+# 跨设备同步的 WebDAV 适配器（sync/storage/webdav.rs）解析 PROPFIND 返回的 multistatus XML。
+# 选 0.37：Cargo.lock 里本来就有它（tauri 依赖链），不会多编一份。
+quick-xml = "0.37"
 
 
 

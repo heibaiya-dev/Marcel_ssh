@@ -7,5 +7,7 @@
 //! - [`core`]：核心库（纯逻辑，没有网络 / 文件 IO）——混合时钟、JSON ↔ 叶子的扁平化、
 //!   镜像（按叶子的 LWW 合并）、本机改动捕获 `diff`、远端改动落地 `apply_to_doc`、
 //!   作用域规则、加密与远端文件格式。整个同步的正确性地基，宁可多写测试。
+//! - [`storage`]：存储适配器（WebDAV / SFTP / 内存测试替身），统一成 [`storage::SyncStorage`]。
 
 pub mod core;
+pub mod storage;

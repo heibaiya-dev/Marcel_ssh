@@ -1176,6 +1176,124 @@ impl SshManager {
             }),
         );
     }
+
+    /// 测试专用：登记一条**带 SFTP 子系统**的回环会话，每开一条 SFTP 通道就用 `make_fs()` 造一个
+    /// 服务端文件系统处理器。跨设备同步的 SFTP 存储适配器用它对着一个内存文件系统跑端到端测试。
+    ///
+    /// `closers` 收集每条 SFTP 通道的关闭手柄：测试调 `handle.close(channel_id)` 就能模拟「对端把
+    /// 通道关了」（连接本身还在册、但已不可用）。
+    pub(crate) async fn register_loopback_sftp_session<H, F>(
+        &self,
+        session_id: &str,
+        make_fs: F,
+        closers: Arc<std::sync::Mutex<Vec<(russh::server::Handle, russh::ChannelId)>>>,
+    ) where
+        H: russh_sftp::server::Handler + Send + 'static,
+        F: Fn() -> H + Send + Sync + 'static,
+    {
+        use russh::server::{Auth, Msg, Session as ServerSession};
+        use russh::{Channel, ChannelId};
+
+        struct Peer<H, F> {
+            make_fs: Arc<F>,
+            pending: HashMap<ChannelId, Channel<Msg>>,
+            closers: Arc<std::sync::Mutex<Vec<(russh::server::Handle, ChannelId)>>>,
+            _handler: std::marker::PhantomData<fn() -> H>,
+        }
+
+        impl<H, F> russh::server::Handler for Peer<H, F>
+        where
+            H: russh_sftp::server::Handler + Send + 'static,
+            F: Fn() -> H + Send + Sync + 'static,
+        {
+            type Error = russh::Error;
+
+            async fn auth_none(&mut self, _: &str) -> Result<Auth, Self::Error> {
+                Ok(Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self,
+                channel: Channel<Msg>,
+                _: &mut ServerSession,
+            ) -> Result<bool, Self::Error> {
+                self.pending.insert(channel.id(), channel);
+                Ok(true)
+            }
+
+            async fn subsystem_request(
+                &mut self,
+                channel_id: ChannelId,
+                name: &str,
+                session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                let Some(channel) = self.pending.remove(&channel_id).filter(|_| name == "sftp")
+                else {
+                    session.channel_failure(channel_id)?;
+                    return Ok(());
+                };
+                session.channel_success(channel_id)?;
+                self.closers
+                    .lock()
+                    .unwrap()
+                    .push((session.handle(), channel_id));
+                russh_sftp::server::run(channel.into_stream(), (self.make_fs)()).await;
+                Ok(())
+            }
+        }
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let key = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[13; 32]);
+        let config = russh::server::Config {
+            keys: vec![key.into()],
+            ..Default::default()
+        };
+        let peer = Peer {
+            make_fs: Arc::new(make_fs),
+            pending: HashMap::new(),
+            closers,
+            _handler: std::marker::PhantomData,
+        };
+        tokio::spawn(async move {
+            if let Ok(session) = russh::server::run_stream(Arc::new(config), server_io, peer).await
+            {
+                let _ = session.await;
+            }
+        });
+        let client = Client {
+            host: "127.0.0.1".into(),
+            port: 22,
+            store: KnownHostsStore::in_memory(),
+            trust_new: true,
+            verdict: Arc::new(TokioMutex::new(None)),
+            tofu_record_error: Arc::new(TokioMutex::new(None)),
+        };
+        let mut handle =
+            client::connect_stream(Arc::new(client::Config::default()), client_io, client)
+                .await
+                .expect("loopback sftp sshd handshake");
+        assert!(handle
+            .authenticate_none("tester")
+            .await
+            .expect("loopback auth")
+            .success());
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        self.connections.write().await.insert(
+            session_id.to_string(),
+            Arc::new(SshConnection {
+                id: session_id.to_string(),
+                host: "127.0.0.1".into(),
+                port: 22,
+                username: "tester".into(),
+                connection_id: None,
+                generation: 1,
+                cmd_tx,
+                handle: Arc::new(TokioMutex::new(handle)),
+                jump_handle: None,
+                sftp_meta: SharedSlot::new(),
+            }),
+        );
+    }
 }
 
 /// `with_shared_sftp` 的端到端测试：回环 sshd（支持 `sftp` 子系统）+ 真实的
