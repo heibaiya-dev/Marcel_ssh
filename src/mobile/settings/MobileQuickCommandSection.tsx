@@ -9,6 +9,7 @@ import * as tauri from '@/lib/tauri';
 import { useConnectionStore } from '@/stores/connectionStore';
 import { getErrorMessage } from '@/lib/errors';
 import { usePrivacyMode } from '@/hooks/usePrivacyMode';
+import { useSyncDataApplied } from '@/lib/syncRefresh';
 import { formatConnLabel } from '@/lib/privacy';
 import MobileSheet from '../ui/MobileSheet';
 import MobileSelect from '../ui/MobileSelect';
@@ -125,6 +126,11 @@ export function MobileQuickCommandSection() {
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  // 别的设备改了快捷命令（跨设备同步落地）：这个页面自己持有列表，要主动重读一遍。
+  useSyncDataApplied(['quickCommands'], () => {
+    void reload();
+  });
 
   const connectionName = useCallback(
     (sessionKey: string | null | undefined) => {

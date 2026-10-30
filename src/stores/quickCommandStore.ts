@@ -9,7 +9,8 @@ interface QuickCommandState {
   error: string | null;
   executingId: string | null;
   lastSessionKey: string | null;
-  load: (sessionKey?: string | null) => Promise<void>;
+  /** `silent`：后台静默刷新（跨设备同步落地后用），不翻 loading。 */
+  load: (sessionKey?: string | null, opts?: { silent?: boolean }) => Promise<void>;
   add: (input: QuickCommandInput) => Promise<void>;
   update: (id: string, patch: QuickCommandPatch) => Promise<void>;
   delete: (id: string) => Promise<void>;
@@ -29,15 +30,20 @@ export const useQuickCommandStore = create<QuickCommandState>((set, get) => ({
   executingId: null,
   lastSessionKey: null,
 
-  load: async (sessionKey?: string | null) => {
-    set({ lastSessionKey: sessionKey ?? null, loading: true, error: null });
+  load: async (sessionKey?: string | null, opts?: { silent?: boolean }) => {
+    const silent = opts?.silent === true;
+    set(
+      silent
+        ? { lastSessionKey: sessionKey ?? null }
+        : { lastSessionKey: sessionKey ?? null, loading: true, error: null },
+    );
     try {
       const commands = await tauri.quickCommandList(sessionKey ?? null);
       set({ commands });
     } catch (err) {
       set({ error: getErrorMessage(err) });
     } finally {
-      set({ loading: false });
+      if (!silent) set({ loading: false });
     }
   },
 

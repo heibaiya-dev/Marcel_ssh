@@ -8,6 +8,8 @@ import { emptyRegistry, emptySlots, defaultNetPolicy, dedupeModelEntries } from 
 import { normalizeUpdateMode } from '@/lib/updateMode';
 import { normalizeUiTheme } from '@/lib/uiTheme';
 import { defaultCustomRiskRules } from '@/lib/riskRules';
+import { deepEqual, threeWayMerge } from '@/lib/settingsMerge';
+import { getErrorMessage } from '@/lib/errors';
 
 const DEFAULT_AGENT_MODE_SETTINGS: AgentModeSettings = {
   listMode: 'denylist',
@@ -196,10 +198,25 @@ interface SettingsState {
     channelKeyStatus?: ChannelKeyStatus[];
     warning?: string | null;
   }) => void;
-  /** Persist a full settings object and update local state. */
-  save: (settings: AppSettings) => Promise<void>;
-  /** Patch a subset of fields, persist, and update local state. */
+  /**
+   * 保存一份整体设置（桌面设置页「草稿 + 保存」流）。
+   *
+   * 传 `base`（草稿打开 / 上次与 store 对齐时的快照）时，只把 `settings` 相对 `base`
+   * **真正改过的字段**合并到此刻最新的设置上再保存——别的设备同步来的改动不会被旧草稿改回去。
+   * 不传 `base` = 整份覆盖（仅限确定手上这份就是最新的场景）。
+   */
+  save: (settings: AppSettings, base?: AppSettings) => Promise<void>;
+  /**
+   * Patch a subset of fields, persist, and update local state.
+   * 与 `save` 同一套合并：patch 相对「调用时的设置」改了什么，就只把那部分落到执行时的最新设置上。
+   */
   update: (patch: Partial<AppSettings>) => Promise<void>;
+  /**
+   * 跨设备同步把别的设备的改动落到本机之后（`sync-data-applied`），从后端重读设置。
+   * 与保存共用一条串行队列：不会和在途的保存交叉，保存之后读到的一定是落盘后的真值。
+   * 失败只记日志，保留当前内存里的设置。
+   */
+  refreshFromBackend: () => Promise<void>;
   /** Acknowledge / dismiss a backend warning. */
   clearWarning: () => void;
   /** Preview settings for live updates (not persisted until save) */
@@ -238,6 +255,67 @@ function hydrateExperimental(
   };
 }
 
+/**
+ * 把磁盘 / 后端返回的原始设置补成前端使用的完整形态（缺字段补默认、旧数据归一化）。
+ * 启动快照、`load`、同步落地后的 `refreshFromBackend` 三条读取路径共用这一份，
+ * 不会出现「某条路径少补了一个字段」的漂移。
+ */
+function hydrateSettings(fromDisk: AppSettings): AppSettings {
+  return {
+    ...DEFAULT_SETTINGS,
+    ...fromDisk,
+    terminalColors: fromDisk.terminalColors ?? DEFAULT_TERMINAL_COLORS,
+    // 审批引擎等新字段：旧数据缺字段时用默认值兜底。
+    // 「兼容旧数据 = 保持原样 + 默认值填充」——`commandApprovalEngine` 缺省
+    // 走 `model`，行为与引入 Jev 之前一致，不改变任何用户现状。
+    agentModeSettings: {
+      ...DEFAULT_AGENT_MODE_SETTINGS,
+      ...(fromDisk.agentModeSettings ?? {}),
+    },
+    llmRegistry: normalizeRegistry(fromDisk.llmRegistry),
+    experimentalSettings: hydrateExperimental(fromDisk.experimentalSettings),
+    memorySettings: { ...DEFAULT_MEMORY_SETTINGS, ...(fromDisk.memorySettings ?? {}) },
+    // 旧配置没有归档保留天数：按默认 30 天兜底（与 Rust 默认值一致）
+    archiveRetentionDays: fromDisk.archiveRetentionDays ?? 30,
+    fileManagerPaths: fromDisk.fileManagerPaths ?? {},
+    workspaceLayout: normalizeWorkspaceLayout(fromDisk.workspaceLayout),
+    // 应用主题：缺字段/非法颜色由 normalizeUiTheme 按默认值兜底（兼容旧数据 = 保持原样 + 默认填充）。
+    uiTheme: normalizeUiTheme(fromDisk.uiTheme),
+    mobileNotificationSettings: {
+      ...DEFAULT_MOBILE_NOTIFICATION_SETTINGS,
+      ...(fromDisk.mobileNotificationSettings ?? {}),
+    },
+    mobileBackgroundSettings: {
+      ...DEFAULT_MOBILE_BACKGROUND_SETTINGS,
+      ...(fromDisk.mobileBackgroundSettings ?? {}),
+    },
+    // 更新方式三态：旧后端/旧配置没有该字段时按旧的 autoUpdate 推导，
+    // 保持用户现状（旧语义下 autoUpdate=false = 仅提醒），不清空也不报错。
+    updateMode: normalizeUpdateMode(fromDisk),
+  };
+}
+
+/**
+ * 设置读写的串行队列（保存与同步后刷新共用）。
+ *
+ * 没有它：两次几乎同时的 `update` 各自拿同一份旧设置合并，后完成的整份覆盖先完成的
+ * （丢更新）；同步刷新夹在一次在途保存中间，则会被保存完成后的 `set` 盖回旧值。
+ * 空闲时 job 同步开跑（不多等一个微任务），排队时接在上一个之后；上一个失败不影响下一个。
+ */
+let writeTail: Promise<void> | null = null;
+function serialize<T>(job: () => Promise<T>): Promise<T> {
+  const run = writeTail ? writeTail.then(job) : job();
+  const settled = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  writeTail = settled;
+  void settled.then(() => {
+    if (writeTail === settled) writeTail = null;
+  });
+  return run;
+}
+
 export const useSettingsStore = create<SettingsState>((set, get) => ({
   settings: DEFAULT_SETTINGS,
   loaded: false,
@@ -253,39 +331,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   preview: null,
 
   hydrateFromBootstrap: (data) => {
-    const fromDisk = data.settings;
-    const merged: AppSettings = {
-      ...DEFAULT_SETTINGS,
-      ...fromDisk,
-      terminalColors: fromDisk.terminalColors ?? DEFAULT_TERMINAL_COLORS,
-      // 审批引擎等新字段：旧数据缺字段时用默认值兜底。
-      // 「兼容旧数据 = 保持原样 + 默认值填充」——`commandApprovalEngine` 缺省
-      // 走 `model`，行为与引入 Jev 之前一致，不改变任何用户现状。
-      agentModeSettings: {
-        ...DEFAULT_AGENT_MODE_SETTINGS,
-        ...(fromDisk.agentModeSettings ?? {}),
-      },
-      llmRegistry: normalizeRegistry(fromDisk.llmRegistry),
-      experimentalSettings: hydrateExperimental(fromDisk.experimentalSettings),
-      memorySettings: { ...DEFAULT_MEMORY_SETTINGS, ...(fromDisk.memorySettings ?? {}) },
-      // 旧配置没有归档保留天数：按默认 30 天兜底（与 Rust 默认值一致）
-      archiveRetentionDays: fromDisk.archiveRetentionDays ?? 30,
-      fileManagerPaths: fromDisk.fileManagerPaths ?? {},
-      workspaceLayout: normalizeWorkspaceLayout(fromDisk.workspaceLayout),
-      // 应用主题：缺字段/非法颜色由 normalizeUiTheme 按默认值兜底（兼容旧数据 = 保持原样 + 默认填充）。
-      uiTheme: normalizeUiTheme(fromDisk.uiTheme),
-      mobileNotificationSettings: {
-        ...DEFAULT_MOBILE_NOTIFICATION_SETTINGS,
-        ...(fromDisk.mobileNotificationSettings ?? {}),
-      },
-      mobileBackgroundSettings: {
-        ...DEFAULT_MOBILE_BACKGROUND_SETTINGS,
-        ...(fromDisk.mobileBackgroundSettings ?? {}),
-      },
-      // 更新方式三态：旧后端/旧配置没有该字段时按旧的 autoUpdate 推导，
-      // 保持用户现状（旧语义下 autoUpdate=false = 仅提醒），不清空也不报错。
-      updateMode: normalizeUpdateMode(fromDisk),
-    };
+    const merged = hydrateSettings(data.settings);
     set({
       settings: merged,
       loaded: true,
@@ -306,35 +352,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     if (get().loaded && !force) return;
     try {
       const resp = await tauri.getSettings();
-      const fromDisk = resp.settings;
-      const merged: AppSettings = {
-        ...DEFAULT_SETTINGS,
-        ...fromDisk,
-        terminalColors: fromDisk.terminalColors ?? DEFAULT_TERMINAL_COLORS,
-        agentModeSettings: {
-          ...DEFAULT_AGENT_MODE_SETTINGS,
-          ...(fromDisk.agentModeSettings ?? {}),
-        },
-        llmRegistry: normalizeRegistry(fromDisk.llmRegistry),
-        experimentalSettings: hydrateExperimental(fromDisk.experimentalSettings),
-        memorySettings: { ...DEFAULT_MEMORY_SETTINGS, ...(fromDisk.memorySettings ?? {}) },
-        // 旧配置没有归档保留天数：按默认 30 天兜底（与 Rust 默认值一致）
-        archiveRetentionDays: fromDisk.archiveRetentionDays ?? 30,
-        fileManagerPaths: fromDisk.fileManagerPaths ?? {},
-        workspaceLayout: normalizeWorkspaceLayout(fromDisk.workspaceLayout),
-      // 应用主题：缺字段/非法颜色由 normalizeUiTheme 按默认值兜底（兼容旧数据 = 保持原样 + 默认填充）。
-      uiTheme: normalizeUiTheme(fromDisk.uiTheme),
-        // 移动端独立设置：旧数据无此字段时用默认值兜底（兼容旧数据 = 保持原样 + 默认值填充）
-        mobileNotificationSettings: {
-          ...DEFAULT_MOBILE_NOTIFICATION_SETTINGS,
-          ...(fromDisk.mobileNotificationSettings ?? {}),
-        },
-        mobileBackgroundSettings: {
-          ...DEFAULT_MOBILE_BACKGROUND_SETTINGS,
-          ...(fromDisk.mobileBackgroundSettings ?? {}),
-        },
-        updateMode: normalizeUpdateMode(fromDisk),
-      };
+      const merged = hydrateSettings(resp.settings);
       set({
         settings: merged,
         loaded: true,
@@ -356,13 +374,17 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     }
   },
 
-  save: async (settings: AppSettings) => {
+  save: async (settings: AppSettings, base?: AppSettings) => {
     if (!get().loaded) {
       console.warn('[settingsStore] save() blocked — settings not loaded yet');
       return;
     }
-    await tauri.saveSettings(settings);
-    set({ settings, preview: null });
+    await serialize(async () => {
+      // 排到队里再取「最新」：前面的保存 / 同步刷新可能已经改过 store。
+      const next = base ? threeWayMerge(base, settings, get().settings) : settings;
+      await tauri.saveSettings(next);
+      set({ settings: next, preview: null });
+    });
   },
 
   update: async (patch: Partial<AppSettings>) => {
@@ -370,10 +392,47 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       console.warn('[settingsStore] update() blocked — settings not loaded yet');
       return;
     }
-    const next = { ...get().settings, ...patch };
-    await tauri.saveSettings(next);
-    set({ settings: next, preview: null });
+    // base = 调用方此刻看到的设置；mine = 调用方想要的结果。
+    // 真正落盘时再拿最新值做合并（见 serialize 的说明）。
+    const base = get().settings;
+    const mine = { ...base, ...patch };
+    await serialize(async () => {
+      const next = threeWayMerge(base, mine, get().settings);
+      await tauri.saveSettings(next);
+      set({ settings: next, preview: null });
+    });
   },
+
+  refreshFromBackend: () =>
+    serialize(async () => {
+      if (!get().loaded) return;
+      try {
+        const resp = await tauri.getSettings();
+        const merged = hydrateSettings(resp.settings);
+        const flags = {
+          hasApiKey: resp.hasApiKey,
+          hasWebSearchApiKey: resp.hasWebSearchApiKey ?? false,
+          hasDeepseekToolsApiKey: resp.hasDeepseekToolsApiKey ?? false,
+          hasCustomSearchApiKey: resp.hasCustomSearchApiKey ?? false,
+          hasCustomFetchApiKey: resp.hasCustomFetchApiKey ?? false,
+          hasTavilyFetchApiKey: resp.hasTavilyFetchApiKey ?? false,
+          hasJevApiKey: resp.hasJevApiKey ?? false,
+          channelKeyStatus: toKeyStatusMap(resp.channelKeyStatus),
+        };
+        const current = get();
+        // 内容没变就别换引用 / 别触发订阅：下游 effect（主题 / 终端外观）不该白白跑一遍。
+        const settingsChanged = !deepEqual(merged, current.settings);
+        const flagsChanged = (Object.keys(flags) as (keyof typeof flags)[]).some(
+          (key) => !deepEqual(flags[key], current[key]),
+        );
+        if (settingsChanged || flagsChanged) {
+          set({ ...(settingsChanged ? { settings: merged } : {}), ...(flagsChanged ? flags : {}) });
+        }
+        setNotificationVolume(merged.notificationSettings?.notificationVolume ?? 70);
+      } catch (err) {
+        console.error('同步后刷新设置失败:', getErrorMessage(err));
+      }
+    }),
 
   setPreview: (preview: Partial<AppSettings>) => {
     set({ preview });

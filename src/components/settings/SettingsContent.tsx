@@ -14,6 +14,7 @@ import { ThemeSection } from './ThemeSection';
 import { WorkspaceLayoutSection } from './WorkspaceLayoutSection';
 import { ToolCapabilitiesSection } from './ToolCapabilitiesSection';
 import { TransferSection } from './TransferSection';
+import { SyncSection } from './SyncSection';
 import { McpServerSection } from './McpServerSection';
 import { PluginSection } from './PluginSection';
 import { MarketSection } from '@/components/market/MarketSection';
@@ -90,6 +91,7 @@ export function SettingsContent({ activeCategory, searchQuery }: SettingsContent
     { id: 'settings-experimental', element: <ToolCapabilitiesSection /> },
     { id: 'settings-mcp-server', element: <McpServerSection /> },
     { id: 'settings-transfer', element: <TransferSection /> },
+    { id: 'settings-sync', element: <SyncSection /> },
     { id: 'settings-about', element: <AboutSection /> },
     { id: 'settings-plugins', element: <PluginSection /> },
     { id: 'settings-market', element: <MarketSection /> },

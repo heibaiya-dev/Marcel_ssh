@@ -1750,3 +1750,70 @@ export interface AppBootstrapData {
   skills: Skill[];
 }
 
+
+// ───── 跨设备同步（后端契约见 scratch/sync/phase1-spec.md 4.9） ─────
+
+/** 同步存储位置：WebDAV（坚果云等）或用户自己的某台已保存服务器（SFTP）。 */
+export type SyncStorageConfig =
+  | { kind: 'webDav'; url: string; username: string; root: string }
+  | { kind: 'sftp'; connectionId: string; root: string };
+
+/**
+ * 同步状态机的对外形态。
+ * - `needsUpgrade`：云端有本机版本读不懂的新格式数据，本机暂停推进，升级应用后自动恢复；
+ * - `needsConfirm`：本机一次删除了很多条目，等用户确认要不要同步给其它设备。
+ */
+export type SyncState = 'off' | 'idle' | 'syncing' | 'error' | 'needsUpgrade' | 'needsConfirm';
+
+export interface SyncStatus {
+  enabled: boolean;
+  state: SyncState;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  pendingCount: number;
+  deviceId: string | null;
+  deviceName: string | null;
+  storage: SyncStorageConfig | null;
+  /** 等待确认的大量删除：每个同步源删了多少条。 */
+  held: { source: string; count: number }[] | null;
+}
+
+export interface SyncDevice {
+  id: string;
+  name: string;
+  platform: 'desktop' | 'android';
+  appVersion: string;
+  lastSeenAt: string;
+  isSelf: boolean;
+}
+
+export interface SyncHistoryEntry {
+  id: string;
+  at: string;
+  deviceName: string;
+  source: string;
+  path: string;
+  /** 值是对象 / 长文本时后端只给摘要。 */
+  oldValue: string | null;
+  newValue: string | null;
+  kind: 'change' | 'warning';
+  undone: boolean;
+  /**
+   * 后端生成的人话说明，例如「连接『生产服务器』的主机地址」「设置 · 终端字号」。
+   * 警告条的正文也在这里。界面优先显示它，没有时才回落到前端按路径猜的中文。
+   *
+   * 可选：这个字段加进来之前写下的历史记录没有它。
+   */
+  label?: string;
+}
+
+/** `sync_create` 的返回：恢复密钥与同步码都是机密，只在向导里展示一次，不进任何全局状态。 */
+export interface SyncCreateResult {
+  recoveryKey: string;
+  syncCode: string;
+}
+
+/** `sync-data-applied` 事件：别的设备的改动落到了本机的哪个同步源。 */
+export interface SyncDataAppliedPayload {
+  source: string;
+}

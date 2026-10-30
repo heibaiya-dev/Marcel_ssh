@@ -22,6 +22,7 @@ import GlobalInteractionOverlay from '@/components/agent/GlobalInteractionOverla
 import { initInteractionListener } from '@/stores/interactionStore';
 import { initJobWake } from '@/stores/jobWake';
 import { initAgentQueue } from '@/stores/agentQueueStore';
+import { initSync } from '@/stores/syncStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useUiTheme } from '@/hooks/useUiTheme';
 import { useTaskStore } from '@/stores/taskStore';
@@ -203,6 +204,8 @@ export default function App() {
     const detachJobWake = initJobWake();
     // 发送队列：任务自然结束后自动发出排好的消息，停止/出错/断连则暂停
     const detachAgentQueue = initAgentQueue();
+    // 跨设备同步：订阅后端状态推送，别的设备的改动落地后刷新各 store，窗口获得焦点时触发一次同步
+    const detachSync = initSync();
     // 启动恢复：拉取全部会话的后台作业（事件不会重放，重启前已存在的
     // 作业靠这次全量拉取回到 UI；只 upsert 合并，不覆盖事件实时状态）
     void useJobStore.getState().fetchJobs();
@@ -212,6 +215,7 @@ export default function App() {
       detachJobs();
       detachJobWake();
       detachAgentQueue();
+      detachSync();
     };
   }, []);
 

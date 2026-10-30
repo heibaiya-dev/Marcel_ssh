@@ -9,7 +9,8 @@ interface SkillState {
   loading: boolean;
   error: string | null;
 
-  fetchSkills: () => Promise<void>;
+  /** `silent`：后台静默刷新（跨设备同步落地后用），不翻 loading、不闪动列表。 */
+  fetchSkills: (opts?: { silent?: boolean }) => Promise<void>;
   addSkill: (
     name: string,
     description: string,
@@ -38,15 +39,16 @@ export const useSkillStore = create<SkillState>((set, get) => ({
   loading: false,
   error: null,
 
-  fetchSkills: async () => {
-    set({ loading: true, error: null });
+  fetchSkills: async (opts) => {
+    const silent = opts?.silent === true;
+    if (!silent) set({ loading: true, error: null });
     try {
       const skills = await tauri.skillList();
       set({ skills });
     } catch (err) {
       set({ error: getErrorMessage(err) });
     } finally {
-      set({ loading: false });
+      if (!silent) set({ loading: false });
     }
   },
 

@@ -1,5 +1,5 @@
 import type React from 'react';
-import { Bookmark, Bot, Cpu, Info, Monitor, Plug, Store, UploadCloud, Wrench } from 'lucide-react';
+import { Bookmark, Bot, Cloud, Cpu, Info, Monitor, Plug, Store, UploadCloud, Wrench } from 'lucide-react';
 
 export interface SettingsCategory {
   id: string;
@@ -26,6 +26,8 @@ export const SETTINGS_SECTION_SPAN: Record<string, SettingsSectionSpan> = {
   // 含 JSON 配置片段，需要整行宽度才不会被折断成看不懂的样子
   'settings-mcp-server': 'full',
   'settings-transfer': 'half',
+  // 状态 / 设备列表 / 同步记录都是整行内容，半宽会把记录挤成一条缝
+  'settings-sync': 'full',
   'settings-about': 'half',
   'settings-plugins': 'full',
   'settings-market': 'full',
@@ -72,6 +74,12 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     label: '文件传输',
     icon: <UploadCloud className="w-4 h-4" />,
     sections: ['settings-transfer'],
+  },
+  {
+    id: 'sync',
+    label: '跨设备同步',
+    icon: <Cloud className="w-4 h-4" />,
+    sections: ['settings-sync'],
   },
   {
     id: 'plugins',
