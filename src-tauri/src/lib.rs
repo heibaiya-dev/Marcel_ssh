@@ -23,6 +23,9 @@ pub mod notification;
 pub mod plugins;
 pub mod skills;
 pub mod ssh;
+// 跨设备同步：核心库（HLC / 镜像 / 差异 / 落地 / 加密与远端格式，纯逻辑无 IO）
+// 在 sync/core，存储适配器与运行时在其兄弟模块，见模块注释。
+pub mod sync;
 // 跨读取块的 UTF-8 解码器：终端 / 远端命令通道 / 本机命令管道共用，
 // 避免多字节字符被包边界切开后变成 U+FFFD。
 pub(crate) mod utf8_carry;
