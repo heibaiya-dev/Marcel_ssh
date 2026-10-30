@@ -201,6 +201,11 @@ html[data-marcel-theme='light'] .prose.marcel-prose :not(pre) > code {
   --tw-prose-td-borders: var(--color-edge);
 }
 
+/* 防孤字：正文最后一行只剩一个词，是廉价感最便宜的来源。不支持时自然降级。 */
+.prose.marcel-prose :where(p, li, blockquote) {
+  text-wrap: pretty;
+}
+
 /*
  * 可视化的底色要等于它所在那一层「面」的底色，否则在面上就是一块偏亮/偏暗的方块。
  * 默认值（zinc-900）是桌面对话面板和手机底部面板的底色；手机对话页是更深的
@@ -529,6 +534,57 @@ html[data-marcel-theme='light'] .prose.marcel-prose :not(pre) > code {
   .rolling-in,
   .rolling-out {
     animation-duration: 1ms;
+  }
+}
+
+/* ── 流式文字的墨晕：最新到达的一段字从「略糊 + 半透明」收敛到清晰 ──
+   只包最新一段的**一层** span（见 lib/streamInk.ts）：逐字包或逐字滑窗都要在每帧
+   重建几十个 span、把动画反复重启，看起来一卡一卡还闪。
+   90ms 必须短于显示节拍（MarkdownBody 的 STREAM_TICK_MS = 110ms）：上一段在新一段
+   到来之前就播完，退回纯文本时看不出变化，不会闪。
+   两个动画名交替（.ink-a / .ink-b）：React 复用同一个 span 元素时，换 class 就能让
+   新到的一段重新起播，不会出现「后半段没有动画」。
+   必须 display:inline —— inline-block 会把字变成独立盒子，中文断行与英文单词
+   都会被拆开，复制出来的文本还会多出边界。 */
+@keyframes ink-in-a {
+  from {
+    opacity: 0.4;
+    filter: blur(3px);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0);
+  }
+}
+@keyframes ink-in-b {
+  from {
+    opacity: 0.4;
+    filter: blur(3px);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0);
+  }
+}
+
+.ink-a,
+.ink-b,
+.ink-run {
+  display: inline;
+}
+
+.ink-a {
+  animation: ink-in-a 90ms cubic-bezier(0.215, 0.61, 0.355, 1) backwards;
+}
+
+.ink-b {
+  animation: ink-in-b 90ms cubic-bezier(0.215, 0.61, 0.355, 1) backwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ink-a,
+  .ink-b {
+    animation: none;
   }
 }
 
@@ -947,6 +1003,68 @@ button,
 .agent-input textarea:focus-visible {
   outline: none;
   outline-offset: 0;
+}
+
+/* ── Agent 输入区：不画边框，靠表面抬升 + 柔和投影分层 ──
+   静止时比面板抬 2–4 个 L*（45% 卡片色混画布色），聚焦时再抬一档；
+   键盘焦点同样看得见（表面变亮 + 投影加深），不再用 outline/ring 描一圈。
+   拖拽悬停只加一层强调色薄雾，不换边框。 */
+.agent-composer-surface {
+  background-color: color-mix(in oklab, var(--color-zinc-800) 45%, var(--color-zinc-900));
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 0.18),
+    0 12px 32px -20px rgb(0 0 0 / 0.55);
+  transition:
+    background-color 160ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)),
+    box-shadow 220ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1));
+}
+.agent-composer-surface:focus-within {
+  background-color: color-mix(in oklab, var(--color-zinc-800) 92%, #fff 8%);
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 0.2),
+    0 18px 44px -18px rgb(0 0 0 / 0.62);
+}
+.agent-composer-surface[data-dragover='true'] {
+  background-color: color-mix(in oklab, var(--color-zinc-800) 78%, var(--color-indigo-500, #6366f1) 22%);
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 0.2),
+    0 0 0 3px color-mix(in oklab, var(--color-indigo-500, #6366f1) 22%, transparent),
+    0 18px 44px -18px rgb(0 0 0 / 0.62);
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-composer-surface {
+    transition: none;
+  }
+}
+/* 浅色下同样的投影会显脏：收薄、收近，只留一层贴地的边。 */
+html[data-marcel-theme='light'] .agent-composer-surface {
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 0.06),
+    0 10px 28px -24px rgb(0 0 0 / 0.28);
+}
+html[data-marcel-theme='light'] .agent-composer-surface:focus-within {
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 0.08),
+    0 16px 36px -24px rgb(0 0 0 / 0.36);
+}
+/* Windows 高对比度：把边界线还回来，否则所有表面塌成一个色块。 */
+@media (forced-colors: active) {
+  .agent-composer-surface {
+    border: 1px solid CanvasText;
+  }
+}
+
+/* 用户气泡：与画布拉一档表面差，顶缘一线高光给材质，不再用整块亮灰压住对话。 */
+.marcel-user-bubble {
+  background-color: var(--color-zinc-800);
+  box-shadow:
+    inset 0 1px 0 color-mix(in oklab, #fff 7%, transparent),
+    0 1px 2px rgb(0 0 0 / 0.18);
+}
+@media (forced-colors: active) {
+  .marcel-user-bubble {
+    border: 1px solid CanvasText;
+  }
 }
 
 /* Card hover effects */
