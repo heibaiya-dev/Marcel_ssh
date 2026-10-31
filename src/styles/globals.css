@@ -530,8 +530,8 @@ html[data-marcel-theme='light'] .prose.marcel-prose :not(pre) > code {
 /* ── 流式文字的墨晕：最新到达的一段字从「略糊 + 半透明」收敛到清晰 ──
    只包最新一段的**一层** span（见 lib/streamInk.ts）：逐字包或逐字滑窗都要在每帧
    重建几十个 span、把动画反复重启，看起来一卡一卡还闪。
-   90ms 必须短于显示节拍（MarkdownBody 的 STREAM_TICK_MS = 100ms）：上一段在新一段
-   到来之前就播完，退回纯文本时看不出变化，不会闪。
+   文字到达即上屏（没有显示限速），一段的停留时间由 Markdown 解析节奏决定，所以动画要短：
+   90ms 收完，下一段到来时这段基本已是清晰态，退回纯文本看不出变化，不会闪。
    两个动画名交替（.ink-a / .ink-b）：React 复用同一个 span 元素时，换 class 就能让
    新到的一段重新起播，不会出现「后半段没有动画」。
    必须 display:inline —— inline-block 会把字变成独立盒子，中文断行与英文单词

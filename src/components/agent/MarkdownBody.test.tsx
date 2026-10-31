@@ -6,7 +6,6 @@ import MarkdownBody from './MarkdownBody';
 import { markdownRenderManager } from '@/lib/markdownRenderManager';
 import type { MarkdownTree } from '@/lib/markdownProcessor';
 import { MarkdownVisibility } from './markdownVisibility';
-import { STREAM_MAX_HOLD_MS, STREAM_TICK_MS } from '@/lib/streamPacing';
 
 vi.mock('@/lib/markdownRenderManager', () => ({
   markdownRenderManager: { request: vi.fn(() => vi.fn()) },
@@ -44,24 +43,17 @@ it('does not wrap streamed text when the message is not live', async () => {
   await deliver('first next');
   expect(host.querySelectorAll('.ink-a, .ink-b').length).toBe(0);
 });
-it('holds text back for a beat, then reveals it in one piece while streaming', async () => {
-  vi.useFakeTimers();
-  try {
-    await render('a', true);
-    await deliver('a');
-    await render('ab', true);
-    // 节拍未到 / 还没攒够：屏幕上还是上一次放出的内容。
-    expect(host.textContent).toBe('a');
-    // 压到上限就放行（模型吐得慢也不能干等），而且是整段出现，不是逐字蹦。
-    await act(async () => { vi.advanceTimersByTime(STREAM_MAX_HOLD_MS + STREAM_TICK_MS * 2); });
-    const requested = vi.mocked(markdownRenderManager.request).mock.calls.map((c) => c[1]);
-    expect(requested).toContain('ab');
-    await deliver('ab');
-    const spans = [...host.querySelectorAll('.ink-a, .ink-b')];
-    expect(spans.map((s) => s.textContent)).toEqual(['b']);
-  } finally {
-    vi.useRealTimers();
-  }
+it('shows streamed text as soon as it arrives, no display pacing', async () => {
+  await render('a', true);
+  await deliver('a');
+  await render('ab', true);
+  // 显示限速已经删掉：内容一到就上屏，不用等节拍、也不用等攒够字数。
+  expect(host.textContent).toBe('ab');
+  const requested = vi.mocked(markdownRenderManager.request).mock.calls.map((c) => c[1]);
+  expect(requested).toContain('ab');
+  await deliver('ab');
+  const spans = [...host.querySelectorAll('.ink-a, .ink-b')];
+  expect(spans.map((s) => s.textContent)).toEqual(['b']);
 });
 it('shows text immediately, then keeps parsed content while the next prefix is processed', async () => {
   await render('first');
