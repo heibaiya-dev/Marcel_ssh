@@ -150,7 +150,7 @@ export function AgentComposer({
                 : "请先连接到服务器..."
           }
           disabled={!canInteract}
-          className="w-full px-4 pt-3 pb-1.5 text-[15px] text-zinc-100 placeholder:text-zinc-500 bg-transparent outline-none focus:outline-none focus:ring-0 disabled:opacity-50 resize-none max-h-[6rem] overflow-y-auto leading-relaxed"
+          className="w-full px-4 pt-3 pb-1.5 text-[15px] text-zinc-100 placeholder:text-zinc-500 bg-transparent outline-none focus:outline-none focus:ring-0 disabled:opacity-50 resize-none max-h-[6rem] overflow-y-auto leading-relaxed transition-[height] duration-120 ease-out motion-reduce:transition-none"
         />
 
         {/* Toolbar：+ 附件 / 模式 / 模型 —— 发送按钮右对齐 */}

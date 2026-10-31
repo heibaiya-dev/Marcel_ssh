@@ -588,6 +588,44 @@ html[data-marcel-theme='light'] .prose.marcel-prose :not(pre) > code {
   animation: indeterminate-slide 1.4s ease-in-out infinite;
 }
 
+/* Scroll-to-bottom FAB: preserve spatial origin, exit faster than enter. */
+@keyframes scrollFabEnter {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes scrollFabExit {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(4px) scale(0.9);
+  }
+}
+
+.scroll-fab-enter {
+  animation: scrollFabEnter 140ms var(--ease-out) both;
+}
+
+.scroll-fab-exit {
+  animation: scrollFabExit 100ms var(--ease-out) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scroll-fab-enter,
+  .scroll-fab-exit {
+    animation-duration: 1ms;
+  }
+}
+
 /* Toggle animation classes */
 .animate-toggle-on {
   animation: spring-toggle-on 400ms var(--spring-bounce) forwards;
