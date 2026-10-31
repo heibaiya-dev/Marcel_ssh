@@ -1640,7 +1640,13 @@ mod tests {
             );
         }
         // 以前前端只抄了其中一部分，这几个是被漏掉的典型。
-        for expected in ["subagent", "system_info", "job_kill", "memory", "render_html"] {
+        for expected in [
+            "subagent",
+            "system_info",
+            "job_kill",
+            "memory",
+            "render_html",
+        ] {
             assert!(names.iter().any(|n| n == expected), "缺 {expected}");
         }
     }

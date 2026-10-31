@@ -471,12 +471,41 @@ describe('real virtualizer integration', { timeout: 20_000 }, () => {
     const healthyRow = viewport.querySelector('[data-virtual-row-key="message:m5"]')!;
     // 恢复可见：只重挂账实不符的槽位
     vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
-    await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await new Promise((resolve) => setTimeout(resolve, 100)); // 等审计的双 rAF
+    });
     expect(viewport.querySelector('[data-virtual-row-key="message:m3"]')).not.toBe(staleSlot);
     expect(viewport.querySelector('iframe')).toBe(healthyIframe);
     expect(viewport.querySelector('[data-virtual-row-key="message:m5"]')).toBe(healthyRow);
     await settle();
     expect(viewport.scrollHeight).toBeLessThan(withContent);
+  });
+
+  it('does not remount an iframe slot on visibility restore even when its cached height mismatches', async () => {
+    data[6] = { ...data[6], role: 'tool', toolResult: {
+      toolName: 'render_html', result: '', summary: 'chart', success: true, blocked: false,
+    } };
+    await render();
+    await settle();
+    const iframe = viewport.querySelector('iframe')!;
+    const iframeRow = viewport.querySelector('[data-virtual-row-key="message:m5"]')!;
+    // 对照槽位：同样账实不符（行内容被清空）但没有 iframe，应当被重挂
+    data = data.map((m) => m.id === 'm3' ? { ...m, role: 'assistant' as const, content: '' } : m);
+    heights.set(data[6].id, 400); // iframe 槽位实际高度变了，账面还是旧值，且不跑 settle
+    await act(async () => root.render(
+      <AgentMessageList messages={data} conversationId="test" listRef={handle} />,
+    ));
+    const plainSlot = viewport.querySelector('[data-virtual-row-key="message:m3"]')!;
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+    expect(viewport.querySelector('iframe')).toBe(iframe);
+    expect(viewport.querySelector('[data-virtual-row-key="message:m5"]')).toBe(iframeRow);
+    // 审计确实跑过了（否则上面两条断言是空转）：无 iframe 的账实不符槽位被重挂
+    expect(viewport.querySelector('[data-virtual-row-key="message:m3"]')).not.toBe(plainSlot);
   });
 
   it('follows streamed/async height growth in the real transcript, but respects a reader above the bottom', async () => {

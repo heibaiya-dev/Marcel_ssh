@@ -179,7 +179,11 @@ pub async fn config_delete_connection(
         {
             Ok((_, n)) if n > 0 => {
                 log::info!("删除连接 {id}：一并删除 {n} 条机器记忆");
-                crate::memory::reflect::emit_changed(state.inner(), crate::memory::Source::User, None);
+                crate::memory::reflect::emit_changed(
+                    state.inner(),
+                    crate::memory::Source::User,
+                    None,
+                );
             }
             Ok(_) => {}
             Err(e) => log::warn!("删除连接 {id} 的记忆失败: {e}"),

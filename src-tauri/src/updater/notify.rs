@@ -231,7 +231,10 @@ mod tests {
         assert_eq!(plan(&downloading(501, 1000), true, &mut last), None);
         assert_eq!(plan(&downloading(504, 1000), true, &mut last), None);
         // 跨过整数百分比才再发一次
-        assert_eq!(plan(&downloading(510, 1000), true, &mut last), Some(progress(51)));
+        assert_eq!(
+            plan(&downloading(510, 1000), true, &mut last),
+            Some(progress(51))
+        );
     }
 
     #[test]

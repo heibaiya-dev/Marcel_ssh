@@ -90,7 +90,10 @@ fn settings_sample() -> Value {
     );
     obj.insert("customProtectedPaths".into(), serde_json::json!(["/etc"]));
     obj.insert("disabledPlugins".into(), serde_json::json!(["p1"]));
-    obj.insert("authorizedCapabilities".into(), serde_json::json!(["ssh.list"]));
+    obj.insert(
+        "authorizedCapabilities".into(),
+        serde_json::json!(["ssh.list"]),
+    );
     obj.insert(
         "workspaceLayout".into(),
         serde_json::json!({"sizes": [1, 2], "activeTab": "files"}),
@@ -124,7 +127,10 @@ fn settings_sample() -> Value {
             "message": "",
         }]),
     );
-    obj.insert("riskRuleOverrides".into(), serde_json::json!({"shell.rm": "deny"}));
+    obj.insert(
+        "riskRuleOverrides".into(),
+        serde_json::json!({"shell.rm": "deny"}),
+    );
     v
 }
 
@@ -224,14 +230,22 @@ fn known_hosts_sample() -> Value {
 fn all_samples() -> Vec<(&'static str, &'static ScopeRules, Value)> {
     vec![
         ("settings", &scopes::SETTINGS_RULES, settings_sample()),
-        ("connections", &scopes::CONNECTIONS_RULES, connections_sample()),
+        (
+            "connections",
+            &scopes::CONNECTIONS_RULES,
+            connections_sample(),
+        ),
         (
             "quickCommands",
             &scopes::QUICK_COMMANDS_RULES,
             quick_commands_sample(),
         ),
         ("skills", &scopes::SKILLS_RULES, skills_sample()),
-        ("mcpServers", &scopes::MCP_SERVERS_RULES, mcp_servers_sample()),
+        (
+            "mcpServers",
+            &scopes::MCP_SERVERS_RULES,
+            mcp_servers_sample(),
+        ),
         (
             "knownHosts",
             &scopes::KNOWN_HOSTS_RULES,
@@ -368,6 +382,8 @@ fn every_config_field_declares_its_sync_scope() {
         crate::config::persist::atomic_write(&path, &expected).expect("写快照");
         return;
     }
+    // 快照是 LF 文本；Windows 上 core.autocrlf 签出时可能变成 CRLF，统一成 LF 再比，
+    // 否则只有行尾不同也会整份判红（diff_summary 按行去重看不出差异）。
     let actual = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "读不到作用域快照 {}: {e}\n\
@@ -393,7 +409,11 @@ fn the_known_machine_local_fields_are_marked_local() {
     // 快照测试能发现「字段新增 / 作用域变化」，这条说清「哪几条是不能松口的底线」。
     let k = |s: &str| vec![Seg::key(s)];
     let cases: &[(&ScopeRules, &[Seg], &str)] = &[
-        (&scopes::SETTINGS_RULES, &[Seg::key("panelHeight")], "panelHeight"),
+        (
+            &scopes::SETTINGS_RULES,
+            &[Seg::key("panelHeight")],
+            "panelHeight",
+        ),
         (
             &scopes::SETTINGS_RULES,
             &[Seg::key("fileManagerPath")],
@@ -435,11 +455,7 @@ fn the_known_machine_local_fields_are_marked_local() {
         ),
         (
             &scopes::KNOWN_HOSTS_RULES,
-            &[
-                Seg::key("entries"),
-                Seg::key("h:22"),
-                Seg::key("last_seen"),
-            ],
+            &[Seg::key("entries"), Seg::key("h:22"), Seg::key("last_seen")],
             "entries/*/last_seen",
         ),
     ];
@@ -452,7 +468,11 @@ fn the_known_machine_local_fields_are_marked_local() {
     }
     let _ = k;
     // 平台字段：两个平台各一份，互相不覆盖
-    for name in ["fontSize", "notificationSettings", "mobileNotificationSettings"] {
+    for name in [
+        "fontSize",
+        "notificationSettings",
+        "mobileNotificationSettings",
+    ] {
         assert_eq!(
             scopes::SETTINGS_RULES.scope_of(&[Seg::key(name)]),
             Scope::Platform,

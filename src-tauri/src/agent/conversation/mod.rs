@@ -27,6 +27,7 @@ mod plans;
 mod recall;
 mod usage;
 
+pub use conversations::SubDispatch;
 pub use fork::{AnchorRef, ForkError, ForkOutcome};
 pub use history::{
     CardBrief, HistoryError, HistoryHit, HistoryOverview, HistoryRead, HistoryWindow, MsgBrief,
@@ -92,7 +93,8 @@ impl ConversationDb {
                 pinned INTEGER NOT NULL DEFAULT 0,
                 usage_json TEXT,
                 forked_from_id TEXT,
-                archived_at TEXT
+                archived_at TEXT,
+                sub_dispatch_json TEXT
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -285,6 +287,16 @@ impl ConversationDb {
             conn.execute("ALTER TABLE conversations ADD COLUMN archived_at TEXT", [])
                 .map_err(|e| ConversationError::SchemaError { source: e })?;
             log::info!("Migration complete: archived_at column added");
+        }
+        // Migration: add sub_dispatch_json —— 子 agent 对话的派发参数（执行侧 / 模式 / 目标机器），
+        // 供 `continue_id` 续派时还原（见 `SubDispatch`）。旧库 ALTER 加列；NULL = 不是子 agent
+        // 对话，或是引入该列之前派发的（这类对话不可续派）。
+        if !column_exists(&conn, "conversations", "sub_dispatch_json") {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN sub_dispatch_json TEXT",
+                [],
+            )
+            .map_err(|e| ConversationError::SchemaError { source: e })?;
         }
         // 归档列表按「连接 + 归档时间」取，顺带覆盖按连接等值查未归档项的最左前缀。
         conn.execute(

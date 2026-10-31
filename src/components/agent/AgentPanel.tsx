@@ -84,7 +84,6 @@ export default function AgentPanel() {
     draftConversationId,
     draftSendUnavailableReason,
     newConversation,
-    switchConversation,
     renameConversation,
     archivedConversations,
     archivedLoading,
@@ -205,9 +204,9 @@ export default function AgentPanel() {
 
   const handleBackToParent = useCallback(() => {
     if (parentConversationId) {
-      void switchConversation(parentConversationId);
+      void sessionConversationBindingManager.openConversation(parentConversationId);
     }
-  }, [parentConversationId, switchConversation]);
+  }, [parentConversationId]);
 
   useEffect(() => {
     fetchConnections();

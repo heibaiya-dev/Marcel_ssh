@@ -362,7 +362,17 @@ interface TaskStreamState {
    *  最大的时候，逐事件提交 = 每个 token 拷贝一遍整份对话并重渲染。 */
   pendingCompactionText: string | null;
   compactionRafId: number | null;
+  /**
+   * 本轮流式输出的起点标记（流中途断线重试要据此撤掉半截内容）。
+   * 在本轮第一次提交正文/思考时懒记录；工具结果落定（轮结束）时清空，
+   * 即使没清也会在下一轮建新气泡时被覆盖，不会指向旧轮。
+   */
+  roundMark: RoundMark | null;
 }
+
+type RoundMark =
+  | { id: string; created: true }
+  | { id: string; created: false; contentLen: number; reasoningLen: number };
 
 const taskStreamState: Map<string, TaskStreamState> = new Map();
 
@@ -394,6 +404,7 @@ export function getStreamState(taskId: string): TaskStreamState {
     compactionTrigger: null,
     pendingCompactionText: null,
     compactionRafId: null,
+    roundMark: null,
   };
 }
 
@@ -422,6 +433,20 @@ export function cleanupStreamState(taskId: string) {
   }
   taskStreamState.delete(taskId);
   taskStreamWriters.delete(taskId);
+}
+
+/**
+ * 一轮模型输出结束（后端每轮流结束后发 `contextUsage`）：先把缓冲里的 delta 提交，
+ * 再清掉本轮的撤销标记。不清的话，没有工具的一轮（工具结果才清标记）之后若同一气泡
+ * 又被下一轮续写（如作业通知唤醒的新一轮），下一轮流中途断线重试会按上一轮留下的
+ * 标记把上一轮的正文也截掉。必须先提交缓冲：尾巴晚于清标记落下的话，会按「尾巴之前」
+ * 的长度重新记标记，同样把尾巴划进下一轮。
+ */
+export function markRoundEnded(taskId: string) {
+  const state = taskStreamState.get(taskId);
+  if (!state) return;
+  flushLeftoverDeltas(taskId, state);
+  state.roundMark = null;
 }
 
 /** 收尾补笔：把缓冲里剩下的 delta 写到它们本就该去的那个对话。 */
@@ -502,6 +527,7 @@ export function handleToolResult(
         streamState.assistantMessageId = null;
         streamState.messageIndex = -1;
         streamState.toolResultCount = 0;
+        streamState.roundMark = null;
         setStreamState(taskId, streamState);
         reinsertSkeleton();
         return newMsgs;
@@ -533,6 +559,7 @@ export function handleToolResult(
     streamState.assistantMessageId = null;
     streamState.messageIndex = -1;
     streamState.toolResultCount = 0;
+    streamState.roundMark = null;
 
     setStreamState(taskId, streamState);
 
@@ -626,8 +653,17 @@ function flushPendingDeltas(
       newMsgs.push(newMsg);
       state.assistantMessageId = newMsg.id;
       state.messageIndex = newMsgs.length - 1;
+      state.roundMark = { id: newMsg.id, created: true };
     } else {
       const msg = newMsgs[idx];
+      if (!state.roundMark || state.roundMark.id !== msg.id) {
+        state.roundMark = {
+          id: msg.id,
+          created: false,
+          contentLen: msg.content.length,
+          reasoningLen: msg.reasoningContent?.length ?? 0,
+        };
+      }
       newMsgs[idx] = {
         ...msg,
         content: msg.content + pendingTextDelta,
@@ -846,11 +882,21 @@ export function handleRetrying(
   handler: StreamHandler,
   taskId: string,
   conversationId: string,
-  ev: { type: 'retrying'; attempt: number; maxAttempts: number; delaySecs: number; lastError: string },
+  ev: {
+    type: 'retrying';
+    attempt: number;
+    maxAttempts: number;
+    delaySecs: number;
+    lastError: string;
+    discardPartial?: boolean;
+  },
 ) {
+  const discard = ev.discardPartial === true;
+  if (discard) discardRoundPartial(taskId);
   handler.updateMessages(conversationId, (convMsgs) => {
-    const newMsgs = convMsgs
+    let newMsgs = convMsgs
       .filter((m) => !(m.role === 'system' && m.isRetrying));
+    if (discard) newMsgs = dropRoundPartial(taskId, newMsgs);
     return [
       ...newMsgs,
       {
@@ -866,6 +912,66 @@ export function handleRetrying(
       },
     ];
   });
+}
+
+/**
+ * 流中途断线重试：先丢掉还没提交的缓冲（不提交——那是被丢弃那次尝试的内容）。
+ * 消息列表上的撤销在 `dropRoundPartial`，由 updater 一并完成。
+ */
+function discardRoundPartial(taskId: string) {
+  const state = getStreamState(taskId);
+  state.pendingTextDelta = '';
+  state.pendingThinkingDelta = '';
+  state.pendingOutputTokens = 0;
+  if (state.flushRafId != null) {
+    cancelAnimationFrame(state.flushRafId);
+    state.flushRafId = null;
+  }
+}
+
+/**
+ * 撤掉本轮已上屏的半截内容：新建的助手气泡整条删，追加的截回起点；
+ * 本轮已开出的工具卡（流式期间一个都没执行过）删掉并清追踪表；
+ * 最后保证有一条 loading 骨架，让界面回到「等待模型」。
+ */
+function dropRoundPartial(taskId: string, msgs: AgentMessage[]): AgentMessage[] {
+  const state = getStreamState(taskId);
+  let out = msgs;
+  const mark = state.roundMark;
+  if (mark) {
+    if (mark.created) {
+      out = out.filter((m) => m.id !== mark.id);
+      state.assistantMessageId = null;
+      state.messageIndex = -1;
+    } else {
+      out = out.map((m) =>
+        m.id === mark.id
+          ? {
+              ...m,
+              content: m.content.slice(0, mark.contentLen),
+              reasoningContent: m.reasoningContent
+                ? m.reasoningContent.slice(0, mark.reasoningLen) || undefined
+                : m.reasoningContent,
+              isThinking: false,
+            }
+          : m,
+      );
+    }
+    state.roundMark = null;
+  }
+  if (state.pendingToolCalls.size > 0) {
+    const ids = new Set(state.pendingToolCalls.values());
+    out = out.filter((m) => !ids.has(m.id));
+    for (const toolCallId of state.pendingToolCalls.keys()) {
+      state.pendingToolArgs.delete(toolCallId);
+      partialFlushAt.delete(toolCallId);
+      argTrackers.delete(toolCallId);
+    }
+    state.pendingToolCalls.clear();
+  }
+  if (!findLoadingSkeleton(out)) out = [...out, makeLoadingSkeleton()];
+  setStreamState(taskId, state);
+  return out;
 }
 
 // ---------------------------------------------------------------------------

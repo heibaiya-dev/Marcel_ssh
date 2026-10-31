@@ -243,19 +243,19 @@ impl ConversationDb {
 
             // 子对话：被复制的消息里引用到的才复制。必须深拷贝 —— 删来源会级联删掉它的
             // 子对话，共用的话分叉里的子 agent 卡片就全打不开了。
-            let children: Vec<(String, String, String, String)> = {
+            let children: Vec<(String, String, String, String, Option<String>)> = {
                 let mut stmt = tx.prepare(
-                    "SELECT id, title, created_at, updated_at FROM conversations
+                    "SELECT id, title, created_at, updated_at, sub_dispatch_json FROM conversations
                      WHERE parent_conversation_id = ?1",
                 )?;
                 let rows = stmt
                     .query_map([source_id], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 rows
             };
-            for (child_id, child_title, child_created, child_updated) in children {
+            for (child_id, child_title, child_created, child_updated, child_dispatch) in children {
                 let referenced = copied.iter().any(|m| {
                     m.content.contains(&child_id)
                         || m.tool_calls_json
@@ -268,15 +268,16 @@ impl ConversationDb {
                 let new_child_id = Uuid::new_v4().to_string();
                 tx.execute(
                     "INSERT INTO conversations
-                        (id, connection_id, title, created_at, updated_at, parent_conversation_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        (id, connection_id, title, created_at, updated_at, parent_conversation_id, sub_dispatch_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         new_child_id,
                         connection_id,
                         child_title,
                         child_created,
                         child_updated,
-                        new_id
+                        new_id,
+                        child_dispatch
                     ],
                 )?;
                 let child_rows = Self::query_stored_messages(&tx, &child_id, None)?;

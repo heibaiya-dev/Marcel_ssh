@@ -53,6 +53,10 @@ pub enum StreamEvent {
         max_attempts: u32,
         delay_secs: f32,
         last_error: String,
+        /// 失败发生在流式输出途中（首包之后）：这一轮已经上屏的正文 / 思考 /
+        /// 工具卡是半截，前端要撤掉，重试会从头重新输出整轮。
+        #[serde(default)]
+        discard_partial: bool,
     },
     /// Context compaction started — LLM summarization of old history is in
     /// progress (can take tens of seconds; frontend must not look stalled).
@@ -182,9 +186,6 @@ mod tests {
             tool_call_id: None,
         })
         .unwrap();
-        assert!(
-            v.get("toolCallId").is_none(),
-            "非 tool 行不携带 toolCallId"
-        );
+        assert!(v.get("toolCallId").is_none(), "非 tool 行不携带 toolCallId");
     }
 }

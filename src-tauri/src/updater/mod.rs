@@ -1871,7 +1871,11 @@ mod update_gate {
                 tokio::spawn(async move {
                     let mut scratch = [0u8; 2048];
                     let _ = socket.read(&mut scratch).await;
-                    let reason = if status == 200 { "OK" } else { "Internal Server Error" };
+                    let reason = if status == 200 {
+                        "OK"
+                    } else {
+                        "Internal Server Error"
+                    };
                     let head = format!(
                         "HTTP/1.1 {status} {reason}\r\ncontent-length: {declared_len}\r\nconnection: close\r\n\r\n"
                     );
@@ -1959,12 +1963,14 @@ mod update_gate {
             TEST_PAYLOAD,
             "落盘内容必须逐字节一致"
         );
-        let meta: PendingUpdateMeta = serde_json::from_slice(
-            &std::fs::read(dir.join(PENDING_FILE_NAME)).unwrap(),
-        )
-        .unwrap();
+        let meta: PendingUpdateMeta =
+            serde_json::from_slice(&std::fs::read(dir.join(PENDING_FILE_NAME)).unwrap()).unwrap();
         assert_eq!(meta.version, VERSION);
-        assert_eq!(meta.sha256, sha_of(TEST_PAYLOAD), "pending 里记的必须是校验过的 sha");
+        assert_eq!(
+            meta.sha256,
+            sha_of(TEST_PAYLOAD),
+            "pending 里记的必须是校验过的 sha"
+        );
         assert_eq!(
             meta.signature, TEST_SIG_WRAP_B64,
             "pending 要留签名供启动时复验"

@@ -118,7 +118,15 @@ pub(super) fn emit_message_saved(
 /// **两个调用方共用这一份文本**：本轮内注入（模型还在跑，见本文件的自然
 /// 结束守卫）与跨轮唤醒（前端经 `job_pending_notice` 取走，开新一轮交给
 /// 模型）。两处各写一份必然分叉。
-pub(crate) fn build_job_settlement_notice(jobs: &[crate::command_exec::JobInfo]) -> String {
+///
+/// `still_running` 是该对话名下**此刻仍在运行**的作业数（本机 + 远端，见
+/// [`count_running_jobs`]）。它决定末尾的收尾指令：界面只展开回合里最后一条
+/// 回复，其余全部折叠，所以「最后一个作业的结局」到达时模型若只回一句
+/// 「作业也完成了」，真正的总结就被折叠掉了。
+pub(crate) fn build_job_settlement_notice(
+    jobs: &[crate::command_exec::JobInfo],
+    still_running: usize,
+) -> String {
     let mut lines: Vec<String> = Vec::new();
     for j in jobs {
         let status = match j.status {
@@ -142,7 +150,50 @@ pub(crate) fn build_job_settlement_notice(jobs: &[crate::command_exec::JobInfo])
          若作业已不再需要，可用 job_kill 终止。"
             .to_string(),
     );
+    if still_running == 0 {
+        lines.push(
+            "这是最后一个后台作业，名下已没有仍在运行的作业。如果你读完输出后就要收尾，\
+             最终回复必须是对整件任务的完整总结（结果、结论、改了什么、还剩什么），\
+             要重新写完整，不能只讲这个作业的结果，也不能写“见上文”：\
+             在界面上，最后一条回复之前的内容都会被折叠，用户只会读到最后这一条。"
+                .to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "名下还有 {still_running} 个后台作业仍在运行。先不要写最终总结，\
+             除非你决定不再等它们、就此收尾；等它们都结束后，最后一条回复再统一给出完整总结。"
+        ));
+    }
     lines.join("\n")
+}
+
+/// 某对话名下仍在运行的后台作业数（本机 + 远端；按归属对话计，另并入
+/// 本轮 `task_id` 名下的，以免漏掉没带归属的记录）。通知的收尾指令据此分叉。
+pub(crate) async fn count_running_jobs(
+    remote: &crate::command_exec::CommandExecutionManager,
+    local: &crate::command_exec::CommandExecutionManager,
+    conversation_id: &str,
+    task_id: Option<&str>,
+) -> usize {
+    use crate::command_exec::JobFilter;
+    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mgr in [remote, local] {
+        for j in mgr
+            .list_jobs(
+                JobFilter::OwnerConversation(conversation_id),
+                Some("running"),
+            )
+            .await
+        {
+            ids.insert(j.job_id);
+        }
+        if let Some(t) = task_id {
+            for j in mgr.running_jobs_for_task(t).await {
+                ids.insert(j.job_id);
+            }
+        }
+    }
+    ids.len()
 }
 
 /// 一轮请求结束后的上下文快照（占用环那几个数）。
@@ -941,7 +992,7 @@ mod tests {
                 crate::command_exec::JobStatus::Killed,
             ),
         ];
-        let notice = build_job_settlement_notice(&jobs);
+        let notice = build_job_settlement_notice(&jobs, 0);
         assert!(notice.contains("job_1"));
         assert!(notice.contains("编译 release"));
         assert!(notice.contains("已完成"));
@@ -960,10 +1011,31 @@ mod tests {
             "cargo test",
             crate::command_exec::JobStatus::Failed,
         )];
-        let notice = build_job_settlement_notice(&jobs);
+        let notice = build_job_settlement_notice(&jobs, 0);
         assert!(notice.contains("job_3"));
         assert!(notice.contains("cargo test"));
         assert!(notice.contains("执行失败"));
+    }
+
+    #[test]
+    fn job_settlement_notice_closing_depends_on_remaining_jobs() {
+        let jobs = vec![job_info(
+            "job_1",
+            "编译",
+            "make",
+            crate::command_exec::JobStatus::Completed,
+        )];
+        let last = build_job_settlement_notice(&jobs, 0);
+        assert!(last.contains("最后一个后台作业"), "{last}");
+        assert!(last.contains("完整总结") && last.contains("折叠"), "{last}");
+        let more = build_job_settlement_notice(&jobs, 2);
+        assert!(more.contains("还有 2 个后台作业仍在运行"), "{more}");
+        assert!(more.contains("先不要写最终总结"), "{more}");
+        assert!(!more.contains("最后一个后台作业"), "{more}");
+        // 收尾句不能被前端误认成作业行
+        for t in [&last, &more] {
+            assert_eq!(t.lines().filter(|l| l.starts_with("后台作业 ")).count(), 1);
+        }
     }
 
     fn breakdown(

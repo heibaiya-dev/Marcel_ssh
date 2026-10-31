@@ -976,6 +976,42 @@ describe('conversationStore', () => {
       expect(useConversationStore.getState().messages['sub-conv-1']).toHaveLength(2);
     });
 
+    it('resume (continue_id): a new subTaskId on an existing sub-conversation appends the follow-up and a fresh skeleton', () => {
+      useConversationStore.setState({ conversations: {}, messages: {}, activeConversationId: null });
+      const store = () => useConversationStore.getState();
+      store().registerSubConversation('sub-conv-1', 'conn-1', 't', 'sub-task-1', 'first', 'main-conv-1');
+      // 第一轮结束：骨架被真实消息替换
+      useConversationStore.setState((s) => ({
+        messages: {
+          ...s.messages,
+          'sub-conv-1': [
+            { id: 'sub-user-sub-task-1', role: 'user', content: 'first', timestamp: 't0' },
+            { id: 'a1', role: 'assistant', content: 'report one', timestamp: 't1' },
+          ],
+        },
+      }));
+
+      const loadingId = store().registerSubConversation(
+        'sub-conv-1', 'conn-1', 't', 'sub-task-2', '再查一下端口', 'main-conv-1',
+      );
+      expect(loadingId).toBe('sub-loading-sub-task-2');
+      const msgs = store().messages['sub-conv-1'];
+      expect(msgs.map((m) => m.id)).toEqual([
+        'sub-user-sub-task-1',
+        'a1',
+        'sub-user-sub-task-2',
+        'sub-loading-sub-task-2',
+      ]);
+      expect(msgs[2]).toMatchObject({ role: 'user', content: '再查一下端口' });
+      expect(store().conversations['sub-conv-1'].title).toBe('t');
+
+      // 同一轮再登记一次（toolResult 兜底）仍是幂等的
+      expect(
+        store().registerSubConversation('sub-conv-1', 'conn-1', 't', 'sub-task-2', '再查一下端口', 'main-conv-1'),
+      ).toBeNull();
+      expect(store().messages['sub-conv-1']).toHaveLength(4);
+    });
+
     it('does not touch the active conversation', () => {
       useConversationStore.setState({
         conversations: {},

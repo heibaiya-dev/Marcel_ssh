@@ -16,12 +16,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+use super::core::format::{SegmentFile, SnapshotFile};
 use super::core::{
     diff, export_all, flatten_scoped, DiffCtx, Hlc, HlcClock, IdMapRegistry, Mirror, Op, OpKind,
     Path, Platform, ScopeRules, Seg,
 };
-use super::core::format::{SegmentFile, SnapshotFile};
-use super::store::{valid_source_key, Cursor, DeviceRecord, Dirty, LedgerFiles, LoadedLedger, PersistedState};
+use super::store::{
+    valid_source_key, Cursor, DeviceRecord, Dirty, LedgerFiles, LoadedLedger, PersistedState,
+};
 use super::types::HeldSummary;
 use crate::error::AppError;
 
@@ -134,7 +136,11 @@ impl Ledger {
     /// 等待确认的删除，按源汇总（给状态用）。只数被删的元素（Tombstone），不数随同扣下的顺序叶子。
     pub fn held_summary(&self) -> Vec<HeldSummary> {
         let mut by_source: BTreeMap<&str, usize> = BTreeMap::new();
-        for op in self.held.iter().filter(|o| matches!(o.kind, OpKind::Tombstone)) {
+        for op in self
+            .held
+            .iter()
+            .filter(|o| matches!(o.kind, OpKind::Tombstone))
+        {
             *by_source.entry(op.source.as_str()).or_default() += 1;
         }
         by_source
@@ -329,7 +335,13 @@ impl Ledger {
 
     // ── 吸收远端文件 ─────────────────────────────────────────────────────
 
-    fn touch_device(&mut self, device_id: &str, info: &super::core::DeviceInfo, newest_ms: Option<u64>, now_rfc3339: impl Fn(u64) -> String) {
+    fn touch_device(
+        &mut self,
+        device_id: &str,
+        info: &super::core::DeviceInfo,
+        newest_ms: Option<u64>,
+        now_rfc3339: impl Fn(u64) -> String,
+    ) {
         let rec = self.st.devices.entry(device_id.to_string()).or_default();
         rec.name = info.name.clone();
         rec.platform = info.platform.clone();
@@ -382,7 +394,11 @@ impl Ledger {
         let newest = file
             .mirrors
             .values()
-            .flat_map(|m| m.leaves().map(|(_, e)| &e.hlc).chain(m.tombstones().map(|(_, h)| h)))
+            .flat_map(|m| {
+                m.leaves()
+                    .map(|(_, e)| &e.hlc)
+                    .chain(m.tombstones().map(|(_, h)| h))
+            })
             .filter(|h| h.device == file.device.id)
             .map(|h| h.ms)
             .max();
@@ -501,8 +517,14 @@ mod tests {
     }
 
     fn cap(l: &mut Ledger, doc: &Value, wall: u64) -> CaptureStats {
-        l.capture_into("connections", &CONNECTIONS_RULES, Platform::Desktop, wall, doc)
-            .unwrap()
+        l.capture_into(
+            "connections",
+            &CONNECTIONS_RULES,
+            Platform::Desktop,
+            wall,
+            doc,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -523,9 +545,10 @@ mod tests {
         doc2["connections"][0]["name"] = json!("renamed");
         assert_eq!(cap(&mut l, &doc2, 3000).captured, 1);
         let visible = l.mirrors["connections"].visible();
-        assert!(visible
-            .values()
-            .any(|v| v == &json!("renamed")), "本机 op 先合并进镜像");
+        assert!(
+            visible.values().any(|v| v == &json!("renamed")),
+            "本机 op 先合并进镜像"
+        );
     }
 
     #[test]
@@ -542,7 +565,13 @@ mod tests {
         assert_eq!(l.held.len(), 7);
         // 镜像里它们仍然活着（没合并 Tombstone）
         assert_eq!(l.mirrors["connections"].tombstone_count(), 0);
-        assert_eq!(l.held_summary(), vec![HeldSummary { source: "connections".into(), count: 6 }]);
+        assert_eq!(
+            l.held_summary(),
+            vec![HeldSummary {
+                source: "connections".into(),
+                count: 6
+            }]
+        );
         // 基线已经推进：下一次捕获不会再把同一批删除重新发现一遍
         assert_eq!(cap(&mut l, &conns(4), 3000), CaptureStats::default());
         assert_eq!(l.held.len(), 7);
@@ -555,7 +584,11 @@ mod tests {
         cap(&mut l, &conns(10), 1000);
         l.outbox.clear();
         let s = cap(&mut l, &conns(6), 2000);
-        assert_eq!((s.held, s.captured), (0, 5), "4 个 Tombstone + 新的顺序叶子");
+        assert_eq!(
+            (s.held, s.captured),
+            (0, 5),
+            "4 个 Tombstone + 新的顺序叶子"
+        );
         assert_eq!(l.mirrors["connections"].tombstone_count(), 4);
 
         // 删 5 个但列表有 20 个：不到一半
@@ -589,7 +622,10 @@ mod tests {
         l2.set_applied("connections", true);
         assert_eq!(l2.discard_held(), 9);
         assert!(l2.held.is_empty() && l2.outbox.is_empty());
-        assert!(l2.needs_apply("connections"), "撤销后要让下一轮把被删的元素写回本机");
+        assert!(
+            l2.needs_apply("connections"),
+            "撤销后要让下一轮把被删的元素写回本机"
+        );
     }
 
     #[test]
@@ -598,18 +634,26 @@ mod tests {
         let mut doc = json!({"keep": 1, "legacy": 2});
         // 用一个没有任何作用域规则的空规则集
         let rules = &crate::sync::core::ScopeRules::SHARED_ALL;
-        l.capture_into("settings", rules, Platform::Desktop, 1000, &doc).unwrap();
+        l.capture_into("settings", rules, Platform::Desktop, 1000, &doc)
+            .unwrap();
         l.outbox.clear();
 
         l.suppress_pending.insert("settings".into());
         doc.as_object_mut().unwrap().remove("legacy");
-        let s = l.capture_into("settings", rules, Platform::Desktop, 2000, &doc).unwrap();
-        assert_eq!(s.captured, 0, "升级后第一次捕获：新版本删掉的字段不发 Remove");
+        let s = l
+            .capture_into("settings", rules, Platform::Desktop, 2000, &doc)
+            .unwrap();
+        assert_eq!(
+            s.captured, 0,
+            "升级后第一次捕获：新版本删掉的字段不发 Remove"
+        );
         assert!(l.suppress_pending.is_empty());
 
         // 之后的删除照常上报
         doc.as_object_mut().unwrap().remove("keep");
-        let s = l.capture_into("settings", rules, Platform::Desktop, 3000, &doc).unwrap();
+        let s = l
+            .capture_into("settings", rules, Platform::Desktop, 3000, &doc)
+            .unwrap();
         assert_eq!(s.captured, 1);
     }
 
@@ -622,11 +666,22 @@ mod tests {
             source: "settings".into(),
             path: vec![Seg::key("a")],
             kind: OpKind::Set(json!("cloud")),
-            hlc: Hlc { ms: 5, counter: 0, device: "A".into() },
+            hlc: Hlc {
+                ms: 5,
+                counter: 0,
+                device: "A".into(),
+            },
         });
         l.mirrors.insert("settings".into(), cloud);
         let rules = &crate::sync::core::ScopeRules::SHARED_ALL;
-        l.capture_into("settings", rules, Platform::Desktop, 9999, &json!({"a": "local", "b": 1})).unwrap();
+        l.capture_into(
+            "settings",
+            rules,
+            Platform::Desktop,
+            9999,
+            &json!({"a": "local", "b": 1}),
+        )
+        .unwrap();
         let vis = l.mirrors["settings"].visible();
         assert_eq!(vis[&vec![Seg::key("a")]], json!("cloud"), "云端赢");
         assert_eq!(vis[&vec![Seg::key("b")]], json!(1), "本机独有的保留");
@@ -641,7 +696,11 @@ mod tests {
             source: "settings".into(),
             path: vec![Seg::key("a")],
             kind: OpKind::Set(json!(1)),
-            hlc: Hlc { ms: 1, counter: 0, device: "X".into() },
+            hlc: Hlc {
+                ms: 1,
+                counter: 0,
+                device: "X".into(),
+            },
         });
         l.mirrors.insert("settings".into(), m);
         assert!(l.needs_apply("settings"), "镜像里有、从没落地过");

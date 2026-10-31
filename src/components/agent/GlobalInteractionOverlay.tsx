@@ -4,6 +4,7 @@ import { isLocalSessionId } from '@/lib/toolCatalog';
 import { useInteractionStore } from '@/stores/interactionStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useConversationStore } from '@/stores/conversationStore';
+import { sessionConversationBindingManager } from '@/stores/sessionConversationBindingManager';
 import { useTaskStore } from '@/stores/taskStore';
 import ApprovalDialog from '@/components/agent/ApprovalDialog';
 import QuestionPanel from '@/components/agent/QuestionPanel';
@@ -57,7 +58,6 @@ export default function GlobalInteractionOverlay() {
   const setActiveSession = useSessionStore((s) => s.setActiveSession);
 
   const activeConversationId = useConversationStore((s) => s.activeConversationId);
-  const switchConversation = useConversationStore((s) => s.switchConversation);
 
   // 用户是否主动最小化了当前交互
   const [minimized, setMinimized] = useState(false);
@@ -86,13 +86,13 @@ export default function GlobalInteractionOverlay() {
       setActiveSession(jumpSessionId);
     }
     if (current.conversationId && activeConversationId !== current.conversationId) {
-      void switchConversation(current.conversationId);
+      void sessionConversationBindingManager.openConversation(current.conversationId);
     }
     // 触发飞入动画并自动最小化弹窗
     const origin = e ? { x: e.clientX, y: e.clientY } : undefined;
     flyToInteractionCapsule(origin);
     setMinimized(true);
-  }, [current, activeSessionId, activeConversationId, setActiveSession, switchConversation]);
+  }, [current, activeSessionId, activeConversationId, setActiveSession]);
 
   /**
    * 收起当前交互：飞到右下角浮动药丸，**不作答**。

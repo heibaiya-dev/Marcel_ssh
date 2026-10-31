@@ -608,7 +608,10 @@ pub async fn sftp_home_dir(
 ) -> Result<String, AppError> {
     state
         .ssh_manager
-        .with_shared_sftp(&session_id, |sftp| async move { sftp.canonicalize(".").await })
+        .with_shared_sftp(
+            &session_id,
+            |sftp| async move { sftp.canonicalize(".").await },
+        )
         .await?
         .map_err(|e| AppError::Ssh(format!("获取家目录失败: {}", e)))
 }

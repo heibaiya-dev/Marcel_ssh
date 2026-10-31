@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 use crate::error::AppError;
-use crate::llm::error::{parse_retry_conditions, RetryCondition};
+use crate::llm::error::{parse_retry_conditions, RequestPhase, RetryCondition};
 use crate::llm::openai::{ModelInfo, OpenAiProvider, TextSink};
 use crate::llm::provider::{LlmConfig, LlmMessage, ToolDefinition};
 use crate::llm::streaming::StreamEvent;
@@ -171,6 +171,8 @@ impl LlmManager {
                             max_attempts,
                             delay_secs: delay.as_secs_f32(),
                             last_error: err_msg,
+                            // 空响应没有可见正文；思考过程照旧由下一轮覆盖
+                            discard_partial: false,
                         });
                         // sink（摘要等内嵌调用）：重试新一轮前清空已展示进度，
                         // 与错误重试路径一致，避免残留"上一尝试"的进度文本。
@@ -209,12 +211,20 @@ impl LlmManager {
                         delay.as_secs_f32(),
                     );
 
+                    // 首包后断线：前端已经画出了半截回复，通知它撤掉再等新一轮。
+                    let discard_partial = phase == RequestPhase::Streaming;
                     let _ = event_tx.send(StreamEvent::Retrying {
                         attempt,
                         max_attempts,
                         delay_secs: delay.as_secs_f32(),
                         last_error: err_msg,
+                        discard_partial,
                     });
+                    if discard_partial {
+                        if let Some(s) = sink {
+                            (s.reset)();
+                        }
+                    }
 
                     // 3. 重试等待（支持毫秒级打断取消）
                     if let Some(ref mut rx) = cancel_rx {
@@ -325,5 +335,103 @@ mod tests {
         assert!(res.is_err());
         // Max retries is 2, so it should have emitted 2 retrying events
         assert_eq!(retrying_events.load(Ordering::SeqCst), 2);
+    }
+
+    /// 读完一条 HTTP 请求（头 + Content-Length 声明的体），返回后由调用方写响应。
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut declared: Option<usize> = None;
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            if declared.is_none() {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:")?.trim().parse().ok())
+                        .unwrap_or(0);
+                    declared = Some(pos + 4 + len);
+                }
+            }
+            if declared.is_some_and(|d| buf.len() >= d) {
+                return;
+            }
+        }
+    }
+
+    /// 流式输出途中断线（首包之后）也要自动重试：第一次连接吐出半截正文就断，
+    /// 第二次完整返回。重试事件必须带 `discard_partial`，最终拿到完整的第二轮。
+    #[tokio::test]
+    async fn manager_retries_mid_stream_disconnect_and_flags_discard() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_srv = attempts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                read_http_request(&mut stream).await;
+                let n = attempts_srv.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // 声明很长的体，只发一段 SSE 就断开 → 客户端读流报网络错
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 100000\r\n\r\n\
+                              data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n",
+                        )
+                        .await;
+                    let _ = stream.flush().await;
+                    drop(stream);
+                } else {
+                    let body =
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"whole answer\"}}]}\n\n\
+                                data: [DONE]\n\n";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let mut config = LlmConfig::default();
+        config.base_url = Some(format!("http://{addr}/v1"));
+        config.api_key = "test-key".into();
+        config.max_retries = 2;
+        config.retry_delay_secs = 0.01;
+        let manager = LlmManager::new(config).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            let mut discards = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                if let StreamEvent::Retrying {
+                    discard_partial, ..
+                } = ev
+                {
+                    discards.push(discard_partial);
+                }
+            }
+            discards
+        });
+
+        let res = manager
+            .stream_chat(&[LlmMessage::user("hi")], &[], &tx, None)
+            .await;
+        drop(tx);
+        let discards = collector.await.unwrap();
+
+        let msg = res.expect("断线后应自动重试成功");
+        assert_eq!(msg.content, "whole answer");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(discards, vec![true]);
     }
 }

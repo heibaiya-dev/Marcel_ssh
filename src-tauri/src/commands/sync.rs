@@ -51,10 +51,7 @@ pub async fn sync_join_manual(
     secret: Option<String>,
     recovery_key: String,
 ) -> Result<(), AppError> {
-    state
-        .sync
-        .join_manual(storage, secret, recovery_key)
-        .await
+    state.sync.join_manual(storage, secret, recovery_key).await
 }
 
 /// 立即同步一次。前端在订阅好同步事件后第一次调用它，才会解除启动后的「等前端」闸门。
@@ -109,9 +106,6 @@ pub async fn sync_confirm_held(state: State<'_, AppState>, accept: bool) -> Resu
 
 /// 停止同步。本机配置数据不动；`wipe_remote` 同时删掉云端本应用的同步文件。
 #[tauri::command]
-pub async fn sync_disable(
-    state: State<'_, AppState>,
-    wipe_remote: bool,
-) -> Result<(), AppError> {
+pub async fn sync_disable(state: State<'_, AppState>, wipe_remote: bool) -> Result<(), AppError> {
     state.sync.disable(wipe_remote).await
 }

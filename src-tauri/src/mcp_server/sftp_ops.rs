@@ -86,10 +86,7 @@ impl SftpExecutor {
         );
 
         if !Path::new(local_path).exists() {
-            return Err(AppError::Config(format!(
-                "本地文件不存在: {}",
-                local_path
-            )));
+            return Err(AppError::Config(format!("本地文件不存在: {}", local_path)));
         }
 
         let start = Instant::now();
@@ -234,15 +231,12 @@ impl SftpExecutor {
         } else {
             match sftp.remove_file(remote_path).await {
                 Ok(()) => Ok(()),
-                Err(file_err) => sftp
-                    .remove_dir(remote_path)
-                    .await
-                    .map_err(|dir_err| {
-                        AppError::Ssh(format!(
-                            "删除失败（按文件删：{}；按空目录删：{}）",
-                            file_err, dir_err
-                        ))
-                    }),
+                Err(file_err) => sftp.remove_dir(remote_path).await.map_err(|dir_err| {
+                    AppError::Ssh(format!(
+                        "删除失败（按文件删：{}；按空目录删：{}）",
+                        file_err, dir_err
+                    ))
+                }),
             }
         }
     }
@@ -251,7 +245,8 @@ impl SftpExecutor {
     fn remove_recursive<'a>(
         sftp: &'a SftpSession,
         path: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let mut dir = sftp
                 .read_dir(path)

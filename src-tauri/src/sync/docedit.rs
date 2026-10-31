@@ -179,9 +179,17 @@ mod tests {
     #[test]
     fn set_leaf_creates_missing_parents_and_elements() {
         let mut doc = json!({});
-        assert!(set_leaf(&mut doc, &[k("l"), id("e1"), k("name")], json!("n")));
+        assert!(set_leaf(
+            &mut doc,
+            &[k("l"), id("e1"), k("name")],
+            json!("n")
+        ));
         assert_eq!(doc, json!({"l": [{"id": "e1", "name": "n"}]}));
-        assert!(set_leaf(&mut doc, &[k("l"), id("e1"), k("host")], json!("h")));
+        assert!(set_leaf(
+            &mut doc,
+            &[k("l"), id("e1"), k("host")],
+            json!("h")
+        ));
         assert_eq!(doc["l"][0]["host"], json!("h"));
         assert_eq!(doc["l"].as_array().unwrap().len(), 1, "不重复建元素");
     }

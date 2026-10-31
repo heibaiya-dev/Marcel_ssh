@@ -71,8 +71,7 @@ pub fn set_plugin_event_subscribers(count: usize) {
 /// 无插件订阅时只发原通道——镜像那份要多一次 JSON 包装 + 全 webview 广播，
 /// 终端刷屏类高频事件下是白付的（见 PLUGIN_EVENT_SUBSCRIBERS 门控）。
 pub fn emit_event<S: serde::Serialize + Clone>(app: &AppHandle, event: &str, payload: S) {
-    let mirror =
-        PLUGIN_EVENT_SUBSCRIBERS.load(std::sync::atomic::Ordering::Relaxed) > 0;
+    let mirror = PLUGIN_EVENT_SUBSCRIBERS.load(std::sync::atomic::Ordering::Relaxed) > 0;
     emit_event_with_mirror(app, event, payload, mirror);
 }
 

@@ -166,6 +166,43 @@ class SessionConversationBindingManager {
   }
 
   /**
+   * 从「任务中心 / 交互弹窗 / 工具卡 / 返回主对话」这类入口打开一条对话。
+   *
+   * 这些入口以前直接 `switchConversation(id)`、不带机器会话 id，只改显示、不改绑定：
+   * 跳到另一条主对话（或另一条主对话的子对话）后，这台机器仍绑在旧对话上，
+   * 输入区判定「归属对不上」就一直卡在「会话尚未就绪」。统一经这里：
+   * - 主对话：走 `selectOrJumpToConversation`（占用检测 + 绑定，与历史列表同路径）；
+   * - 子对话：绑定只落到它的主对话（子对话从不独占绑定，见 `draftConversationIdFor`
+   *   按根对话匹配），再切显示；
+   * - 对话元数据未知（重启后从卡片跳转）或与当前机器会话不是同一连接：照旧只切显示，
+   *   `switchConversation` 会补拉元数据，这里不替它猜归属。
+   */
+  public async openConversation(conversationId: string): Promise<void> {
+    const convStore = useConversationStore.getState();
+    const conv = convStore.conversations[conversationId];
+    const sessionId = useSessionStore.getState().activeSessionId;
+    const session = sessionId ? useSessionStore.getState().sessions[sessionId] : undefined;
+    if (!conv || !sessionId || !session || session.configId !== conv.connectionId) {
+      await convStore.switchConversation(conversationId);
+      return;
+    }
+
+    const rootId = conv.parentConversationId;
+    if (!rootId) {
+      await this.selectOrJumpToConversation(conversationId, sessionId);
+      return;
+    }
+
+    const bound = convStore.activeConversationBySession[sessionId];
+    const boundRoot = bound ? (convStore.conversations[bound]?.parentConversationId ?? bound) : undefined;
+    const occupying = this.findOccupyingSession(rootId);
+    if (boundRoot !== rootId && (!occupying || occupying.sessionId === sessionId)) {
+      convStore.bindConversationToSession(sessionId, rootId);
+    }
+    await convStore.switchConversation(conversationId);
+  }
+
+  /**
    * 分叉当前会话并切到分叉：锚点所在回合（缺省 = 整个会话）之前的历史被复制成
    * 一条独立会话，原会话原封不动留在列表里，随时可以回去继续。锚点由
    * `resolveForkAnchor`（`lib/forkConversation.ts`）解析：库内 id 优先，live

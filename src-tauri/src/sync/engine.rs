@@ -372,10 +372,15 @@ impl SyncEngine {
         if let Some(dk) = &self.dk {
             return Ok(dk.clone());
         }
-        let Some(b64) = self.deps.secrets.get(&SecretSlot::SyncDataKey)?.map(Zeroizing::new)
+        let Some(b64) = self
+            .deps
+            .secrets
+            .get(&SecretSlot::SyncDataKey)?
+            .map(Zeroizing::new)
         else {
             return Err(AppError::Other(
-                "找不到同步的加密密钥（可能被系统清理了）。请先停止同步，再用恢复密钥重新加入。".into(),
+                "找不到同步的加密密钥（可能被系统清理了）。请先停止同步，再用恢复密钥重新加入。"
+                    .into(),
             ));
         };
         let dk = DataKey::from_b64(&b64)?;
@@ -444,7 +449,10 @@ impl SyncEngine {
 
         // 6. 压缩（失败不影响这一轮的结论）
         if let Err(e) = self.maybe_compact(&backend, &dk).await {
-            log::warn!("同步：压缩本机增量段失败（下一轮再试）: {}", plain_error(&e));
+            log::warn!(
+                "同步：压缩本机增量段失败（下一轮再试）: {}",
+                plain_error(&e)
+            );
         }
 
         let mut errors = report.soft_errors;
@@ -591,8 +599,7 @@ impl SyncEngine {
                 };
                 let snap = decode_snapshot(dk, device, latest, &bytes)
                     .map_err(|e| self.classify(device, e))?;
-                self.ledger
-                    .ingest_snapshot(&snap, wall, rfc3339_from_ms);
+                self.ledger.ingest_snapshot(&snap, wall, rfc3339_from_ms);
                 cursor = Cursor {
                     snap: latest,
                     seg: latest,
@@ -613,8 +620,8 @@ impl SyncEngine {
             else {
                 return Ok(());
             };
-            let seg = decode_segment(dk, device, seq, &bytes)
-                .map_err(|e| self.classify(device, e))?;
+            let seg =
+                decode_segment(dk, device, seq, &bytes).map_err(|e| self.classify(device, e))?;
             self.ledger.ingest_segment(&seg, wall, rfc3339_from_ms);
             cursor.seg = seq;
             self.ledger.set_cursor(device, cursor.clone());
@@ -639,7 +646,11 @@ impl SyncEngine {
                 ApplyMode::Normal
             };
             if let Err(e) = self.merge_into_doc(&adapter, mode).await {
-                log::warn!("同步：{} 落地失败（下一轮重试）: {}", source_label(key), plain_error(&e));
+                log::warn!(
+                    "同步：{} 落地失败（下一轮重试）: {}",
+                    source_label(key),
+                    plain_error(&e)
+                );
                 errors.push(format!("{}：{}", source_label(key), plain_error(&e)));
             }
         }
@@ -1006,7 +1017,15 @@ impl SyncEngine {
         self.ledger.st.storage = Some(storage.clone());
         self.ledger.st.last_app_version = self.deps.app_version.clone();
         self.ledger.st.protected_path = protected;
-        let built = self.create_inner(&backend, &dk, &wrapped, secret.as_deref().map(|s| s.as_str()), &rk).await;
+        let built = self
+            .create_inner(
+                &backend,
+                &dk,
+                &wrapped,
+                secret.as_deref().map(|s| s.as_str()),
+                &rk,
+            )
+            .await;
         match built {
             Ok(result) => {
                 backend.close().await;
@@ -1017,9 +1036,7 @@ impl SyncEngine {
             }
             Err(e) => {
                 // 回滚：远端只可能留下本机的设备目录与 meta（尽力清理），本机账本放回去
-                let _ = backend
-                    .delete(&format::device_dir(&device_id))
-                    .await;
+                let _ = backend.delete(&format::device_dir(&device_id)).await;
                 let _ = backend.delete(META_FILE).await;
                 backend.close().await;
                 self.ledger = previous;
@@ -1094,7 +1111,9 @@ impl SyncEngine {
         if let (Some(StorageConfig::WebDav { .. }), Some(pw)) =
             (&self.ledger.st.storage, storage_secret)
         {
-            self.deps.secrets.set(&SecretSlot::SyncStoragePassword, pw)?;
+            self.deps
+                .secrets
+                .set(&SecretSlot::SyncStoragePassword, pw)?;
         }
         self.ledger.st.enabled = true;
         self.ledger.mark_all_dirty();
@@ -1167,10 +1186,15 @@ impl SyncEngine {
                         .clone()
                         .and_then(|v| serde_json::from_value::<SftpBundle>(v).ok())
                         .ok_or_else(|| {
-                            AppError::Other("同步码里缺少 SFTP 服务器的信息，请在另一台设备上重新生成同步码。".into())
+                            AppError::Other(
+                                "同步码里缺少 SFTP 服务器的信息，请在另一台设备上重新生成同步码。"
+                                    .into(),
+                            )
                         })?;
                     check_bundle_supported(&bundle)?;
-                    installed = self.install_bundle(&bundle, secret.as_deref().map(|s| s.as_str())).await?;
+                    installed = self
+                        .install_bundle(&bundle, secret.as_deref().map(|s| s.as_str()))
+                        .await?;
                 }
                 (storage, secret, rk)
             }
@@ -1199,7 +1223,8 @@ impl SyncEngine {
         let Some(meta_bytes) = backend.get(META_FILE).await.map_err(storage_err)? else {
             backend.close().await;
             return Err(AppError::Other(
-                "在这个位置没有找到同步数据。请确认存储位置（地址 / 目录）和另一台设备上的一致。".into(),
+                "在这个位置没有找到同步数据。请确认存储位置（地址 / 目录）和另一台设备上的一致。"
+                    .into(),
             ));
         };
         let meta = SyncMeta::from_bytes(&meta_bytes)?;
@@ -1285,7 +1310,9 @@ impl SyncEngine {
             .secrets
             .set(&SecretSlot::SyncRecoveryKey, rk.canonical())?;
         if let (StorageConfig::WebDav { .. }, Some(pw)) = (storage, storage_secret) {
-            self.deps.secrets.set(&SecretSlot::SyncStoragePassword, pw)?;
+            self.deps
+                .secrets
+                .set(&SecretSlot::SyncStoragePassword, pw)?;
         }
         self.ledger.st.enabled = true;
         // 所有源都已经在加入时对齐过镜像
@@ -1503,7 +1530,10 @@ pub async fn build_sync_code(
             .cloned()
             .ok_or_else(|| AppError::Other("同步用的服务器连接已经被删除了。".into()))?;
         if connection.auth_method == "Password" {
-            if let Some(pw) = deps.secrets.get(&SecretSlot::SshPassword(connection_id.clone()))? {
+            if let Some(pw) = deps
+                .secrets
+                .get(&SecretSlot::SshPassword(connection_id.clone()))?
+            {
                 secret = Zeroizing::new(pw);
             }
         }

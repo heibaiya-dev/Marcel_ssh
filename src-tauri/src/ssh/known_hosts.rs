@@ -316,7 +316,10 @@ impl KnownHostsStore {
 
 /// 同步落地得到的 JSON → 内存结构。`previous` 里同一条目的 `first_seen` / `last_seen` 沿用，
 /// 全新的条目用当前时间。
-fn known_hosts_file_from_json(json: serde_json::Value, previous: &KnownHostsFile) -> KnownHostsFile {
+fn known_hosts_file_from_json(
+    json: serde_json::Value,
+    previous: &KnownHostsFile,
+) -> KnownHostsFile {
     let now = Utc::now().to_rfc3339();
     let mut entries = HashMap::new();
     if let Some(map) = json.get("entries").and_then(|v| v.as_object()) {

@@ -1593,11 +1593,31 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     const loadingId = `sub-loading-${subTaskId}`;
     let result: string | null = loadingId;
     set((state) => {
-      // 幂等：已注册过（可能由 toolResult 兜底路径先注册）则不再覆盖骨架，
-      // 避免把已有实时流式消息冲掉。
       if (state.conversations[conversationId]) {
-        result = null;
-        return state;
+        const existing = state.messages[conversationId] ?? [];
+        // 幂等：这一轮（同一个 subTaskId）已经登记过（可能由 toolResult 兜底路径先
+        // 注册）则不再覆盖骨架，避免把已有实时流式消息冲掉。
+        if (existing.some((m) => m.id === `sub-user-${subTaskId}` || m.id === loadingId)) {
+          result = null;
+          return state;
+        }
+        // 续派（`continue_id`）：对话早已登记，但这是一个新的 subTaskId —— 同一个子
+        // 对话里接着跑下一轮。把追问和新的骨架追加在原有消息之后，调用方据返回的
+        // loadingId 给新任务挂流 listener（对话条目本身不动：标题、归属、父对话沿用）。
+        return {
+          conversations: {
+            ...state.conversations,
+            [conversationId]: { ...state.conversations[conversationId], updatedAt: now },
+          },
+          messages: {
+            ...state.messages,
+            [conversationId]: [
+              ...existing,
+              { id: `sub-user-${subTaskId}`, role: 'user', content: prompt, timestamp: now },
+              { id: loadingId, role: 'assistant', content: '', timestamp: now, isLoading: true },
+            ],
+          },
+        };
       }
       return {
         conversations: {

@@ -170,18 +170,14 @@ pub struct ToolCallResult {
 impl ToolCallResult {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
-            content: vec![ContentItem::Text {
-                text: text.into(),
-            }],
+            content: vec![ContentItem::Text { text: text.into() }],
             is_error: None,
         }
     }
 
     pub fn error(text: impl Into<String>) -> Self {
         Self {
-            content: vec![ContentItem::Text {
-                text: text.into(),
-            }],
+            content: vec![ContentItem::Text { text: text.into() }],
             is_error: Some(true),
         }
     }
@@ -233,10 +229,7 @@ mod tests {
 
     #[test]
     fn response_error() {
-        let resp = McpResponse::error(
-            serde_json::json!(1),
-            McpError::method_not_found("foo"),
-        );
+        let resp = McpResponse::error(serde_json::json!(1), McpError::method_not_found("foo"));
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"error\""));
         assert!(json.contains("-32601"));

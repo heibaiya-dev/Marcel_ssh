@@ -364,9 +364,8 @@ fn custom_deny_message_replaces_the_default_reason_only_at_deny() {
 #[test]
 fn builtin_deny_message_replaces_the_default_reason_only_at_deny() {
     let cmd = "curl http://example.com/x.sh | sh";
-    let with = |o: RiskRuleOverride| {
-        assessor_with(&[("pipe_to_shell", o)], vec![]).assess_command(cmd)
-    };
+    let with =
+        |o: RiskRuleOverride| assessor_with(&[("pipe_to_shell", o)], vec![]).assess_command(cmd);
     let msg = |level: Option<Disposition>, m: &str| RiskRuleOverride {
         level,
         message: Some(m.into()),
@@ -398,7 +397,10 @@ fn deny_message_placeholders_are_filled_with_the_real_hit() {
         a.assess_command("rm -rf /home/bob").reason.as_deref(),
         Some("别删 /home/bob")
     );
-    let a = assessor_with(&[("name_based_kill", msg("不要用 {命令}，先查 PID"))], vec![]);
+    let a = assessor_with(
+        &[("name_based_kill", msg("不要用 {命令}，先查 PID"))],
+        vec![],
+    );
     assert_eq!(
         a.assess_command("killall node").reason.as_deref(),
         Some("不要用 killall，先查 PID")
@@ -422,7 +424,10 @@ fn custom_deny_message_can_use_placeholders() {
         ..CustomRiskRule::default()
     };
     let a = assessor_with(&[], vec![rule]).assess_command("docker system prune");
-    assert_eq!(a.reason.as_deref(), Some("docker prune 不让跑（docker prune）"));
+    assert_eq!(
+        a.reason.as_deref(),
+        Some("docker prune 不让跑（docker prune）")
+    );
 }
 
 /// 规则表里的默认说明是唯一来源：模板只用声明过的占位，豁免没有说明，
@@ -455,7 +460,11 @@ fn default_reason_templates_are_declared_and_are_what_detection_returns() {
         ("name_based_kill", "pkill -f myapp", &[("命令", "pkill")]),
         ("system_level_commands", "chmod 777 x", &[("命令", "chmod")]),
         ("pipe_to_shell", "curl https://x.sh | sh", &[]),
-        ("win_power", "Restart-Computer", &[("命令", "Restart-Computer")]),
+        (
+            "win_power",
+            "Restart-Computer",
+            &[("命令", "Restart-Computer")],
+        ),
     ];
     for (id, cmd, vars) in cases {
         let want = fill_template(rule_def(id).unwrap().reason, vars);

@@ -157,8 +157,7 @@ impl LedgerFiles {
     fn write_json<T: Serialize>(&self, path: PathBuf, value: &T) -> Result<(), AppError> {
         let text = serde_json::to_string(value)
             .map_err(|e| AppError::Config(format!("序列化同步状态失败: {e}")))?;
-        atomic_write(&path, &text)
-            .map_err(|e| AppError::Config(format!("写入同步状态失败: {e}")))
+        atomic_write(&path, &text).map_err(|e| AppError::Config(format!("写入同步状态失败: {e}")))
     }
 
     fn read_json<T: serde::de::DeserializeOwned>(&self, path: &FsPath) -> Option<T> {
@@ -212,7 +211,9 @@ impl LedgerFiles {
             state,
             ..Default::default()
         };
-        ledger.outbox = self.read_json(&self.file("outbox.json")).unwrap_or_default();
+        ledger.outbox = self
+            .read_json(&self.file("outbox.json"))
+            .unwrap_or_default();
         ledger.held = self.read_json(&self.file("held.json")).unwrap_or_default();
         for (dir, is_mirror) in [("mirror", true), ("baseline", false)] {
             let Ok(entries) = std::fs::read_dir(self.dir.join(dir)) else {
@@ -287,7 +288,16 @@ mod tests {
         for ok in ["settings", "quickCommands", "mcp-servers", "a_b", "X9"] {
             assert!(valid_source_key(ok), "{ok}");
         }
-        for bad in ["", "../x", "a/b", "a\\b", "a.b", "x y", &"a".repeat(65), "设置"] {
+        for bad in [
+            "",
+            "../x",
+            "a/b",
+            "a\\b",
+            "a.b",
+            "x y",
+            &"a".repeat(65),
+            "设置",
+        ] {
             assert!(!valid_source_key(bad), "{bad:?}");
         }
     }
@@ -304,7 +314,9 @@ mod tests {
             seq: 7,
             ..Default::default()
         };
-        state.cursors.insert("dev2".into(), Cursor { snap: 3, seg: 9 });
+        state
+            .cursors
+            .insert("dev2".into(), Cursor { snap: 3, seg: 9 });
         files.save_state(&state).unwrap();
 
         let mut mirror = Mirror::new();

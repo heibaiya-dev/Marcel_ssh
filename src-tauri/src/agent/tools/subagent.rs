@@ -69,6 +69,10 @@ pub(crate) struct SubTaskStartEvent {
     /// （见 `src/lib/types.ts` 的 `SubTaskStartPayload.side`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub side: Option<String>,
+    /// `true` = 这是对**已有**子对话的续派（`continue_id`）：前端不新建子对话，而是在
+    /// 原对话里追加这条追问并重新挂上流 listener。首次派发不写这个键（事件形状不变）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumed: bool,
 }
 
 fn default_sub_mode() -> String {
@@ -129,7 +133,10 @@ pub(crate) fn resolve_subagent_candidates(registry: &LlmRegistry) -> Vec<Subagen
             continue;
         };
         if !channel.enabled {
-            log::debug!("子agent 候选 {} 所在渠道已禁用，已跳过", registry.model_label(model));
+            log::debug!(
+                "子agent 候选 {} 所在渠道已禁用，已跳过",
+                registry.model_label(model)
+            );
             continue;
         }
         // 同一模型重复条目（手改配置才会出现，UI 已排除）：直接只保留第一条，
@@ -150,7 +157,11 @@ pub(crate) fn resolve_subagent_candidates(registry: &LlmRegistry) -> Vec<Subagen
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" "),
-            channel_name: channel.name.split_whitespace().collect::<Vec<_>>().join(" "),
+            channel_name: channel
+                .name
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
         });
     }
     let mut out: Vec<SubagentModelCandidate> = Vec::new();
@@ -258,6 +269,132 @@ pub(crate) fn lookup_model_choice(
 /// 「模型 X 不在候选清单」带回给主 agent 的提示（拼在结果标题后）。
 pub(crate) fn unknown_model_note(label: &str) -> String {
     format!("（模型 \"{label}\" 不在候选清单，已沿用会话模型）")
+}
+
+// ── 续派（`continue_id`，`subagent` 与 `local_subagent` 共用）────────────────
+//
+// 让主 agent 给**已经跑过**的子 agent（完成 / 失败 / 被取消均可）再发一条消息，沿它
+// 现有的子对话接着干：历史从库里整段回灌，不重新建子对话。用途两个：一是子 agent 因
+// 瞬时错误死掉后接着做而不是从头来；二是追问细节，子 agent 不必把已读过的东西再读一遍。
+// 执行侧 / 模式 / 目标机器取自首次派发时落在会话行上的 [`SubDispatch`]，调用方传的
+// `mode` / `host` 在续派时被忽略（续派不能改变子 agent 的权限与所在机器）。
+
+/// `continue_id` 参数的 schema（两个工具共用）。
+pub(super) fn continue_id_schema() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "description": "Optional. Continue an EARLIER subagent (finished, failed or cancelled) instead of starting a fresh one: pass the `continue_id` shown at the end of that subagent's result. The subagent resumes in its existing conversation with its full context (everything it already read and did), and `prompt` becomes your follow-up message to it — so keep `prompt` short and don't repeat the original task. Use it to ask a follow-up question without making it re-read everything, or to resume a subagent that died from a transient error instead of starting over. Its mode and machine stay as originally dispatched (`mode` / `host` are ignored). Only one run per subagent at a time."
+    })
+}
+
+/// 附在每种结果（完成 / 失败 / 取消 / 空结论）末尾的一行，让模型知道怎么接着用它。
+pub(super) fn continue_hint(sub_conversation_id: &str) -> String {
+    format!(
+        "\n\n如需追问，或让它接着做（含失败/被取消后继续），用 continue_id=\"{sub_conversation_id}\" 再派发：它保留全部上下文，prompt 只需写追加的指令。"
+    )
+}
+
+/// 工具入参里的 `continue_id`（trim 后非空才算传了）。
+pub(super) fn optional_continue_id(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("continue_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// 续派校验通过后的目标。
+#[derive(Debug, Clone)]
+pub(super) struct ContinueTarget {
+    pub conversation_id: String,
+    pub title: String,
+    pub connection_id: String,
+    pub dispatch: crate::agent::conversation::SubDispatch,
+}
+
+/// 续派校验（纯函数便于单测）。`side` 是调用方工具的执行侧（`"remote"` / `"local"`）。
+/// 失败返回给主 agent 看的完整说明。
+pub(super) fn validate_continue_target(
+    continue_id: &str,
+    conversation: Option<&crate::agent::conversation::Conversation>,
+    dispatch: Option<crate::agent::conversation::SubDispatch>,
+    parent_conversation_id: &str,
+    side: &str,
+    has_running_task: bool,
+) -> Result<ContinueTarget, String> {
+    let Some(conv) = conversation else {
+        return Err(format!(
+            "找不到 continue_id=\"{continue_id}\" 对应的子agent对话（可能已被删除）。去掉 continue_id 重新派发。"
+        ));
+    };
+    // 只能续自己这个主对话派发的子 agent：别的对话的子 agent 上下文与本次无关，
+    // 也不该让一个对话的 agent 越界驱动另一个对话的子 agent。
+    if conv.parent_conversation_id.as_deref() != Some(parent_conversation_id) {
+        return Err(format!(
+            "continue_id=\"{continue_id}\" 不是当前对话派发的子agent，不能续派。只能续接结果里给出的 continue_id。"
+        ));
+    }
+    let Some(dispatch) = dispatch else {
+        return Err(format!(
+            "continue_id=\"{continue_id}\" 的子agent没有留下派发记录（它早于续派功能），无法还原它的运行模式与机器。去掉 continue_id 重新派发。"
+        ));
+    };
+    if dispatch.side != side {
+        let (right_tool, this_tool) = if side == "local" {
+            ("subagent", "local_subagent")
+        } else {
+            ("local_subagent", "subagent")
+        };
+        return Err(format!(
+            "continue_id=\"{continue_id}\" 是用 {right_tool} 派发的，不能用 {this_tool} 续派。请改用 {right_tool}。"
+        ));
+    }
+    if has_running_task {
+        return Err(format!(
+            "continue_id=\"{continue_id}\" 的子agent还在运行，同一个子agent同一时刻只能跑一轮。等它结束后再续派。"
+        ));
+    }
+    Ok(ContinueTarget {
+        conversation_id: conv.id.clone(),
+        title: conv.title.clone(),
+        connection_id: conv.connection_id.clone(),
+        dispatch,
+    })
+}
+
+/// 该对话上是否有未结束的任务（含另一个 tool call 刚拉起的续派）。
+pub(super) fn conversation_has_running_task(state: &AppState, conversation_id: &str) -> bool {
+    state
+        .agent_tasks
+        .read()
+        .values()
+        .any(|t| t.conversation_id == conversation_id && t.status.is_running())
+}
+
+/// 同一轮里并发的两个 tool call 可能同时续同一个子对话：两边的「没有运行中任务」检查
+/// 都发生在任一方的任务入表之前。进程级占位在检查之前先抢，Drop 释放。
+static CONTINUE_CLAIMS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+pub(super) struct ContinueClaim(String);
+
+impl ContinueClaim {
+    pub(super) fn try_claim(conversation_id: &str) -> Option<Self> {
+        let mut guard = CONTINUE_CLAIMS.lock().unwrap_or_else(|e| e.into_inner());
+        let set = guard.get_or_insert_with(Default::default);
+        set.insert(conversation_id.to_string())
+            .then(|| Self(conversation_id.to_string()))
+    }
+}
+
+impl Drop for ContinueClaim {
+    fn drop(&mut self) {
+        let mut guard = CONTINUE_CLAIMS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = guard.as_mut() {
+            set.remove(&self.0);
+        }
+    }
 }
 
 /// 子任务实际使用的模型展示名（spawn 解析后的真实落地模型，含回落情形）。
@@ -413,7 +550,14 @@ const BASE_DESCRIPTION: &str =
          modify files / run installs / deploy on its machine (still risk-assessed and \
          subject to the parent task's approval semantics). mode=\"agent\" is only \
          allowed when the CURRENT parent task is in Agent/Auto mode — Plan-mode \
-         parents can only spawn read-only research subagents (use \"plan\").";
+         parents can only spawn read-only research subagents (use \"plan\").\n\
+         \n\
+         CONTINUING a subagent: every result ends with a `continue_id`. Pass it back \
+         (with a short follow-up `prompt`) to resume that subagent in its existing \
+         conversation with its full context — it does not re-read what it already \
+         read. Use it for follow-up questions, and to pick up a subagent that failed \
+         or was cancelled (e.g. a transient LLM error) instead of starting over. Its \
+         mode and machine stay as originally dispatched.";
 
 #[async_trait]
 impl AgentTool for SubagentTool {
@@ -445,7 +589,8 @@ impl AgentTool for SubagentTool {
                     "type": "string",
                     "enum": ["plan", "agent"],
                     "description": "Optional (multi-host). 'plan' (default) = read-only research subagent; 'agent' = read-write execution subagent that can modify files / run installs / deploy — only when the current parent task is Agent/Auto mode (Plan-mode parents are rejected). When omitted, defaults to 'plan' (unchanged legacy behavior)."
-                }
+                },
+                "continue_id": continue_id_schema()
             },
             "required": ["prompt"]
         });
@@ -557,6 +702,51 @@ impl AgentTool for SubagentTool {
             ));
         }
 
+        // ── 续派（continue_id）：校验目标子对话，并还原它首次派发时的 mode / host ──
+        let parent_conversation_id = state
+            .agent_tasks
+            .read()
+            .get(&parent_task_id)
+            .map(|t| t.conversation_id.clone())
+            .unwrap_or_default();
+        let mut cont: Option<ContinueTarget> = None;
+        let mut _continue_claim: Option<ContinueClaim> = None;
+        if let Some(continue_id) = optional_continue_id(&params) {
+            let Some(claim) = ContinueClaim::try_claim(&continue_id) else {
+                return Ok(ToolOutput::fail(
+                    "subagent: 无法续派",
+                    "这个子agent正在被另一个调用续派，同一个子agent同一时刻只能跑一轮。",
+                ));
+            };
+            _continue_claim = Some(claim);
+            let conv = state
+                .conversation_db
+                .get_conversation(&continue_id)
+                .ok()
+                .flatten();
+            let dispatch = state
+                .conversation_db
+                .get_sub_dispatch(&continue_id)
+                .ok()
+                .flatten();
+            let running = conversation_has_running_task(&state, &continue_id);
+            match validate_continue_target(
+                &continue_id,
+                conv.as_ref(),
+                dispatch,
+                &parent_conversation_id,
+                "remote",
+                running,
+            ) {
+                Ok(target) => cont = Some(target),
+                Err(message) => return Ok(ToolOutput::fail("subagent: 无法续派", message)),
+            }
+        }
+        let description = match (&cont, params.get("description").and_then(|v| v.as_str())) {
+            (Some(c), d) if d.map(str::trim).unwrap_or("").is_empty() => c.title.clone(),
+            _ => description,
+        };
+
         // ── 多机操控：host 参数 → 目标机器会话；mode → 读写/只读 ──
         // host 存在但不在「勾选集合 ∪ 当前机」/无凭证 → 明确错误（绝不落回
         // 当前会话假装在目标机）。mode="agent"（读写）双端可用（多机操控
@@ -564,10 +754,14 @@ impl AgentTool for SubagentTool {
         // 不得经子 agent 间接获得写权限。未来若按设置收紧，此处统一降级只读。
         let mut exec_session_id = ctx.session_id.clone();
         let mut target_host_label: Option<String> = None;
-        let mode = params
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("plan");
+        // 续派沿用首次派发的模式：调用方不能借续派悄悄升级权限。
+        let mode = match &cont {
+            Some(c) => c.dispatch.mode.as_str(),
+            None => params
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("plan"),
+        };
 
         // 多机操控双端恒开启：mode="agent" 接受（读写子 agent）；未知值
         // 一律只读（历史行为）。
@@ -597,7 +791,11 @@ impl AgentTool for SubagentTool {
         };
 
         // host 解析（多机恒开时有意义；门控关闭则 host 非空 → 明确错误）。
-        if let Some(host) = crate::multi_host::optional_host(&params) {
+        let host_param = match &cont {
+            Some(c) => c.dispatch.host.clone(),
+            None => crate::multi_host::optional_host(&params),
+        };
+        if let Some(host) = host_param {
             if !mh_enabled {
                 return Ok(ToolOutput::fail(
                     "subagent: 多机操控不可用",
@@ -632,27 +830,63 @@ impl AgentTool for SubagentTool {
                 "SSH 会话不存在，无法派发子agent。",
             ));
         };
-        let sub_title = format!("{}（子agent）", description);
-        let parent_conversation_id = state
-            .agent_tasks
-            .read()
-            .get(&parent_task_id)
-            .map(|t| t.conversation_id.clone())
-            .unwrap_or_default();
-        let sub_conv = match state.conversation_db.create_sub_conversation(
-            &connection_id,
-            &sub_title,
-            &parent_conversation_id,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(ToolOutput::fail(
-                    "subagent: 创建子agent会话失败",
-                    format!("创建子agent会话失败: {}", e),
-                ));
+        let (sub_conversation_id, history) = match &cont {
+            Some(target) => {
+                // 续派必须还在原来那台机器上：对话归属 = 首次派发时的机器，换了机器的
+                // 话历史里的路径、已读内容都对不上。
+                if target.connection_id != connection_id {
+                    return Ok(ToolOutput::fail(
+                        "subagent: 无法续派",
+                        "这个子agent原来运行的机器与当前会话/host 解析到的机器不一致，不能续派。去掉 continue_id 重新派发。",
+                    ));
+                }
+                match state
+                    .conversation_db
+                    .load_llm_history_for_resume(&target.conversation_id)
+                {
+                    Ok(h) => (target.conversation_id.clone(), h),
+                    Err(e) => {
+                        return Ok(ToolOutput::fail(
+                            "subagent: 读取子agent历史失败",
+                            format!("读取子agent历史失败: {}", e),
+                        ));
+                    }
+                }
+            }
+            None => {
+                let sub_title = format!("{}（子agent）", description);
+                let sub_conv = match state.conversation_db.create_sub_conversation(
+                    &connection_id,
+                    &sub_title,
+                    &parent_conversation_id,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Ok(ToolOutput::fail(
+                            "subagent: 创建子agent会话失败",
+                            format!("创建子agent会话失败: {}", e),
+                        ));
+                    }
+                };
+                if let Err(e) = state.conversation_db.set_sub_dispatch(
+                    &sub_conv.id,
+                    &crate::agent::conversation::SubDispatch {
+                        side: "remote".to_string(),
+                        mode: if exec_mode == AgentMode::Agent {
+                            "agent"
+                        } else {
+                            "plan"
+                        }
+                        .to_string(),
+                        host: target_host_label.clone(),
+                    },
+                ) {
+                    // 只影响日后能否续派，不该让这次派发失败。
+                    log::warn!("记录子agent派发参数失败（之后无法续派）: {}", e);
+                }
+                (sub_conv.id, Vec::new())
             }
         };
-        let sub_conversation_id = sub_conv.id;
 
         // ── 生成子任务 id 并告知前端（先注册子对话 + 挂载子流 listener）──
         let sub_task_id = uuid::Uuid::new_v4().to_string();
@@ -680,6 +914,7 @@ impl AgentTool for SubagentTool {
                     },
                     // 远端派发：不写 side（与既有事件形状一致）。
                     side: None,
+                    resumed: cont.is_some(),
                 },
             );
         }
@@ -719,7 +954,7 @@ impl AgentTool for SubagentTool {
             session_id: exec_session_id.clone(),
             conversation_id: sub_conversation_id.clone(),
             prompt,
-            history: Vec::new(),
+            history,
             model_override,
             prompt_extra: vec![sub_instruction],
             // 子 agent 的 prompt 是父 agent 写的派发任务，但它在自己的子会话里
@@ -779,7 +1014,11 @@ impl AgentTool for SubagentTool {
 
         match classify_subagent_result(result, &status) {
             SubagentOutcome::Report(text) => {
-                let output = truncate_chars(&text, MAX_TASK_OUTPUT_CHARS);
+                let output = format!(
+                    "{}{}",
+                    truncate_chars(&text, MAX_TASK_OUTPUT_CHARS),
+                    continue_hint(&sub_conversation_id)
+                );
                 log::info!(
                     "Subtask {} completed: {} chars returned to parent",
                     sub_task_id,
@@ -799,8 +1038,11 @@ impl AgentTool for SubagentTool {
                 log::warn!("Subtask {} returned an empty report", sub_task_id);
                 Ok(ToolOutput::fail(
                     format!("子agent未返回结论：{}{}", description, model_note),
-                    "子agent结束了，但没有返回任何结论（正文为空，或整段都在思维标签里）。\
-                     不要把它当成调研结果：需要结论时重新派发，并在 prompt 里明确要求以正文给出最终报告。",
+                    format!(
+                        "子agent结束了，但没有返回任何结论（正文为空，或整段都在思维标签里）。\
+                         不要把它当成调研结果：需要结论时用 continue_id 续派，并明确要求以正文给出最终报告。{}",
+                        continue_hint(&sub_conversation_id)
+                    ),
                 )
                 .with_metadata(result_meta(json!({
                     "subTaskId": sub_task_id,
@@ -812,7 +1054,10 @@ impl AgentTool for SubagentTool {
                 log::info!("Subtask {} cancelled", sub_task_id);
                 Ok(ToolOutput::fail(
                     format!("子agent已取消：{}{}", description, model_note),
-                    "子agent已被取消，未返回调研结果。",
+                    format!(
+                        "子agent已被取消，未返回调研结果。{}",
+                        continue_hint(&sub_conversation_id)
+                    ),
                 )
                 .with_metadata(result_meta(json!({
                     "subTaskId": sub_task_id,
@@ -824,7 +1069,10 @@ impl AgentTool for SubagentTool {
                 log::warn!("Subtask {} failed (no result)", sub_task_id);
                 Ok(ToolOutput::fail(
                     format!("子agent失败：{}{}", description, model_note),
-                    "子agent执行失败（LLM 错误或达到最大轮数），未返回调研结果。",
+                    format!(
+                        "子agent执行失败（LLM 错误或达到最大轮数），未返回调研结果。{}",
+                        continue_hint(&sub_conversation_id)
+                    ),
                 )
                 .with_metadata(result_meta(json!({
                     "subTaskId": sub_task_id,
@@ -946,6 +1194,7 @@ mod tests {
             session_id: "sess-b".into(),
             mode: "plan".into(),
             side: None,
+            resumed: false,
         };
         let json = serde_json::to_value(ev).unwrap();
         assert_eq!(json["type"], "subTaskStart");
@@ -1233,6 +1482,85 @@ mod tests {
         assert_eq!(
             unknown_model_note("X"),
             "（模型 \"X\" 不在候选清单，已沿用会话模型）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod continue_tests {
+    use super::*;
+    use crate::agent::conversation::{Conversation, SubDispatch};
+
+    fn conv(parent: Option<&str>) -> Conversation {
+        let db = crate::agent::conversation::ConversationDb::in_memory().unwrap();
+        let mut c = db.create_conversation("conn", "调研（子agent）").unwrap();
+        c.parent_conversation_id = parent.map(String::from);
+        c
+    }
+
+    fn dispatch(side: &str) -> Option<SubDispatch> {
+        Some(SubDispatch {
+            side: side.into(),
+            mode: "plan".into(),
+            host: None,
+        })
+    }
+
+    #[test]
+    fn valid_target_is_accepted_and_carries_dispatch() {
+        let c = conv(Some("P"));
+        let t = validate_continue_target("x", Some(&c), dispatch("remote"), "P", "remote", false)
+            .unwrap();
+        assert_eq!(t.conversation_id, c.id);
+        assert_eq!(t.dispatch.mode, "plan");
+    }
+
+    #[test]
+    fn wrong_parent_missing_or_legacy_are_rejected() {
+        let c = conv(Some("P"));
+        let err = |c: Option<&Conversation>, d, p: &str, side: &str, running| {
+            validate_continue_target("x", c, d, p, side, running).unwrap_err()
+        };
+        assert!(err(None, dispatch("remote"), "P", "remote", false).contains("找不到"));
+        assert!(
+            err(Some(&c), dispatch("remote"), "OTHER", "remote", false).contains("不是当前对话")
+        );
+        let orphan = conv(None);
+        assert!(
+            err(Some(&orphan), dispatch("remote"), "P", "remote", false).contains("不是当前对话")
+        );
+        assert!(err(Some(&c), None, "P", "remote", false).contains("派发记录"));
+    }
+
+    #[test]
+    fn wrong_side_and_running_are_rejected() {
+        let c = conv(Some("P"));
+        let e = validate_continue_target("x", Some(&c), dispatch("local"), "P", "remote", false)
+            .unwrap_err();
+        assert!(e.contains("local_subagent"));
+        let e = validate_continue_target("x", Some(&c), dispatch("remote"), "P", "local", false)
+            .unwrap_err();
+        assert!(e.contains("改用 subagent"));
+        let e = validate_continue_target("x", Some(&c), dispatch("remote"), "P", "remote", true)
+            .unwrap_err();
+        assert!(e.contains("还在运行"));
+    }
+
+    #[test]
+    fn claim_is_exclusive_until_dropped() {
+        let a = ContinueClaim::try_claim("claim-test-1").expect("first claim");
+        assert!(ContinueClaim::try_claim("claim-test-1").is_none());
+        drop(a);
+        assert!(ContinueClaim::try_claim("claim-test-1").is_some());
+    }
+
+    #[test]
+    fn hint_names_the_conversation_id() {
+        assert!(continue_hint("abc").contains("continue_id=\"abc\""));
+        assert_eq!(optional_continue_id(&json!({"continue_id": "  "})), None);
+        assert_eq!(
+            optional_continue_id(&json!({"continue_id": " a "})).as_deref(),
+            Some("a")
         );
     }
 }

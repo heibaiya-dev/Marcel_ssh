@@ -5,6 +5,7 @@ import { useJobStore } from '@/stores/jobStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useConnectionStore } from '@/stores/connectionStore';
 import { useConversationStore } from '@/stores/conversationStore';
+import { sessionConversationBindingManager } from '@/stores/sessionConversationBindingManager';
 import { getTaskVisualStatus, getActiveRunningTasks } from '@/stores/agentStatusSelectors';
 import { AgentStatusIndicator } from './AgentStatusIndicator';
 import { useAnimatedPresence } from '@/hooks/useAnimatedPresence';
@@ -35,7 +36,6 @@ export const AgentTasksDrawer: React.FC<AgentTasksDrawerProps> = ({ open, onClos
   const connections = useConnectionStore((s) => s.connections);
   const conversations = useConversationStore((s) => s.conversations);
   const setActiveSession = useSessionStore((s) => s.setActiveSession);
-  const switchConversation = useConversationStore((s) => s.switchConversation);
   const activeConversationId = useConversationStore((s) => s.activeConversationId);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
 
@@ -80,7 +80,7 @@ export const AgentTasksDrawer: React.FC<AgentTasksDrawerProps> = ({ open, onClos
       setActiveSession(task.sessionId);
     }
     if (task.conversationId && task.conversationId !== activeConversationId) {
-      await switchConversation(task.conversationId);
+      await sessionConversationBindingManager.openConversation(task.conversationId);
     }
     onClose();
   };

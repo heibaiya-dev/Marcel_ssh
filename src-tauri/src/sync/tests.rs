@@ -103,10 +103,9 @@ impl Dev {
         let bus = DataChangeBus::new();
         let mut skill_store = SkillStore::new();
         crate::skills::builtin::ensure_builtin_skills(&mut skill_store);
-        let known_hosts =
-            KnownHostsStore::load_in_config_dir(dir.path(), Some(bus.clone()))
-                .await
-                .unwrap();
+        let known_hosts = KnownHostsStore::load_in_config_dir(dir.path(), Some(bus.clone()))
+            .await
+            .unwrap();
         let mut dev = Dev {
             name,
             settings: JsonStore::new(dir.path(), AppSettings::default(), Some(bus.clone())),
@@ -310,7 +309,9 @@ fn placeholder_engine() -> SyncEngine {
         default_device_name: "x".into(),
         load_failures: Vec::new(),
     });
-    let view = Arc::new(SharedView::new(HistoryStore::empty(dir.path().join("h.json"))));
+    let view = Arc::new(SharedView::new(HistoryStore::empty(
+        dir.path().join("h.json"),
+    )));
     SyncEngine::new(deps, view)
 }
 
@@ -411,15 +412,25 @@ async fn create_writes_meta_snapshot_and_keeps_secrets_off_the_cloud() {
     );
     // 本机存了密钥，云端只有密文
     assert!(a.secrets.get(&SecretSlot::SyncDataKey).unwrap().is_some());
-    assert!(a.secrets.get(&SecretSlot::SyncRecoveryKey).unwrap().is_some());
+    assert!(a
+        .secrets
+        .get(&SecretSlot::SyncRecoveryKey)
+        .unwrap()
+        .is_some());
     assert_eq!(
-        a.secrets.get(&SecretSlot::SyncStoragePassword).unwrap().as_deref(),
+        a.secrets
+            .get(&SecretSlot::SyncStoragePassword)
+            .unwrap()
+            .as_deref(),
         Some(PASSWORD)
     );
     for p in &paths {
         let bytes = cloud.peek(p).unwrap();
         let text = String::from_utf8_lossy(&bytes);
-        assert!(!text.contains("生产服务器") || p == META_FILE, "{p} 里不该有明文配置");
+        assert!(
+            !text.contains("生产服务器") || p == META_FILE,
+            "{p} 里不该有明文配置"
+        );
         assert!(!text.contains(PASSWORD), "{p}");
         assert!(!text.contains(&rk.replace('-', "")), "{p}");
     }
@@ -428,7 +439,10 @@ async fn create_writes_meta_snapshot_and_keeps_secrets_off_the_cloud() {
     assert!(super::engine::plain_error(&again).contains("已经开启"));
     let mut other = Dev::new("O", &cloud, &new_clock(), Platform::Desktop).await;
     let err = other.engine.create(webdav(), None).await.unwrap_err();
-    assert!(super::engine::plain_error(&err).contains("已有同步数据"), "{err}");
+    assert!(
+        super::engine::plain_error(&err).contains("已有同步数据"),
+        "{err}"
+    );
     assert!(!other.status().enabled, "拒绝后本机不受影响");
 }
 
@@ -449,7 +463,10 @@ async fn join_merges_cloud_wins_dedupes_the_same_server_and_keeps_local_only_ite
         .await
         .unwrap();
     a.quick
-        .mutate(|s| s.add("q-a".into(), qc_input("重启 nginx", None)).map(|_| ()))
+        .mutate(|s| {
+            s.add("q-a".into(), qc_input("重启 nginx", None))
+                .map(|_| ())
+        })
         .await
         .unwrap();
     a.skills
@@ -470,7 +487,10 @@ async fn join_merges_cloud_wins_dedupes_the_same_server_and_keeps_local_only_ite
         .set(&SecretSlot::SshPassword("b1".into()), "b1-password")
         .unwrap();
     b.quick
-        .mutate(|s| s.add("q-b".into(), qc_input("看日志", Some("b1"))).map(|_| ()))
+        .mutate(|s| {
+            s.add("q-b".into(), qc_input("看日志", Some("b1")))
+                .map(|_| ())
+        })
         .await
         .unwrap();
     b.settings
@@ -493,10 +513,17 @@ async fn join_merges_cloud_wins_dedupes_the_same_server_and_keeps_local_only_ite
     assert_eq!(b.conn("c1").await.unwrap().name, "生产服务器", "云端赢");
     // 密码跟着搬到云端那条名下，本机旧 id 清理干净
     assert_eq!(
-        b.secrets.get(&SecretSlot::SshPassword("c1".into())).unwrap().as_deref(),
+        b.secrets
+            .get(&SecretSlot::SshPassword("c1".into()))
+            .unwrap()
+            .as_deref(),
         Some("b1-password")
     );
-    assert!(b.secrets.get(&SecretSlot::SshPassword("b1".into())).unwrap().is_none());
+    assert!(b
+        .secrets
+        .get(&SecretSlot::SshPassword("b1".into()))
+        .unwrap()
+        .is_none());
     // 引用改写
     let qcs = b.adapter_doc("quickCommands");
     let session_keys: Vec<&str> = qcs["commands"]
@@ -507,7 +534,11 @@ async fn join_merges_cloud_wins_dedupes_the_same_server_and_keeps_local_only_ite
         .collect();
     assert_eq!(session_keys, ["c1"], "指向被去重连接的引用改写成云端 id");
     assert_eq!(
-        b.settings.read().await.experimental_settings.multi_host_connection_ids,
+        b.settings
+            .read()
+            .await
+            .experimental_settings
+            .multi_host_connection_ids,
         vec!["c1".to_string()]
     );
     // 设置：Shared 冲突云端赢；Local 保留；云端有的快捷指令 / skill 都来了
@@ -522,7 +553,10 @@ async fn join_merges_cloud_wins_dedupes_the_same_server_and_keeps_local_only_ite
     // B 加入时的状态
     assert!(b.status().enabled);
     assert_eq!(b.status().pending_count, b.engine.ledger.outbox.len());
-    assert!(b.engine.ledger.outbox.len() > 0, "本机独有的数据排队等待上传");
+    assert!(
+        b.engine.ledger.outbox.len() > 0,
+        "本机独有的数据排队等待上传"
+    );
     assert!(
         b.events.applied.lock().contains(&"connections".to_string()),
         "落地后通知前端刷新"
@@ -534,7 +568,11 @@ async fn join_merges_cloud_wins_dedupes_the_same_server_and_keeps_local_only_ite
     let mut a_ids = a.conn_ids().await;
     a_ids.sort();
     assert_eq!(a_ids, ["b2", "c1", "c2"]);
-    assert_eq!(a.settings.read().await.panel_height, 111, "A 的 Local 不被 B 影响");
+    assert_eq!(
+        a.settings.read().await.panel_height,
+        111,
+        "A 的 Local 不被 B 影响"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -734,12 +772,18 @@ async fn platform_fields_stay_per_platform_and_local_fields_never_travel() {
     let p = phone.settings.snapshot().await;
     assert!(d.privacy_mode && p.privacy_mode, "Shared 两端一致");
     assert_eq!(d.font_size, 20, "手机的字号不影响桌面");
-    assert_eq!(p.font_size, 9, "各平台各存一份字号：桌面改 20 不覆盖手机自己的 9");
+    assert_eq!(
+        p.font_size, 9,
+        "各平台各存一份字号：桌面改 20 不覆盖手机自己的 9"
+    );
     assert_eq!(
         p.notification_settings.notification_volume, 70,
         "桌面通知不进手机"
     );
-    assert!(d.mobile_notification_settings.agent_task_done, "手机通知不进桌面");
+    assert!(
+        d.mobile_notification_settings.agent_task_done,
+        "手机通知不进桌面"
+    );
     assert_eq!(p.panel_height, 256, "Local 不同步");
     assert_eq!(d.panel_height, 999);
 }
@@ -766,8 +810,13 @@ async fn a_device_never_reads_its_own_files_and_idle_rounds_do_no_writes() {
 async fn six_of_eight_deleted() -> (Dev, Dev, MemoryStorage) {
     let (mut a, mut b, cloud) = pair().await;
     for i in 0..8 {
-        a.add_conn(&format!("c{i}"), &format!("机器{i}"), &format!("10.0.0.{i}"), "root")
-            .await;
+        a.add_conn(
+            &format!("c{i}"),
+            &format!("机器{i}"),
+            &format!("10.0.0.{i}"),
+            "root",
+        )
+        .await;
     }
     let (_rk, code) = a.create().await;
     b.join_code(&code).await.unwrap();
@@ -839,8 +888,16 @@ async fn remote_changes_do_not_resurrect_elements_while_the_delete_is_held() {
     b.edit_conn("c7", |c| c.name = "B 改的".into()).await;
     b.sync().await;
     a.sync().await;
-    assert_eq!(a.conn_ids().await.len(), 2, "挂起期间被删的元素不会被写回来");
-    assert_eq!(a.conn("c7").await.unwrap().name, "B 改的", "其它改动照常落地");
+    assert_eq!(
+        a.conn_ids().await.len(),
+        2,
+        "挂起期间被删的元素不会被写回来"
+    );
+    assert_eq!(
+        a.conn("c7").await.unwrap().name,
+        "B 改的",
+        "其它改动照常落地"
+    );
     assert_eq!(a.status().state, SyncState::NeedsConfirm);
 }
 
@@ -861,11 +918,16 @@ async fn small_deletes_pass_straight_through() {
 // 版本 / 损坏 / 升级
 // ═══════════════════════════════════════════════════════════════════════
 
-fn write_foreign_segment(cloud: &MemoryStorage, secrets: &MemorySecrets, device: &str, seq: u64, format_version: u32, ops: Value) {
-    let dk = crypto::DataKey::from_b64(
-        &secrets.get(&SecretSlot::SyncDataKey).unwrap().unwrap(),
-    )
-    .unwrap();
+fn write_foreign_segment(
+    cloud: &MemoryStorage,
+    secrets: &MemorySecrets,
+    device: &str,
+    seq: u64,
+    format_version: u32,
+    ops: Value,
+) {
+    let dk = crypto::DataKey::from_b64(&secrets.get(&SecretSlot::SyncDataKey).unwrap().unwrap())
+        .unwrap();
     let plain = json!({
         "format": format_version,
         "device": {"id": device, "name": "新版本设备", "platform": "desktop", "appVersion": "9.9.9"},
@@ -978,7 +1040,12 @@ async fn upgrade_does_not_report_fields_the_new_version_dropped() {
     b.sync().await; // 升级后第一次捕获：不发 Remove
     a.sync().await;
     assert!(
-        a.settings.read().await.ui_theme.zones.contains_key("legacy"),
+        a.settings
+            .read()
+            .await
+            .ui_theme
+            .zones
+            .contains_key("legacy"),
         "还在用旧字段的旧版本设备不该被新版本的迁移带着删"
     );
 
@@ -1028,10 +1095,20 @@ async fn known_host_with_a_different_fingerprint_is_never_overwritten_and_warns(
             .map(|(_, e)| e.fingerprint_sha256)
     };
     // 冲突的条目：本机指纹原样保留（安全边界）；A 的新增条目照常到了
-    assert_eq!(fp(&b, "clash.example.com").as_deref(), Some("SHA256:local-b"));
+    assert_eq!(
+        fp(&b, "clash.example.com").as_deref(),
+        Some("SHA256:local-b")
+    );
     assert_eq!(fp(&b, "same.example.com").as_deref(), Some("SHA256:same"));
-    assert_eq!(fp(&b, "b-only.example.com").as_deref(), Some("SHA256:b-only"));
-    let warnings: Vec<_> = b.history().into_iter().filter(|h| h.kind == HistoryKind::Warning).collect();
+    assert_eq!(
+        fp(&b, "b-only.example.com").as_deref(),
+        Some("SHA256:b-only")
+    );
+    let warnings: Vec<_> = b
+        .history()
+        .into_iter()
+        .filter(|h| h.kind == HistoryKind::Warning)
+        .collect();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].label.contains("clash.example.com:22"));
     assert!(warnings[0].label.contains("与本机不同"));
@@ -1041,10 +1118,23 @@ async fn known_host_with_a_different_fingerprint_is_never_overwritten_and_warns(
     b.sync().await;
     a.sync().await;
     b.sync().await;
-    assert_eq!(fp(&b, "clash.example.com").as_deref(), Some("SHA256:local-b"));
-    assert_eq!(fp(&a, "clash.example.com").as_deref(), Some("SHA256:from-a"));
-    assert_eq!(fp(&a, "b-only.example.com").as_deref(), Some("SHA256:b-only"));
-    let warnings = b.history().into_iter().filter(|h| h.kind == HistoryKind::Warning).count();
+    assert_eq!(
+        fp(&b, "clash.example.com").as_deref(),
+        Some("SHA256:local-b")
+    );
+    assert_eq!(
+        fp(&a, "clash.example.com").as_deref(),
+        Some("SHA256:from-a")
+    );
+    assert_eq!(
+        fp(&a, "b-only.example.com").as_deref(),
+        Some("SHA256:b-only")
+    );
+    let warnings = b
+        .history()
+        .into_iter()
+        .filter(|h| h.kind == HistoryKind::Warning)
+        .count();
     assert_eq!(warnings, 1, "同一条警告只记一次");
 
     // 删除条目照常应用
@@ -1092,7 +1182,11 @@ async fn history_names_the_device_and_undo_goes_through_a_normal_local_write() {
     assert!(manager.undo(&host.id).await.is_err(), "不能撤销两次");
     b.sync().await;
     a.sync().await;
-    assert_eq!(a.conn("c1").await.unwrap().host, "1.1.1.1", "撤销本身被同步出去了");
+    assert_eq!(
+        a.conn("c1").await.unwrap().host,
+        "1.1.1.1",
+        "撤销本身被同步出去了"
+    );
 }
 
 /// 在设备现有的引擎旁边搭一个只用于「读视图 + undo + 同步码」的 manager（不起 actor），
@@ -1131,7 +1225,10 @@ async fn compaction_writes_a_snapshot_prunes_own_segments_and_new_devices_can_st
     // B 很久没同步：靠快照追上
     b.sync().await;
     assert!(b.conn("c1").await.unwrap().name.starts_with("第"));
-    assert_eq!(b.conn("c1").await.unwrap().name, a.conn("c1").await.unwrap().name);
+    assert_eq!(
+        b.conn("c1").await.unwrap().name,
+        a.conn("c1").await.unwrap().name
+    );
 
     // 压缩之后新来的设备也能完整加入
     let mut c = Dev::new("C", &cloud, &new_clock(), Platform::Desktop).await;
@@ -1140,7 +1237,10 @@ async fn compaction_writes_a_snapshot_prunes_own_segments_and_new_devices_can_st
         m.get_sync_code().await.unwrap()
     };
     c.join_code(&code).await.unwrap();
-    assert_eq!(c.conn("c1").await.unwrap().name, a.conn("c1").await.unwrap().name);
+    assert_eq!(
+        c.conn("c1").await.unwrap().name,
+        a.conn("c1").await.unwrap().name
+    );
     assert_eq!(c.conn_ids().await.len(), 2);
 }
 
@@ -1155,10 +1255,16 @@ async fn disable_removes_local_state_and_optionally_the_remote_files_but_never_t
     b.engine.disable(false).await.unwrap();
     assert!(!b.status().enabled);
     assert_eq!(b.status().state, SyncState::Off);
-    assert!(!LedgerFiles::new(b.dir.path()).dir().exists(), "本机同步状态目录没了");
+    assert!(
+        !LedgerFiles::new(b.dir.path()).dir().exists(),
+        "本机同步状态目录没了"
+    );
     assert!(b.secrets.is_empty(), "同步的密钥链条目清掉了");
     assert_eq!(b.conn_ids().await.len(), 2, "本机配置数据不动");
-    assert!(cloud.paths().iter().any(|p| p.starts_with(&format::device_dir(&device))));
+    assert!(cloud
+        .paths()
+        .iter()
+        .any(|p| p.starts_with(&format::device_dir(&device))));
     assert!(cloud.peek(META_FILE).is_some());
     // 停止后改动不再上传
     b.add_conn("c9", "x", "9.9.9.9", "r").await;
@@ -1169,7 +1275,11 @@ async fn disable_removes_local_state_and_optionally_the_remote_files_but_never_t
     // 同时删云端
     a.engine.disable(true).await.unwrap();
     assert!(cloud.peek(META_FILE).is_none());
-    assert!(cloud.paths().iter().all(|p| !p.starts_with(DEVICES_DIR)), "{:?}", cloud.paths());
+    assert!(
+        cloud.paths().iter().all(|p| !p.starts_with(DEVICES_DIR)),
+        "{:?}",
+        cloud.paths()
+    );
     assert_eq!(a.conn_ids().await.len(), 2);
 
     // 云端删除失败：不停止，用户可以重试
@@ -1231,7 +1341,9 @@ async fn no_secret_ever_lands_in_the_ledger_history_status_or_errors() {
         }
     }
     // 存储出错时的错误文案不带密码
-    cloud.fail_next(super::storage::StorageError::Auth("用户名或密码不正确".into()));
+    cloud.fail_next(super::storage::StorageError::Auth(
+        "用户名或密码不正确".into(),
+    ));
     let err = a.sync_err().await;
     assert!(!err.contains(PASSWORD));
 }
@@ -1322,11 +1434,17 @@ async fn legacy_sync_leftovers_are_cleaned_whether_or_not_sync_is_enabled() {
     for f in crate::data::legacy::LEGACY_SYNC_FILES {
         assert!(!dir.path().join(f).exists());
     }
-    assert!(dir.path().join("session_snapshot.json").exists(), "来历不明的文件不碰");
+    assert!(
+        dir.path().join("session_snapshot.json").exists(),
+        "来历不明的文件不碰"
+    );
     for slot in SecretSlot::legacy_sync_slots() {
         assert!(secrets.get(&slot).unwrap().is_none());
     }
-    assert!(secrets.get(&SecretSlot::SyncDataKey).unwrap().is_some(), "新版同步的密钥不受影响");
+    assert!(
+        secrets.get(&SecretSlot::SyncDataKey).unwrap().is_some(),
+        "新版同步的密钥不受影响"
+    );
 }
 
 /// actor：创建 → 本机改动经总线防抖后自动上传 → 另一台设备的 `sync_now` 把它拉下来。
@@ -1383,7 +1501,10 @@ async fn actor_uploads_local_changes_after_the_debounce_and_syncs_on_demand() {
     mgr_b.sync_now().await.unwrap();
     assert_eq!(b.font_size().await, 19);
     assert!(b.events.applied.lock().contains(&"settings".to_string()));
-    assert!(mgr_b.list_history(10).iter().any(|h| h.label.contains("终端字号")));
+    assert!(mgr_b
+        .list_history(10)
+        .iter()
+        .any(|h| h.label.contains("终端字号")));
     assert_eq!(mgr_b.list_devices().len(), 2);
 
     // 机密命令：恢复密钥 / 同步码
@@ -1460,11 +1581,20 @@ fn every_adapter_covers_a_distinct_registered_source() {
     };
     let adapters = build_adapters(&stores, Arc::new(MemorySecrets::new()));
     let keys: HashSet<&str> = adapters.iter().map(|a| a.key()).collect();
-    let registry: HashSet<&str> = DataSourceId::ALL.iter().filter_map(|i| i.sync_key()).collect();
-    assert_eq!(keys, registry, "适配器必须恰好覆盖登记表里所有 Config 档数据");
+    let registry: HashSet<&str> = DataSourceId::ALL
+        .iter()
+        .filter_map(|i| i.sync_key())
+        .collect();
+    assert_eq!(
+        keys, registry,
+        "适配器必须恰好覆盖登记表里所有 Config 档数据"
+    );
     for a in &adapters {
         assert_eq!(a.data_source().sync_key(), Some(a.key()));
         assert_eq!(a.data_source().tier(), crate::data::SyncTier::Config);
     }
-    let _ = (<AppSettings as JsonPersistable>::SOURCE, DataSourceId::Settings);
+    let _ = (
+        <AppSettings as JsonPersistable>::SOURCE,
+        DataSourceId::Settings,
+    );
 }

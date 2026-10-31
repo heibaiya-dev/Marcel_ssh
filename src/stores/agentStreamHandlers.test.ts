@@ -10,6 +10,7 @@ import {
   handleCancelled,
   handleError,
   handleRetrying,
+  markRoundEnded,
   handleCompactionStart,
   handleCompactionProgress,
   handleCompactionDone,
@@ -88,6 +89,7 @@ describe('agentStreamHandlers', () => {
         compactionTrigger: null,
         pendingCompactionText: null,
         compactionRafId: null,
+        roundMark: null,
       });
       const state = getStreamState(taskId);
       expect(state.assistantMessageId).toBe('msg-1');
@@ -610,6 +612,60 @@ describe('agentStreamHandlers', () => {
       });
 
       expect(handler._messages[convId].find((m) => m.isLoading)).toBeUndefined();
+    });
+  });
+
+  describe('handleRetrying discardPartial', () => {
+    const flush = () => rafCalls.splice(0).forEach((cb) => cb());
+    const ev = { type: 'retrying' as const, attempt: 2, maxAttempts: 4, delaySecs: 1, lastError: 'net', discardPartial: true };
+
+    it('removes the assistant bubble created this round and shows skeleton', () => {
+      const handler = mockHandler({ [convId]: [{ id: 'u1', role: 'user', content: 'hi', timestamp: '' }] });
+      handleTextDelta(handler, taskId, convId, '', { type: 'textDelta', text: 'half' });
+      flush();
+      handleTextDelta(handler, taskId, convId, '', { type: 'textDelta', text: ' more' });
+      handleRetrying(handler, taskId, convId, ev);
+      const msgs = handler._messages[convId];
+      expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant', 'system']);
+      expect(msgs[1].isLoading).toBe(true);
+      expect(msgs[2].isRetrying).toBe(true);
+      expect(getStreamState(taskId).assistantMessageId).toBeNull();
+      // 缓冲未提交
+      flush();
+      expect(handler._messages[convId].some((m) => m.content.includes('more'))).toBe(false);
+    });
+
+    it('drops tool cards opened this round', () => {
+      const handler = mockHandler({ [convId]: [] });
+      handleToolCallStart(handler, taskId, convId, { type: 'toolCallStart', id: 'tc-d1', name: 'execute_command' });
+      handleRetrying(handler, taskId, convId, ev);
+      const msgs = handler._messages[convId];
+      expect(msgs.some((m) => m.role === 'tool')).toBe(false);
+      expect(getStreamState(taskId).pendingToolCalls.size).toBe(0);
+    });
+
+    it('markRoundEnded keeps a finished tool-less round out of the next round retry', () => {
+      const handler = mockHandler({ [convId]: [{ id: 'u1', role: 'user', content: 'hi', timestamp: '' }] });
+      // 第一轮：纯文本，无工具，尾巴还在缓冲里就收到本轮结束
+      handleTextDelta(handler, taskId, convId, '', { type: 'textDelta', text: 'round1' });
+      flush();
+      handleTextDelta(handler, taskId, convId, '', { type: 'textDelta', text: '-tail' });
+      markRoundEnded(taskId);
+      expect(getStreamState(taskId).roundMark).toBeNull();
+      // 第二轮续写同一气泡，随后流中途重试
+      handleTextDelta(handler, taskId, convId, '', { type: 'textDelta', text: ' round2' });
+      flush();
+      handleRetrying(handler, taskId, convId, ev);
+      const assistant = handler._messages[convId].find((m) => m.role === 'assistant' && !m.isLoading);
+      expect(assistant?.content).toBe('round1-tail');
+    });
+
+    it('does not discard when flag is absent', () => {
+      const handler = mockHandler({ [convId]: [] });
+      handleTextDelta(handler, taskId, convId, '', { type: 'textDelta', text: 'keep' });
+      flush();
+      handleRetrying(handler, taskId, convId, { ...ev, discardPartial: false });
+      expect(handler._messages[convId].some((m) => m.content === 'keep')).toBe(true);
     });
   });
 

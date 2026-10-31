@@ -41,7 +41,13 @@ pub enum LlmError {
 
 impl LlmError {
     /// 判断在指定生命周期阶段下该错误是否可重试：
-    /// 1. 若首包已到达（Streaming 阶段），为保证上游 session 安全与前端一致性，绝对不重试。
+    /// 1. 若首包已到达（Streaming 阶段）：只有**传输层**断掉才重试——连接中途被掐
+    ///    （`Network`）或长时间无数据（`Timeout`，受 `retry_on_timeout` 控制）。
+    ///    chat completions 是无状态请求，整轮重发是安全的；已经上屏的半截内容由
+    ///    `StreamEvent::Retrying { discard_partial: true }` 通知前端撤掉，落库只在整轮
+    ///    成功后发生，不会留下半截。解析失败 / 内容错误是确定性的，重发同样失败，不重试。
+    ///    这条曾经一律不重试，网络抖一下就会让任务（尤其是没人能接着说「继续」的
+    ///    子 agent）直接失败。
     /// 2. 若首包未到达（Probing 阶段）：
     ///    - HTTP 状态码匹配配置中的重试状态码（如 408, 429, 500-599）则重试。
     ///    - 超时错误受 `retry_on_timeout` 控制。
@@ -54,7 +60,11 @@ impl LlmError {
         retry_on_timeout: bool,
     ) -> bool {
         if phase == RequestPhase::Streaming {
-            return false;
+            return match self {
+                LlmError::Network(_) => true,
+                LlmError::Timeout { .. } => retry_on_timeout,
+                _ => false,
+            };
         }
 
         match self {
@@ -224,15 +234,21 @@ mod tests {
         };
         // Probing 阶段可重试
         assert!(http_err.is_retryable(RequestPhase::Probing, &conditions, true));
-        // Streaming 阶段严禁重试
+        // Streaming 阶段：HTTP 状态 / 解析失败不重试（确定性，重发同样失败）
         assert!(!http_err.is_retryable(RequestPhase::Streaming, &conditions, true));
+        let parse_err = LlmError::ParseError("坏 JSON".into());
+        assert!(!parse_err.is_retryable(RequestPhase::Streaming, &conditions, true));
 
         let timeout_err = LlmError::Timeout {
             detail: "首字超时".into(),
         };
         assert!(timeout_err.is_retryable(RequestPhase::Probing, &conditions, true));
         assert!(!timeout_err.is_retryable(RequestPhase::Probing, &conditions, false));
-        assert!(!timeout_err.is_retryable(RequestPhase::Streaming, &conditions, true));
+        // Streaming 阶段：传输层断掉（中途断线 / 读流超时）照样重试，超时受开关控制
+        assert!(timeout_err.is_retryable(RequestPhase::Streaming, &conditions, true));
+        assert!(!timeout_err.is_retryable(RequestPhase::Streaming, &conditions, false));
+        let net_err = LlmError::Network("connection reset".into());
+        assert!(net_err.is_retryable(RequestPhase::Streaming, &conditions, true));
     }
 
     #[test]
@@ -307,10 +323,7 @@ mod tests {
 
         let text = format_reqwest_error(&err);
         assert!(!text.contains("请求构造失败"), "旧文案残留: {text}");
-        assert!(
-            text.contains("请求发送/等待响应失败"),
-            "新文案缺失: {text}"
-        );
+        assert!(text.contains("请求发送/等待响应失败"), "新文案缺失: {text}");
         assert!(
             text.contains("connection closed before message completed"),
             "底层原因链缺失: {text}"

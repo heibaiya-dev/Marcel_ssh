@@ -157,8 +157,15 @@ pub async fn job_pending_notice(
     if jobs.is_empty() {
         return Ok(None);
     }
+    let still_running = crate::agent::agent_loop::count_running_jobs(
+        &state.command_exec,
+        &state.local_command_exec,
+        &conversation_id,
+        None,
+    )
+    .await;
     Ok(Some(JobNotice {
-        text: crate::agent::agent_loop::build_job_settlement_notice(&jobs),
+        text: crate::agent::agent_loop::build_job_settlement_notice(&jobs, still_running),
         job_ids: jobs.into_iter().map(|j| j.job_id).collect(),
     }))
 }

@@ -64,8 +64,7 @@ impl SkillTool {
             .collect();
         // 名字部分的预算 = 总长 - 前缀 - `_` - id 标签。safe_name 此时只含 ASCII，
         // 按字节截断安全；截完再去一次尾部的 `_`/`-`，避免出现 `__`。
-        let budget = MAX_TOOL_NAME_LEN
-            .saturating_sub(SKILL_TOOL_PREFIX.len() + 1 + id_tag.len());
+        let budget = MAX_TOOL_NAME_LEN.saturating_sub(SKILL_TOOL_PREFIX.len() + 1 + id_tag.len());
         let safe_name = if safe_name.len() > budget {
             safe_name[..budget].trim_end_matches(['_', '-'])
         } else {
@@ -239,7 +238,10 @@ mod tests {
 
         let on_mobile = builtin_skill_additions(VISUALIZE_SKILL_ID, true);
         assert!(on_mobile.contains("移动版"), "平台说明仍须保留");
-        assert!(on_mobile.contains(marker), "手机端调用 visualize 必须带手机规则");
+        assert!(
+            on_mobile.contains(marker),
+            "手机端调用 visualize 必须带手机规则"
+        );
         assert!(
             on_mobile.find("用户当前平台") < on_mobile.find(marker),
             "平台说明在前、手机规则在后"
@@ -331,7 +333,11 @@ mod tests {
     fn long_skill_name_keeps_tool_name_within_api_limit() {
         let long = "a-very-long-imported-skill-name-".repeat(4);
         let tool = SkillTool::new(&Skill::new(long, "d", "正文"));
-        assert!(tool.name().len() <= MAX_TOOL_NAME_LEN, "got {}", tool.name());
+        assert!(
+            tool.name().len() <= MAX_TOOL_NAME_LEN,
+            "got {}",
+            tool.name()
+        );
         assert!(tool.name().starts_with(SKILL_TOOL_PREFIX));
         assert!(!tool.name().contains("__"));
         // 同名长 skill 仍靠 id 标签区分

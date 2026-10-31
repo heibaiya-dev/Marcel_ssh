@@ -389,6 +389,11 @@ pub(super) async fn request_round_reply(
                         }
                         Some(other) => {
                             flush_delta_batch(&app_fwd, &evn, pending.take(), &mut batch_deadline);
+                            // 流中途断线重试：上一次尝试已半截丢弃，其思维标签的
+                            // 半解析状态不能带进重发的那次。
+                            if matches!(other, StreamEvent::Retrying { discard_partial: true, .. }) {
+                                thinking_filter = ThinkingFilterState::default();
+                            }
                             emit_event(&app_fwd, &evn, other);
                         }
                     }
@@ -708,7 +713,14 @@ pub(super) async fn finish_text_reply(
     settled_jobs.extend(state.local_command_exec.take_settled_jobs_for_task(task_id));
     settled_jobs.sort_by_key(|job| job.started_at_millis);
     if !settled_jobs.is_empty() {
-        let notice = build_job_settlement_notice(&settled_jobs);
+        let still_running = super::count_running_jobs(
+            &state.command_exec,
+            &state.local_command_exec,
+            &persister.conversation_id,
+            Some(task_id),
+        )
+        .await;
+        let notice = build_job_settlement_notice(&settled_jobs, still_running);
         log::info!(
             "Agent {} job settled notice: {}",
             task_id,

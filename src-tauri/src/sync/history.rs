@@ -333,7 +333,9 @@ pub fn summarize(v: &Value) -> String {
         Value::Number(n) => n.to_string(),
         Value::String(s) => truncate_chars(s, SUMMARY_MAX_CHARS),
         Value::Array(a) => {
-            if a.iter().all(|e| matches!(e, Value::String(_) | Value::Number(_))) && !a.is_empty()
+            if a.iter()
+                .all(|e| matches!(e, Value::String(_) | Value::Number(_)))
+                && !a.is_empty()
             {
                 let joined = a
                     .iter()
@@ -459,11 +461,7 @@ fn key_text(seg: &Seg) -> String {
 }
 
 /// 落地前后的差异 → 记录。
-pub fn change_records(
-    ctx: &ChangeCtx<'_>,
-    before: &Value,
-    after: &Value,
-) -> Vec<HistoryRecord> {
+pub fn change_records(ctx: &ChangeCtx<'_>, before: &Value, after: &Value) -> Vec<HistoryRecord> {
     let mut reg = ctx.idmaps.clone();
     let b = flatten_scoped(before, ctx.rules, ctx.platform, &mut reg);
     let a = flatten_scoped(after, ctx.rules, ctx.platform, &mut reg);
@@ -485,14 +483,16 @@ pub fn change_records(
         }
 
         // 整个元素新增 / 删除 → 折成一条（取最外层）
-        let wholly = element_prefix_lens(ctx.source, path).into_iter().find_map(|len| {
-            let prefix = &path[..len];
-            match (has_prefix(&b, prefix), has_prefix(&a, prefix)) {
-                (false, true) => Some((len, Wholly::Added)),
-                (true, false) => Some((len, Wholly::Removed)),
-                _ => None,
-            }
-        });
+        let wholly = element_prefix_lens(ctx.source, path)
+            .into_iter()
+            .find_map(|len| {
+                let prefix = &path[..len];
+                match (has_prefix(&b, prefix), has_prefix(&a, prefix)) {
+                    (false, true) => Some((len, Wholly::Added)),
+                    (true, false) => Some((len, Wholly::Removed)),
+                    _ => None,
+                }
+            });
         if let Some((len, kind)) = wholly {
             let elem: Path = path[..len].to_vec();
             if elements_done.insert(elem.clone()) {
@@ -598,7 +598,11 @@ fn leaf_label(source: &str, dpath: &[Seg], before: &Value, after: &Value) -> Str
                 .collect::<Vec<_>>()
                 .join(" › ")
         };
-        let prefix = if source == "settings" { "设置 · " } else { "" };
+        let prefix = if source == "settings" {
+            "设置 · "
+        } else {
+            ""
+        };
         return if field.is_empty() {
             format!("{prefix}{noun}『{name}』")
         } else {
@@ -737,7 +741,11 @@ fn order_record(
         _ => "条目".to_string(),
     };
     let _ = (before, after);
-    let prefix = if ctx.source == "settings" { "设置 · " } else { "" };
+    let prefix = if ctx.source == "settings" {
+        "设置 · "
+    } else {
+        ""
+    };
     Some(HistoryRecord {
         id: uuid::Uuid::new_v4().to_string(),
         at: ctx.at.to_string(),
@@ -848,9 +856,16 @@ mod tests {
 
     #[test]
     fn field_change_inside_an_element_names_the_element() {
-        let before = json!({"connections": [{"id": "c1", "name": "生产服务器", "host": "1.1.1.1"}]});
+        let before =
+            json!({"connections": [{"id": "c1", "name": "生产服务器", "host": "1.1.1.1"}]});
         let after = json!({"connections": [{"id": "c1", "name": "生产服务器", "host": "2.2.2.2"}]});
-        let recs = run("connections", &CONNECTIONS_RULES, &Mirror::new(), &before, &after);
+        let recs = run(
+            "connections",
+            &CONNECTIONS_RULES,
+            &Mirror::new(),
+            &before,
+            &after,
+        );
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].label, "连接『生产服务器』的主机地址");
         assert_eq!(recs[0].old_value.as_deref(), Some("1.1.1.1"));
@@ -866,9 +881,19 @@ mod tests {
         let after = json!({"connections": [
             {"id": "new", "name": "新机器", "host": "h2", "port": 22, "username": "u", "authMethod": "Password"}
         ]});
-        let recs = run("connections", &CONNECTIONS_RULES, &Mirror::new(), &before, &after);
+        let recs = run(
+            "connections",
+            &CONNECTIONS_RULES,
+            &Mirror::new(),
+            &before,
+            &after,
+        );
         let labels: Vec<&str> = recs.iter().map(|r| r.label.as_str()).collect();
-        assert_eq!(labels.len(), 2, "两个元素各一条，而不是十几个字段各一条: {labels:?}");
+        assert_eq!(
+            labels.len(),
+            2,
+            "两个元素各一条，而不是十几个字段各一条: {labels:?}"
+        );
         assert!(labels.contains(&"新增连接『新机器』"));
         assert!(labels.contains(&"删除连接『旧机器』"));
         let removed = recs.iter().find(|r| r.label.starts_with("删除")).unwrap();
@@ -884,9 +909,7 @@ mod tests {
 
     #[test]
     fn reordering_the_same_elements_is_recorded_but_add_or_remove_is_not_double_counted() {
-        let make = |ids: &[&str]| {
-            json!({"connections": ids.iter().map(|i| json!({"id": i, "name": i})).collect::<Vec<_>>()})
-        };
+        let make = |ids: &[&str]| json!({"connections": ids.iter().map(|i| json!({"id": i, "name": i})).collect::<Vec<_>>()});
         let reorder = run(
             "connections",
             &CONNECTIONS_RULES,
@@ -904,7 +927,11 @@ mod tests {
             &make(&["a"]),
             &make(&["a", "b"]),
         );
-        assert_eq!(add.len(), 1, "只有「新增连接」一条，顺序叶子的变化不重复记: {add:?}");
+        assert_eq!(
+            add.len(),
+            1,
+            "只有「新增连接」一条，顺序叶子的变化不重复记: {add:?}"
+        );
         assert_eq!(add[0].label, "新增连接『b』");
     }
 
@@ -972,7 +999,14 @@ mod tests {
         let mut store = HistoryStore::load(path.clone());
 
         let w = |key: &str| {
-            HistoryRecord::warning("knownHosts", "t", "手机", &[Seg::key("entries")], "警告", key)
+            HistoryRecord::warning(
+                "knownHosts",
+                "t",
+                "手机",
+                &[Seg::key("entries")],
+                "警告",
+                key,
+            )
         };
         store.push_many(vec![w("k1"), w("k1"), w("k2")]);
         assert_eq!(store.len(), 2, "同一个 dedupe_key 只记一次");
@@ -995,6 +1029,10 @@ mod tests {
             .collect();
         capped.push_many(many);
         assert_eq!(capped.len(), HISTORY_CAP);
-        assert_eq!(capped.list(1)[0].label, format!("n{}", HISTORY_CAP + 29), "最新的在最前");
+        assert_eq!(
+            capped.list(1)[0].label,
+            format!("n{}", HISTORY_CAP + 29),
+            "最新的在最前"
+        );
     }
 }

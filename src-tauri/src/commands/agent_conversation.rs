@@ -39,10 +39,7 @@ fn conversation_subtree_is_busy(
     })
 }
 
-async fn connection_id_for_session(
-    state: &AppState,
-    session_id: &str,
-) -> Result<String, AppError> {
+async fn connection_id_for_session(state: &AppState, session_id: &str) -> Result<String, AppError> {
     if session_id.starts_with("debug-session:") {
         return Ok(DEBUG_SERVER_ID.to_string());
     }
@@ -431,13 +428,11 @@ pub async fn agent_fork_conversation(
 
     // 时间戳解析失败不报错：id 锚点仍可能命中（重载过的会话），别让一个坏时间戳
     // 把整个分叉堵死。
-    let anchor_ts = anchor_turn_started_at
-        .as_deref()
-        .and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|t| t.with_timezone(&chrono::Utc))
-                .ok()
-        });
+    let anchor_ts = anchor_turn_started_at.as_deref().and_then(|s| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .ok()
+    });
     if anchor_turn_started_at.is_some() && anchor_ts.is_none() {
         log::warn!("分叉锚点时间无法解析: {anchor_turn_started_at:?}");
     }
@@ -450,10 +445,7 @@ pub async fn agent_fork_conversation(
         .conversation_db
         .fork_conversation(
             &conversation_id,
-            anchor_message_id
-                .as_deref()
-                .map(AnchorRef::ById)
-                .as_ref(),
+            anchor_message_id.as_deref().map(AnchorRef::ById).as_ref(),
             &title,
             tail_busy,
         )

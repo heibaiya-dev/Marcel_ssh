@@ -139,7 +139,8 @@ mod tests {
 
     #[test]
     fn tree_url_yields_subpath() {
-        let s = parse_skill_url("https://github.com/ShortX-Repo/ShortX-Files/tree/main/skills").unwrap();
+        let s = parse_skill_url("https://github.com/ShortX-Repo/ShortX-Files/tree/main/skills")
+            .unwrap();
         assert_eq!(s.subpath.as_deref(), Some("skills"));
     }
 

@@ -415,7 +415,8 @@ function MessageList({
   slotsRef.current = slots;
   useEffect(() => {
     if (!virtual) return;
-    const onVisibility = () => {
+    let frame = 0;
+    const audit = () => {
       if (!visible || document.visibilityState !== 'visible') return;
       const container = virtualizer.current;
       const listNode = listStart.current?.firstElementChild;
@@ -426,14 +427,34 @@ function MessageList({
         if (!inner?.isConnected) return;
         let wrapper: HTMLElement = inner;
         while (wrapper.parentElement && wrapper.parentElement !== listNode) wrapper = wrapper.parentElement;
+        // 带 iframe 的保留视图（render_html 等）重挂 = 整页重新加载，恢复时表现为长时间黑屏；
+        // 它们不重挂，交给 virtua 的 ResizeObserver 自行重量。
+        if (wrapper.querySelector('iframe')) return;
         const cached = container.getItemSize(index);
         if (!Number.isFinite(cached)) return;
         if (Math.abs(cached - wrapper.getBoundingClientRect().height) > 1) keys.push(slot.key);
       });
       if (keys.length) setRepair((old) => ({ epoch: old.epoch + 1, keys: new Set(keys) }));
     };
+    // 窗口刚恢复的瞬间布局还没稳定（容器可能是 0 尺寸、行高是过渡值），此时比对会把几乎所有行
+    // 判成「账实不符」而整批重挂（子对话里一大堆工具卡/iframe → 黑屏）。
+    // 等到容器有真实尺寸，且 ResizeObserver 已经有一帧机会把健康行的账面追平，再审计。
+    const onVisibility = () => {
+      cancelAnimationFrame(frame);
+      if (!visible || document.visibilityState !== 'visible') return;
+      let waited = 0;
+      const step = () => {
+        const scroll = scrollRef.current;
+        const sized = !scroll || (scroll.clientHeight > 0 && scroll.clientWidth > 0);
+        if (!sized && ++waited < 30) { frame = requestAnimationFrame(step); return; }
+        if (waited >= 30) return;
+        audit();
+      };
+      // 双 rAF：第一帧让 RO 派发，第二帧账面已追平再审计。
+      frame = requestAnimationFrame(() => { frame = requestAnimationFrame(step); });
+    };
     document.addEventListener('visibilitychange', onVisibility);
-    return () => document.removeEventListener('visibilitychange', onVisibility);
+    return () => { cancelAnimationFrame(frame); document.removeEventListener('visibilitychange', onVisibility); };
   }, [virtual, visible]);
   // ssrCount 让首帧在测量前就有内容，但 virtua 的 store 会一直停在「SSR 窗口」
   // （只渲染前 ssrCount 个槽位），直到第一次有效滚动才退出。内容不足一屏的会话滚不动，

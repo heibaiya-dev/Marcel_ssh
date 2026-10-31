@@ -331,8 +331,11 @@ fn isolated_state_with(
         CommandExecutionManager::LOCAL_JOB_ID_PREFIX,
     );
     let ssh_manager = SshManager::with_known_hosts(KnownHostsStore::in_memory());
-    let connection_store =
-        JsonStore::new(dir, crate::config::connections::ConnectionStore::new(), None);
+    let connection_store = JsonStore::new(
+        dir,
+        crate::config::connections::ConnectionStore::new(),
+        None,
+    );
     let settings_store = JsonStore::new(dir, settings, None);
     let quick_command_store = JsonStore::new(
         dir,
@@ -1532,7 +1535,7 @@ fn scripted_production_loop_stream_failures_keep_history_clean() {
                 error_status: None,
                 abort_stream: false,
             },
-            // ── b. Streaming 阶段断流（从不重试）──
+            // ── b. Streaming 阶段断流：传输层断线会重试，重试预算耗尽后才失败 ──
             ModelStep {
                 label: "partial stream then abort",
                 check: Box::new(|request| {
@@ -1540,6 +1543,23 @@ fn scripted_production_loop_stream_failures_keep_history_clean() {
                     require(
                         messages.last().is_some_and(|m| m["content"] == DISCONNECT_PROMPT),
                         "missing disconnect scenario prompt",
+                    )
+                }),
+                frames: vec![
+                    json!({"choices": [{"index": 0, "delta": {"role": "assistant", "content": DISCONNECT_PARTIAL}, "finish_reason": null}]}),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": null}]}),
+                ],
+                error_status: None,
+                abort_stream: true,
+            },
+            ModelStep {
+                label: "partial stream then abort again (retry exhausted)",
+                check: Box::new(|request| {
+                    let messages = request_messages(request)?;
+                    require(
+                        messages.last().is_some_and(|m| m["content"] == DISCONNECT_PROMPT)
+                            && messages.iter().all(|m| m["role"] != "assistant"),
+                        "断线重试必须原样重发历史，不得夹带上一次的半截 assistant",
                     )
                 }),
                 frames: vec![
@@ -1723,9 +1743,14 @@ fn scripted_production_loop_stream_failures_keep_history_clean() {
                 stream_events.iter().any(|e| e["data"]["type"] == "error"),
                 "断流必须以 error 事件收场"
             );
-            assert!(
-                !stream_events.iter().any(|e| e["data"]["type"] == "retrying"),
-                "Streaming 阶段的错误从不重试"
+            let retrying: Vec<&&Value> = stream_events
+                .iter()
+                .filter(|e| e["data"]["type"] == "retrying")
+                .collect();
+            assert_eq!(retrying.len(), 1, "断流先重试一次（预算 1 次），耗尽后才失败");
+            assert_eq!(
+                retrying[0]["data"]["discardPartial"], true,
+                "流中途重试必须通知前端撤掉已上屏的半截内容"
             );
             assert!(!events_contain(
                 &events,
