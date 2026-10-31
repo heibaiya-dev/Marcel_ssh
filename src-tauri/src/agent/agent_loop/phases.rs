@@ -389,6 +389,11 @@ pub(super) async fn request_round_reply(
                         }
                         Some(other) => {
                             flush_delta_batch(&app_fwd, &evn, pending.take(), &mut batch_deadline);
+                            // 流中途断线重试：上一次尝试已半截丢弃，其思维标签的
+                            // 半解析状态不能带进重发的那次。
+                            if matches!(other, StreamEvent::Retrying { discard_partial: true, .. }) {
+                                thinking_filter = ThinkingFilterState::default();
+                            }
                             emit_event(&app_fwd, &evn, other);
                         }
                     }

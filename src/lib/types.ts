@@ -1139,7 +1139,7 @@ export type LlmStreamEvent =
   // 卡片、把回合收尾状态写成 completed（进而折叠）；取消时这两件事都是错的。
   | { type: 'cancelled' }
   | { type: 'error'; message: string }
-  | { type: 'retrying'; attempt: number; maxAttempts: number; delaySecs: number; lastError: string }
+  | { type: 'retrying'; attempt: number; maxAttempts: number; delaySecs: number; lastError: string; discardPartial?: boolean }
   // Context compaction visibility — LLM summarization of old history is in
   // progress (can take tens of seconds), completed, or skipped.
   | { type: 'compactionStart'; trigger: string }

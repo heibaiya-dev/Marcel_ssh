@@ -22,6 +22,7 @@ import {
   handleToolOutput,
   handleToolCallDelta,
   settleComposing,
+  markRoundEnded,
   handleModelApprovalStart,
   handleModelApprovalDone,
   handleCompactionStart,
@@ -414,6 +415,8 @@ export async function attachStreamListener(taskId: string, conversationId: strin
       if (hasEventType(ev, 'contextUsage')) {
         // 本轮模型输出已结束：还没写完标记的（无参数工具）此刻必须亮出卡片
         settleComposing(handler, conversationId);
+        // 本轮撤销标记作废：下一轮若续写同一气泡，流中途重试不能截到上一轮
+        markRoundEnded(taskId);
         // 按**订阅这条流时用的会话 id**落桶：子 agent 的流订阅时用的是它自己
         // 的子会话 id，所以父子天然分开；而后端给的读数里子会话已经并进父会话，
         // 这里再累加就会算两遍。
