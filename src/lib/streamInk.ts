@@ -77,6 +77,8 @@ function wrapNode(node: InkNode, range: InkRange, inkClass: string, cursor: Curs
     const parts: InkNode[] = [];
     const head = chars.slice(0, from - start).join('');
     if (head) parts.push({ type: 'text', value: head });
+    // 一段字只包一层 span。逐字切分会每拍重建几十个 span、并让错峰尾巴拖到
+    // 显示节拍（100ms）之后，被下一拍整段替换掉，看起来就是一闪一闪。
     parts.push({
       type: 'element',
       tagName: 'span',
@@ -125,33 +127,50 @@ export function wrapInkRange<T extends InkNode>(
   return { tree: usable ? next : tree, length: cursor.index };
 }
 
+function isInkNode(node: InkNode): boolean {
+  const className = node.properties?.className;
+  const names = Array.isArray(className)
+    ? className
+    : typeof className === 'string'
+      ? className.split(/\s+/)
+      : [];
+  return names.some((name) => name === 'ink-a' || name === 'ink-b' || name === 'ink-run');
+}
+
 /**
- * 解析结果落后于显示节拍时，把尚未解析的尾巴接到最后一个文本节点。
+ * 解析结果落后于显示节拍时，把尚未解析的尾巴接到最后一行的文本里。
  * 只克隆尾路径：已排版的前缀保持原引用，绝不整块退回裸文本。
+ *
+ * 尾巴不能塞进 `.ink-a/.ink-b`：那是给「已解析的一小段」播一次晕染的，
+ * 后续节拍继续往里追加时 React 会复用同一个 span，动画不会重播，新字就变成直接弹出。
+ * 这里把尾巴挂成墨晕 span 的**兄弟文本节点**，让下一拍的新字保持独立。
  */
 export function appendStreamingTail<T extends InkNode>(tree: T, tail: string): T {
   if (!tail) return tree;
-  let appended = false;
-  const visit = (node: InkNode): InkNode => {
-    if (appended) return node;
+  const visit = (node: InkNode): { next: InkNode; done: boolean } => {
     if (node.type === 'text') {
-      appended = true;
-      return { ...node, value: (node.value ?? '') + tail };
+      return { next: { ...node, value: (node.value ?? '') + tail }, done: true };
     }
     const children = node.children;
-    if (!children?.length) return node;
-    for (let index = children.length - 1; index >= 0; index--) {
-      const next = visit(children[index]);
-      if (next !== children[index]) {
-        const nextChildren = [...children];
-        nextChildren[index] = next;
-        return { ...node, children: nextChildren };
-      }
+    if (!children?.length) return { next: node, done: false };
+    const lastIndex = children.length - 1;
+    const last = children[lastIndex];
+    if (isInkNode(last)) {
+      return {
+        next: { ...node, children: [...children, { type: 'text', value: tail }] },
+        done: true,
+      };
     }
-    return node;
+    const replaced = visit(last);
+    if (replaced.done) {
+      const nextChildren = [...children];
+      nextChildren[lastIndex] = replaced.next;
+      return { next: { ...node, children: nextChildren }, done: true };
+    }
+    return { next: node, done: false };
   };
-  const next = visit(tree);
-  if (next !== tree) return next as T;
+  const result = visit(tree);
+  if (result.done) return result.next as T;
   return {
     ...tree,
     children: [

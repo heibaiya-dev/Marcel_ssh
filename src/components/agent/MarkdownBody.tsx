@@ -117,13 +117,18 @@ export default memo(function MarkdownBody({
     });
   }, [shown, fallback, sync, visible]);
 
+  // 墨晕树只跟「已解析的那份快照」变：每拍重算会把 span 拆了重建，
+  // 复用到的新 span 元素若 class 没变就不会重新起播，看起来就是「晕染没了」。
+  const inked = useMemo(
+    () => (rendered?.ink ? wrapInkRange(rendered.tree, rendered.ink, rendered.even).tree : rendered?.tree ?? null),
+    [rendered],
+  );
+
+  // 解析还没追上的尾巴接在墨晕之后：只克隆尾路径，整棵树其余部分保持原引用。
   const tree = useMemo(() => {
-    if (!rendered || !shown.startsWith(rendered.source)) return null;
-    const base = rendered.ink
-      ? wrapInkRange(rendered.tree, rendered.ink, rendered.even).tree
-      : rendered.tree;
-    return appendStreamingTail(base, shown.slice(rendered.source.length));
-  }, [rendered, shown]);
+    if (!inked || !rendered || !shown.startsWith(rendered.source)) return null;
+    return appendStreamingTail(inked, shown.slice(rendered.source.length));
+  }, [inked, rendered, shown]);
 
   if (fallback || sync) {
     return <SynchronousMarkdown content={content} />;

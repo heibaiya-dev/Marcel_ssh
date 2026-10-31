@@ -98,4 +98,12 @@ describe('appendStreamingTail', () => {
     expect(appendStreamingTail(tree, '')).toBe(tree);
     expect(inkTextLength(appendStreamingTail(tree, '新'))).toBe(1);
   });
+
+  it('尾巴接在墨晕 span 外面，不并进动画节点（否则下一拍不会重播）', () => {
+    const inked = wrapInkRange(root([el('p', [text('旧字')])]), { start: 0, end: 2 }).tree;
+    const next = appendStreamingTail(inked, '新尾巴');
+    expect(inkSpans(next)).toEqual([{ text: '旧字', cls: 'ink-a' }]);
+    expect(inkTextLength(next)).toBe(5);
+    expect(inkTextLength(inked)).toBe(2);
+  });
 });
