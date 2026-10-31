@@ -160,7 +160,7 @@ export function AgentComposer({
             type="button"
             onClick={() => void handleAttach()}
             disabled={!canInteract}
-            className="flex-shrink-0 p-1.5 -ml-0.5 rounded-full text-zinc-400 hover:text-zinc-100 hover:bg-state-mid/50 disabled:opacity-30 disabled:cursor-not-allowed transition-[background-color,color,transform] duration-150 active:scale-90"
+            className="flex-shrink-0 p-1.5 -ml-0.5 rounded-full text-zinc-400 hover:text-zinc-100 hover:bg-state-mid/50 disabled:opacity-30 disabled:cursor-not-allowed transition-[background-color,color,scale] duration-150 active:scale-90"
             title="添加图片或文本文件"
             aria-label="添加图片或文本文件"
           >

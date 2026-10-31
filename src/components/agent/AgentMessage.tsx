@@ -344,7 +344,7 @@ function AgentMessage({
                     />
                   </svg>
                   <svg
-                    className={`w-3.5 h-3.5 text-green-400 absolute inset-0 transition-all duration-120 ${
+                    className={`w-3.5 h-3.5 text-green-400 absolute inset-0 transition-[opacity,transform] duration-120 ${
                       copied ? 'opacity-100 scale-100' : 'opacity-0 scale-50'
                     }`}
                     fill="none"
