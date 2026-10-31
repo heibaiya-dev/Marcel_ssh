@@ -47,7 +47,9 @@ export default memo(function AgentTranscript({
   const lastScroll = useRef({ top: 0, height: 0 });
   const [nearBottom, setNearBottom] = useState(true);
   const previousConversation = useRef(conversationId);
-  const lastMessage = messages[messages.length - 1];
+  // 只认「消息换了」这一个信号。若依赖整个 lastMessage 对象，流式每个 delta 都会重跑一次
+  // 贴底，和 ResizeObserver 抢同一个 scrollTop；内容增长交给 ResizeObserver 独占。
+  const lastMessageId = messages.length ? messages[messages.length - 1].id : null;
   const onManualLayout = useCallback(() => {
     // A disclosure is a reading action. Its header owns the viewport until the next scroll.
     nearBottomRef.current = false;
@@ -75,11 +77,11 @@ export default memo(function AgentTranscript({
       previousConversation.current = conversationId;
       nearBottomRef.current = true;
     }
-    if (!canInteract || !lastMessage) return;
+    if (!canInteract || !lastMessageId) return;
     if (!shouldAutoScroll(nearBottomRef.current, userJustSentRef.current)) return;
     scrollToBottom();
     userJustSentRef.current = false;
-  }, [visible, conversationId, canInteract, lastMessage, scrollToBottom, userJustSentRef]);
+  }, [visible, conversationId, canInteract, lastMessageId, scrollToBottom, userJustSentRef]);
 
   // Async Markdown, images, IME and composer growth all feed the same follow owner.
   useEffect(() => {

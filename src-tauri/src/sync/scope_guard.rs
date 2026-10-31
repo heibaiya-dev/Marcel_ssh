@@ -348,6 +348,14 @@ fn diff_summary(expected: &str, actual: &str) -> String {
     out
 }
 
+/// 快照是纯文本，但 git 在 Windows 上可能把检出内容写成 CRLF（本机 `core.autocrlf=true`，
+/// GitHub 的 windows 运行器默认也是 true）。`render()` 生成的一律是 LF，直接按字节比，
+/// 换行风格就会把「内容完全一致」误报成「有字段没声明作用域」，还因为差异集合为空而看不出原因。
+/// 所以两边都先归一化换行，再比较。
+fn normalize_eol(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -367,6 +375,7 @@ fn every_config_field_declares_its_sync_scope() {
             path.display()
         )
     });
+    let (expected, actual) = (normalize_eol(&expected), normalize_eol(&actual));
     assert!(
         expected == actual,
         "配置字段的作用域和快照对不上：\n{}\n\
