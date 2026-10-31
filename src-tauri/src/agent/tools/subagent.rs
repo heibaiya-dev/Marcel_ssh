@@ -133,7 +133,10 @@ pub(crate) fn resolve_subagent_candidates(registry: &LlmRegistry) -> Vec<Subagen
             continue;
         };
         if !channel.enabled {
-            log::debug!("子agent 候选 {} 所在渠道已禁用，已跳过", registry.model_label(model));
+            log::debug!(
+                "子agent 候选 {} 所在渠道已禁用，已跳过",
+                registry.model_label(model)
+            );
             continue;
         }
         // 同一模型重复条目（手改配置才会出现，UI 已排除）：直接只保留第一条，
@@ -154,7 +157,11 @@ pub(crate) fn resolve_subagent_candidates(registry: &LlmRegistry) -> Vec<Subagen
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" "),
-            channel_name: channel.name.split_whitespace().collect::<Vec<_>>().join(" "),
+            channel_name: channel
+                .name
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
         });
     }
     let mut out: Vec<SubagentModelCandidate> = Vec::new();

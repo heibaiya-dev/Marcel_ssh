@@ -534,7 +534,11 @@ mod tests {
         };
         assert_eq!(
             accounts(&SecretSlot::sync_slots()),
-            ["sync2_data_key", "sync2_recovery_key", "sync2_storage_password"]
+            [
+                "sync2_data_key",
+                "sync2_recovery_key",
+                "sync2_storage_password"
+            ]
         );
         assert_eq!(
             accounts(&SecretSlot::legacy_sync_slots()),

@@ -280,21 +280,23 @@ fn detect_lan_ip() -> Option<IpAddr> {
 /// 端口占用是用户最常撞上的情况，抛一句 `os error 10048` 等于没说——
 /// 用户需要知道的是「哪个端口被占了、去改哪个设置」。
 async fn bind_listener(addr: SocketAddr, port: u16) -> Result<tokio::net::TcpListener, AppError> {
-    tokio::net::TcpListener::bind(addr).await.map_err(|e| match e.kind() {
-        std::io::ErrorKind::AddrInUse => AppError::Config(format!(
-            "端口 {} 已被其他程序占用。换一个端口，或先关掉占用它的程序。",
-            port
-        )),
-        std::io::ErrorKind::PermissionDenied => AppError::Config(format!(
-            "没有权限监听 {}。1024 以下的端口通常需要管理员权限，请改用 1024 以上的端口。",
-            addr
-        )),
-        std::io::ErrorKind::AddrNotAvailable => AppError::Config(format!(
-            "本机没有 {} 这个地址，无法绑定。绑定地址一般保持 127.0.0.1。",
-            addr.ip()
-        )),
-        _ => AppError::Network(format!("无法监听 {}：{}", addr, e)),
-    })
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AddrInUse => AppError::Config(format!(
+                "端口 {} 已被其他程序占用。换一个端口，或先关掉占用它的程序。",
+                port
+            )),
+            std::io::ErrorKind::PermissionDenied => AppError::Config(format!(
+                "没有权限监听 {}。1024 以下的端口通常需要管理员权限，请改用 1024 以上的端口。",
+                addr
+            )),
+            std::io::ErrorKind::AddrNotAvailable => AppError::Config(format!(
+                "本机没有 {} 这个地址，无法绑定。绑定地址一般保持 127.0.0.1。",
+                addr.ip()
+            )),
+            _ => AppError::Network(format!("无法监听 {}：{}", addr, e)),
+        })
 }
 
 /// 运行 HTTP transport 并**阻塞**到服务结束（CLI `--mcp-http` 用）。
@@ -308,11 +310,7 @@ pub async fn run_http_server(server: &McpServer, cfg: HttpConfig) -> Result<(), 
 ///
 /// MCP 的 HTTP 传输把 initialize / tools/list / tools/call 都收敛到
 /// 同一个端点上，请求体就是一条 JSON-RPC 消息。
-async fn handle_mcp(
-    State(state): State<HttpState>,
-    headers: HeaderMap,
-    body: String,
-) -> Response {
+async fn handle_mcp(State(state): State<HttpState>, headers: HeaderMap, body: String) -> Response {
     // ── 认证 ──
     //
     // 注意：`body: String` 由 axum 的提取器在进入本函数**之前**就已读进内存

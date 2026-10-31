@@ -186,9 +186,6 @@ mod tests {
             tool_call_id: None,
         })
         .unwrap();
-        assert!(
-            v.get("toolCallId").is_none(),
-            "非 tool 行不携带 toolCallId"
-        );
+        assert!(v.get("toolCallId").is_none(), "非 tool 行不携带 toolCallId");
     }
 }

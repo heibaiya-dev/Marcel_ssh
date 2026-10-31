@@ -74,15 +74,7 @@ pub async fn mcp_server_start_http(
         state.config_dir.clone(),
     );
 
-    runtime::start(
-        &server,
-        HttpConfig {
-            bind,
-            port,
-            token,
-        },
-    )
-    .await
+    runtime::start(&server, HttpConfig { bind, port, token }).await
 }
 
 /// 停止 HTTP 服务。返回「之前是否在跑」——幂等，重复点不报错。
@@ -99,8 +91,7 @@ pub async fn mcp_server_stop_http() -> Result<bool, AppError> {
 pub fn mcp_server_regenerate_token() -> Result<String, AppError> {
     if runtime::status().is_some() {
         return Err(AppError::Config(
-            "服务正在运行，换令牌会让已接入的客户端立刻断连。请先停止服务，再重新生成。"
-                .into(),
+            "服务正在运行，换令牌会让已接入的客户端立刻断连。请先停止服务，再重新生成。".into(),
         ));
     }
     Ok(generate_token())

@@ -49,10 +49,7 @@ impl ToolRegistry {
     /// 用 `Arc::new_cyclic` 建立双向关系：注册表持有执行器，执行器需要回调
     /// 注册表来分发基础工具。回调那一侧用 `Weak` 断掉引用环，`new_cyclic`
     /// 让这个环在构造期就能建起来。
-    pub fn new_with_agent_tasks(
-        executor: Arc<ExternalExecutor>,
-        config_dir: PathBuf,
-    ) -> Arc<Self> {
+    pub fn new_with_agent_tasks(executor: Arc<ExternalExecutor>, config_dir: PathBuf) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
             let runner = Arc::new(AgentTaskRunner::new(
                 executor.clone(),
@@ -382,10 +379,10 @@ impl ToolRegistry {
         json!({
             "name": AGENT_TASK_TOOL,
             "description": "把一个复杂的多步骤 SSH 任务委派给 Marcel SSH 的无头 agent 执行。\
-它会自己规划步骤、调用 ssh_execute / sftp_* 等工具把活干完，最后返回一段汇报。\
-适合：需要多步探查再动手的任务（部署、排障、批量操作）；单条命令请直接用 ssh_execute。\
-注意：任务执行期间无法向用户提问，所以任务描述要把目标和约束说清楚。\
-安全提示：此工具执行的命令不经过 Marcel SSH 的风险评估，也不会弹审批。",
+        它会自己规划步骤、调用 ssh_execute / sftp_* 等工具把活干完，最后返回一段汇报。\
+        适合：需要多步探查再动手的任务（部署、排障、批量操作）；单条命令请直接用 ssh_execute。\
+        注意：任务执行期间无法向用户提问，所以任务描述要把目标和约束说清楚。\
+        安全提示：此工具执行的命令不经过 Marcel SSH 的风险评估，也不会弹审批。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -424,11 +421,10 @@ impl ToolRegistry {
         &self,
         _arguments: serde_json::Value,
     ) -> Result<ToolCallResult, McpError> {
-        let connections = self
-            .executor
-            .list_connections()
-            .await
-            .map_err(|e| McpError::internal_error(format!("Failed to list connections: {}", e)))?;
+        let connections =
+            self.executor.list_connections().await.map_err(|e| {
+                McpError::internal_error(format!("Failed to list connections: {}", e))
+            })?;
 
         let json = serde_json::to_string(&connections)
             .map_err(|e| McpError::internal_error(format!("JSON serialization failed: {}", e)))?;
@@ -450,9 +446,7 @@ impl ToolRegistry {
             .and_then(|v| v.as_str())
             .ok_or_else(|| McpError::invalid_params("Missing 'command'"))?;
 
-        let timeout_ms = arguments
-            .get("timeout_ms")
-            .and_then(|v| v.as_u64());
+        let timeout_ms = arguments.get("timeout_ms").and_then(|v| v.as_u64());
 
         let output = self
             .executor
@@ -658,16 +652,22 @@ impl ToolRegistry {
         match auth_method {
             "password" => {
                 if password.is_none() {
-                    return Err(McpError::invalid_params("auth_method=password requires 'password' field"));
+                    return Err(McpError::invalid_params(
+                        "auth_method=password requires 'password' field",
+                    ));
                 }
             }
             "private_key" => {
                 if private_key_path.is_none() {
-                    return Err(McpError::invalid_params("auth_method=private_key requires 'private_key_path' field"));
+                    return Err(McpError::invalid_params(
+                        "auth_method=private_key requires 'private_key_path' field",
+                    ));
                 }
             }
             _ => {
-                return Err(McpError::invalid_params("auth_method must be 'password' or 'private_key'"));
+                return Err(McpError::invalid_params(
+                    "auth_method must be 'password' or 'private_key'",
+                ));
             }
         }
 
@@ -751,7 +751,7 @@ mod tests {
     use crate::command_exec::CommandExecutionManager;
     use crate::config::connections::ConnectionStore;
     use crate::SshManager;
-    
+
     /// 构造一个不连真实服务器的注册表：执行器指向临时目录的 manager，
     /// 连接表为空。只用于校验 schema 与分发，不触发真实 SSH。
     async fn test_registry() -> ToolRegistry {
@@ -953,7 +953,9 @@ mod tests {
             crate::mcp_server::protocol::ContentItem::Text { text } => text.clone(),
         };
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let id = parsed["connection_id"].as_str().expect("必须有 connection_id");
+        let id = parsed["connection_id"]
+            .as_str()
+            .expect("必须有 connection_id");
         assert!(id.starts_with("mcp-temp-"), "临时连接 id 应有前缀: {}", id);
         assert_eq!(parsed["temporary"], true);
 
@@ -987,7 +989,10 @@ mod tests {
             .unwrap();
         assert!(created.is_error.is_none());
 
-        let listed = registry.call_tool("list_connections", json!({})).await.unwrap();
+        let listed = registry
+            .call_tool("list_connections", json!({}))
+            .await
+            .unwrap();
         let text = match &listed.content[0] {
             crate::mcp_server::protocol::ContentItem::Text { text } => text.clone(),
         };

@@ -1119,7 +1119,9 @@ mod tests {
         let fresh = TemplateManager::build_agent_registry();
         let ctx = json!({ "session_id": "s", "user_prompt": "p", "plugin_sections": "" });
         for name in ["角色", "沟通", "多机"] {
-            let from_cache = TemplateManager::agent_registry().render(name, &ctx).unwrap();
+            let from_cache = TemplateManager::agent_registry()
+                .render(name, &ctx)
+                .unwrap();
             let from_fresh = fresh.render(name, &ctx).unwrap();
             assert_eq!(from_cache, from_fresh, "模板 {name} 的产物不得因缓存而变");
         }

@@ -214,8 +214,14 @@ mod tests {
         let user_id = user.id.clone();
         store.add(user);
 
-        assert_eq!(retire_builtin_skills(&mut store), RETIRED_BUILTIN_SKILL_IDS.len());
-        assert!(store.get(VISUALIZE_SKILL_ID).is_some(), "在册内置 skill 不能被误删");
+        assert_eq!(
+            retire_builtin_skills(&mut store),
+            RETIRED_BUILTIN_SKILL_IDS.len()
+        );
+        assert!(
+            store.get(VISUALIZE_SKILL_ID).is_some(),
+            "在册内置 skill 不能被误删"
+        );
         assert!(store.get(&user_id).is_some(), "用户 skill 不能被误删");
         assert_eq!(retire_builtin_skills(&mut store), 0, "第二次不应再有变更");
     }

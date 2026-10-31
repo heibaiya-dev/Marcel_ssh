@@ -225,7 +225,8 @@ impl RiskAssessor {
             }
 
             if let Some(path) = self.protected_path_hit(&parsed) {
-                worst = worst.worst(rules.verdict_default("protected_paths", &[("路径", path.as_str())]));
+                worst = worst
+                    .worst(rules.verdict_default("protected_paths", &[("路径", path.as_str())]));
             }
 
             // 用户自己加的规则：与内置规则同层、同样取最严。
@@ -257,9 +258,7 @@ impl RiskAssessor {
         match (kind, inner) {
             // `source` / `.` 的正文没法静态看，且等价替代零成本（`bash <脚本>`）
             // —— 默认直接拒绝并指路，不弹窗。
-            ("source", _) | (".", _) => {
-                rules.verdict_default("source_dot", &[])
-            }
+            ("source", _) | (".", _) => rules.verdict_default("source_dot", &[]),
             (_, Some(s)) => self.assess_command(s),
             // 有包装却没有内层字符串：同样看不懂（今天解析器不会产出这种形态，
             // `bash -c "$CMD"` 走的是上面递归后的「命令写在变量里」；留着是兜底）。

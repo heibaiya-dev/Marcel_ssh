@@ -337,7 +337,10 @@ fn build_from_entries(entries: Vec<Entry>, root: Option<&str>) -> Result<ParsedS
         }
         let text = String::from_utf8(e.bytes.clone())
             .map_err(|_| format!("资源文件 {} 不是有效的 UTF-8 文本", rel))?;
-        resources.push(SkillResource { path: rel, content: text });
+        resources.push(SkillResource {
+            path: rel,
+            content: text,
+        });
     }
     // 稳定顺序：按路径字典序，保证工具返回的清单与测试可预期
     resources.sort_by(|a, b| a.path.cmp(&b.path));
@@ -476,7 +479,10 @@ mod tests {
         assert_eq!(parsed.name, "demo");
         assert_eq!(parsed.prompt, "# Demo\n\n正文");
         let paths: Vec<_> = parsed.resources.iter().map(|r| r.path.as_str()).collect();
-        assert_eq!(paths, vec!["references/actions.md", "references/triggers.md"]);
+        assert_eq!(
+            paths,
+            vec!["references/actions.md", "references/triggers.md"]
+        );
     }
 
     #[test]

@@ -214,7 +214,9 @@ impl McpServer {
                     .unwrap_or(serde_json::json!({}));
 
                 match registry.call_tool(name, arguments).await {
-                    Ok(result) => McpResponse::success(req.id, serde_json::to_value(&result).unwrap()),
+                    Ok(result) => {
+                        McpResponse::success(req.id, serde_json::to_value(&result).unwrap())
+                    }
                     Err(err) => McpResponse::error(req.id, err),
                 }
             }

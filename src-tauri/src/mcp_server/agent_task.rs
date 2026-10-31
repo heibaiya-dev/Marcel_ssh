@@ -303,7 +303,9 @@ impl AgentTaskRunner {
             messages.push(reply);
 
             for call in calls {
-                let outcome = registry.dispatch_base(&call.name, call.arguments.clone()).await;
+                let outcome = registry
+                    .dispatch_base(&call.name, call.arguments.clone())
+                    .await;
 
                 let (ok, text) = match outcome {
                     Ok(result) => (true, content_text(&result)),
@@ -337,10 +339,7 @@ impl AgentTaskRunner {
         Ok(AgentTaskResult {
             status: "max_steps".into(),
             result: last_content,
-            error: Some(format!(
-                "已达到步数上限 {} 步，任务可能未完成",
-                max_steps
-            )),
+            error: Some(format!("已达到步数上限 {} 步，任务可能未完成", max_steps)),
             tool_calls: steps.len(),
             steps,
         })
@@ -354,11 +353,10 @@ impl AgentTaskRunner {
 pub async fn build_headless_llm(config_dir: &Path) -> Result<LlmManager, AppError> {
     let settings_file = AppSettings::default_file(config_dir);
 
-    let mut settings = tokio::task::spawn_blocking(move || {
-        AppSettings::load_from_path(&settings_file)
-    })
-    .await
-    .map_err(|e| AppError::Config(format!("加载设置任务失败：{}", e)))??;
+    let mut settings =
+        tokio::task::spawn_blocking(move || AppSettings::load_from_path(&settings_file))
+            .await
+            .map_err(|e| AppError::Config(format!("加载设置任务失败：{}", e)))??;
 
     // 先收集 id 再逐个回填：密钥链读取是阻塞调用，要 spawn_blocking，
     // 而 `&mut settings` 不能跨 await 持有。
@@ -398,7 +396,9 @@ fn base_tool_definitions(registry: &ToolRegistry) -> Vec<ToolDefinition> {
     registry
         .list_tools()
         .into_iter()
-        .filter(|schema| schema.get("name").and_then(|v| v.as_str()) != Some(tools::AGENT_TASK_TOOL))
+        .filter(|schema| {
+            schema.get("name").and_then(|v| v.as_str()) != Some(tools::AGENT_TASK_TOOL)
+        })
         .filter_map(|schema| {
             let name = schema.get("name")?.as_str()?.to_string();
             let description = schema
@@ -631,8 +631,7 @@ mod tests {
     /// 造一个 runner（registry 必须活着，runner 里拿的是它的 Weak）。
     async fn test_runner() -> (Arc<ToolRegistry>, Arc<AgentTaskRunner>) {
         let ssh = crate::SshManager::new();
-        let dir =
-            std::env::temp_dir().join(format!("marcel-agent-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("marcel-agent-test-{}", uuid::Uuid::new_v4()));
         let exec_mgr = Arc::new(
             crate::command_exec::CommandExecutionManager::new(
                 ssh.clone(),
@@ -721,8 +720,12 @@ mod tests {
         assert_eq!(result.steps.len(), 1);
         assert!(!result.steps[0].ok, "失败的一步要如实记为失败");
         // 失败的痕迹要留下来给调用方看，而不是被悄悄吞掉
-        assert!(result.steps[0].output_summary.contains("1001")
-            || result.steps[0].output_summary.contains("Connection not found"));
+        assert!(
+            result.steps[0].output_summary.contains("1001")
+                || result.steps[0]
+                    .output_summary
+                    .contains("Connection not found")
+        );
     }
 
     #[tokio::test]
@@ -739,10 +742,7 @@ mod tests {
                 !names.iter().any(|n| n == tools::AGENT_TASK_TOOL),
                 "不得把 agent_task 给模型：递归委派会让步数上限形同虚设"
             );
-            assert!(
-                names.iter().any(|n| n == "ssh_execute"),
-                "基础工具应当都在"
-            );
+            assert!(names.iter().any(|n| n == "ssh_execute"), "基础工具应当都在");
         }
     }
 

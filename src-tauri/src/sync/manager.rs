@@ -28,8 +28,7 @@ use super::core::path::{split_platform_prefix, PrefixKind};
 use super::core::{wall_clock_ms, Platform, RecoveryKey, Seg};
 use super::docedit;
 use super::engine::{
-    build_sync_code, plain_error, JoinSpec, RoundKind, SharedView, SyncDeps, SyncEngine,
-    SyncEvents,
+    build_sync_code, plain_error, JoinSpec, RoundKind, SharedView, SyncDeps, SyncEngine, SyncEvents,
 };
 use super::history::{HistoryStore, UndoAction};
 use super::secrets::{KeychainSecrets, SyncSecretStore};
@@ -464,10 +463,7 @@ impl SyncManager {
 
     // ── 写（经 actor） ──
 
-    async fn request<R>(
-        &self,
-        make: impl FnOnce(Reply<R>) -> Cmd,
-    ) -> Result<R, AppError> {
+    async fn request<R>(&self, make: impl FnOnce(Reply<R>) -> Cmd) -> Result<R, AppError> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .tx
@@ -517,11 +513,13 @@ impl SyncManager {
     }
 
     pub async fn set_device_name(&self, name: String) -> Result<(), AppError> {
-        self.request(|reply| Cmd::SetDeviceName { name, reply }).await
+        self.request(|reply| Cmd::SetDeviceName { name, reply })
+            .await
     }
 
     pub async fn confirm_held(&self, accept: bool) -> Result<(), AppError> {
-        self.request(|reply| Cmd::ConfirmHeld { accept, reply }).await
+        self.request(|reply| Cmd::ConfirmHeld { accept, reply })
+            .await
     }
 
     pub async fn disable(&self, wipe_remote: bool) -> Result<(), AppError> {
@@ -796,7 +794,11 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Scheduler::new(timing(), t0);
         s.mark_ready();
-        assert_eq!(s.next_wake(), None, "ready 之后还没排过完整一轮：由调用方的 sync_now 先跑");
+        assert_eq!(
+            s.next_wake(),
+            None,
+            "ready 之后还没排过完整一轮：由调用方的 sync_now 先跑"
+        );
         s.after_round(RoundKind::Full, true, at(t0, 1));
         assert_eq!(s.next_wake(), Some(at(t0, 61)));
         assert_eq!(s.take_due(at(t0, 30)), None);
@@ -874,44 +876,79 @@ mod tests {
         let mut doc = json!({"fontSize": 18, "list": [{"id": "a", "n": 1}]});
 
         // 叶子改回旧值（平台前缀被剥掉）
-        let own = if Platform::current() == Platform::Desktop { "@desktop" } else { "@android" };
+        let own = if Platform::current() == Platform::Desktop {
+            "@desktop"
+        } else {
+            "@android"
+        };
         let changed = apply_undo(
             &mut doc,
-            &UndoAction::Leaf { path: vec![k(own), k("fontSize")], old: Some(json!(14)) },
+            &UndoAction::Leaf {
+                path: vec![k(own), k("fontSize")],
+                old: Some(json!(14)),
+            },
             Platform::current(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(changed);
         assert_eq!(doc["fontSize"], json!(14));
         // 已经是旧值：不算改动
         assert!(!apply_undo(
             &mut doc,
-            &UndoAction::Leaf { path: vec![k(own), k("fontSize")], old: Some(json!(14)) },
+            &UndoAction::Leaf {
+                path: vec![k(own), k("fontSize")],
+                old: Some(json!(14))
+            },
             Platform::current(),
-        ).unwrap());
+        )
+        .unwrap());
         // 本来没有 → 删掉
         assert!(apply_undo(
             &mut doc,
-            &UndoAction::Leaf { path: vec![k("fontSize")], old: None },
+            &UndoAction::Leaf {
+                path: vec![k("fontSize")],
+                old: None
+            },
             Platform::current(),
-        ).unwrap());
+        )
+        .unwrap());
         assert!(doc.get("fontSize").is_none());
 
         // 元素：删 / 放回
-        assert!(apply_undo(&mut doc, &UndoAction::RemoveElement { path: vec![k("list"), Seg::id("a")] }, Platform::current()).unwrap());
+        assert!(apply_undo(
+            &mut doc,
+            &UndoAction::RemoveElement {
+                path: vec![k("list"), Seg::id("a")]
+            },
+            Platform::current()
+        )
+        .unwrap());
         assert_eq!(doc["list"], json!([]));
         assert!(apply_undo(
             &mut doc,
-            &UndoAction::RestoreElement { path: vec![k("list"), Seg::id("a")], element: json!({"id": "a", "n": 1}) },
+            &UndoAction::RestoreElement {
+                path: vec![k("list"), Seg::id("a")],
+                element: json!({"id": "a", "n": 1})
+            },
             Platform::current(),
-        ).unwrap());
+        )
+        .unwrap());
         assert_eq!(doc["list"], json!([{"id": "a", "n": 1}]));
 
         // 另一类设备的叶子：拒绝
-        let other = if Platform::current() == Platform::Desktop { "@android" } else { "@desktop" };
+        let other = if Platform::current() == Platform::Desktop {
+            "@android"
+        } else {
+            "@desktop"
+        };
         assert!(apply_undo(
             &mut doc,
-            &UndoAction::Leaf { path: vec![k(other), k("fontSize")], old: Some(json!(1)) },
+            &UndoAction::Leaf {
+                path: vec![k(other), k("fontSize")],
+                old: Some(json!(1))
+            },
             Platform::current(),
-        ).is_err());
+        )
+        .is_err());
     }
 }

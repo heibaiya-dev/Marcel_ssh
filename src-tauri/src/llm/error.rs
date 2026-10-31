@@ -323,10 +323,7 @@ mod tests {
 
         let text = format_reqwest_error(&err);
         assert!(!text.contains("请求构造失败"), "旧文案残留: {text}");
-        assert!(
-            text.contains("请求发送/等待响应失败"),
-            "新文案缺失: {text}"
-        );
+        assert!(text.contains("请求发送/等待响应失败"), "新文案缺失: {text}");
         assert!(
             text.contains("connection closed before message completed"),
             "底层原因链缺失: {text}"

@@ -140,7 +140,11 @@ fn sync_keys_are_pinned_and_only_config_tier_has_one() {
     for id in DataSourceId::ALL {
         match id.sync_key() {
             Some(key) => {
-                assert_eq!(id.tier(), SyncTier::Config, "{id:?} 有同步源 key 却不是 Config 档");
+                assert_eq!(
+                    id.tier(),
+                    SyncTier::Config,
+                    "{id:?} 有同步源 key 却不是 Config 档"
+                );
                 assert!(seen.insert(key), "同步源 key 重复: {key}");
             }
             None => assert_ne!(

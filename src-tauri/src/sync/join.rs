@@ -157,7 +157,9 @@ pub fn remap_connection_refs(
                 let mut seen = BTreeSet::new();
                 let mut next: Vec<Value> = Vec::with_capacity(ids.len());
                 for v in ids.iter() {
-                    let s = v.as_str().map(|s| map.get(s).map(String::as_str).unwrap_or(s));
+                    let s = v
+                        .as_str()
+                        .map(|s| map.get(s).map(String::as_str).unwrap_or(s));
                     match s {
                         Some(s) => {
                             if v.as_str() != Some(s) {
@@ -254,8 +256,7 @@ mod tests {
 
     #[test]
     fn references_follow_the_surviving_connection() {
-        let map: BTreeMap<String, String> =
-            [("local-1".to_string(), "cloud-1".to_string())].into();
+        let map: BTreeMap<String, String> = [("local-1".to_string(), "cloud-1".to_string())].into();
 
         let mut qc = json!({"commands": [
             {"id": "q1", "scope": "session", "sessionKey": "local-1"},
@@ -277,6 +278,9 @@ mod tests {
         // 不认识的源 / 空映射：什么都不动
         let mut other = json!({"a": 1});
         assert_eq!(remap_connection_refs("skills", &mut other, &map), 0);
-        assert_eq!(remap_connection_refs("settings", &mut settings, &BTreeMap::new()), 0);
+        assert_eq!(
+            remap_connection_refs("settings", &mut settings, &BTreeMap::new()),
+            0
+        );
     }
 }

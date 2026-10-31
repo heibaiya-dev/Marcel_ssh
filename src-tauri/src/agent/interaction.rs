@@ -307,7 +307,10 @@ impl AgentInteractionManager {
             let state = app.state::<crate::AppState>();
             let (ns, privacy_mode) = {
                 let settings = state.settings.read().await;
-                (settings.notification_settings.clone(), settings.privacy_mode)
+                (
+                    settings.notification_settings.clone(),
+                    settings.privacy_mode,
+                )
             };
             let disposition_label = risk.label();
             let body = format!(
@@ -385,7 +388,10 @@ impl AgentInteractionManager {
             let state = app.state::<crate::AppState>();
             let (ns, privacy_mode) = {
                 let settings = state.settings.read().await;
-                (settings.notification_settings.clone(), settings.privacy_mode)
+                (
+                    settings.notification_settings.clone(),
+                    settings.privacy_mode,
+                )
             };
             let title = format!("Agent 向您提问 ({} 题)", questions.len());
             let first_q = &questions[0];

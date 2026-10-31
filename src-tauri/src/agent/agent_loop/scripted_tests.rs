@@ -331,8 +331,11 @@ fn isolated_state_with(
         CommandExecutionManager::LOCAL_JOB_ID_PREFIX,
     );
     let ssh_manager = SshManager::with_known_hosts(KnownHostsStore::in_memory());
-    let connection_store =
-        JsonStore::new(dir, crate::config::connections::ConnectionStore::new(), None);
+    let connection_store = JsonStore::new(
+        dir,
+        crate::config::connections::ConnectionStore::new(),
+        None,
+    );
     let settings_store = JsonStore::new(dir, settings, None);
     let quick_command_store = JsonStore::new(
         dir,

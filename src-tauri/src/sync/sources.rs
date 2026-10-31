@@ -277,7 +277,12 @@ impl PostApply for ConnectionsPostApply {
             }
             for slot in SecretSlot::for_connection(&id) {
                 if let Err(e) = self.secrets.delete(&slot) {
-                    log::warn!("同步删除连接后清理{}失败（id={}）：{}", slot.describe(), id, e);
+                    log::warn!(
+                        "同步删除连接后清理{}失败（id={}）：{}",
+                        slot.describe(),
+                        id,
+                        e
+                    );
                 }
             }
         }
@@ -428,7 +433,10 @@ pub fn guard_known_host_fingerprints(
             continue;
         };
         let Some(local_fp) = current
-            .pointer(&format!("/entries/{}/fingerprint_sha256", escape_pointer(host)))
+            .pointer(&format!(
+                "/entries/{}/fingerprint_sha256",
+                escape_pointer(host)
+            ))
             .and_then(Value::as_str)
         else {
             continue; // 本机没有这条（或没有指纹）：新增，照常应用
@@ -502,10 +510,7 @@ pub fn build_adapters(
             stores.connections.clone(),
             Some(Arc::new(ConnectionsPostApply { secrets })),
         )),
-        Arc::new(JsonSourceAdapter::new(
-            stores.quick_commands.clone(),
-            None,
-        )),
+        Arc::new(JsonSourceAdapter::new(stores.quick_commands.clone(), None)),
         Arc::new(JsonSourceAdapter::new(stores.skills.clone(), None)),
         Arc::new(JsonSourceAdapter::new(
             stores.mcp_servers.clone(),

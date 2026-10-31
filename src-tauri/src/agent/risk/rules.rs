@@ -833,9 +833,7 @@ impl RuleConfig {
                 let needle = c.arg_contains.trim();
                 name_hit && (needle.is_empty() || parsed.args.iter().any(|a| a.contains(needle)))
             })
-            .map(|c| {
-                Assessment::at(c.level, c.verdict_reason()).with_rule(&c.id)
-            })
+            .map(|c| Assessment::at(c.level, c.verdict_reason()).with_rule(&c.id))
             .collect()
     }
 }

@@ -115,15 +115,9 @@ async fn write_response(
         .await
         .map_err(|e| AppError::Io(e))?;
 
-    stdout
-        .write_all(b"\n")
-        .await
-        .map_err(|e| AppError::Io(e))?;
+    stdout.write_all(b"\n").await.map_err(|e| AppError::Io(e))?;
 
-    stdout
-        .flush()
-        .await
-        .map_err(|e| AppError::Io(e))?;
+    stdout.flush().await.map_err(|e| AppError::Io(e))?;
 
     Ok(())
 }

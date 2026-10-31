@@ -481,7 +481,10 @@ mod tests {
         ];
         let (block, ids) = render_block(&ctx(), &items, now());
         assert_eq!(ids.len(), 2);
-        assert!(block.contains("- [small] 短条目：在 /opt/app"), "短条目带全文");
+        assert!(
+            block.contains("- [small] 短条目：在 /opt/app"),
+            "短条目带全文"
+        );
         assert!(!block.contains(&big), "大条目只剩标题");
         assert!(block.contains("- [big] 大条目（全局）"));
     }

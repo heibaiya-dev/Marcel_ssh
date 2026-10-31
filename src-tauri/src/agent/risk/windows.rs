@@ -85,7 +85,12 @@ fn win_default(rules: &RuleConfig, id: &str, vars: &[(&str, &str)]) -> Option<As
 
 /// 同 [`win_default`]，但措辞与规则表里那一种不同的分支（如 `net localgroup administrators`）
 /// 就地写说明；用户写了「拒绝说明」时同样由它替换，占位用 `vars`。
-fn win_with(rules: &RuleConfig, id: &str, reason: String, vars: &[(&str, &str)]) -> Option<Assessment> {
+fn win_with(
+    rules: &RuleConfig,
+    id: &str,
+    reason: String,
+    vars: &[(&str, &str)],
+) -> Option<Assessment> {
     let verdict = rules.verdict_with(id, reason, vars);
     (verdict.disposition != Disposition::Allow).then_some(verdict)
 }
@@ -192,11 +197,7 @@ fn verdict_for_line(line: &str, depth: u8, rules: &RuleConfig) -> Option<Assessm
             win_default(
                 rules,
                 "win_recursive_delete",
-                &[
-                    ("命令", head.as_str()),
-                    ("目标", target),
-                    ("说明", what),
-                ],
+                &[("命令", head.as_str()), ("目标", target), ("说明", what)],
             )
         }
 

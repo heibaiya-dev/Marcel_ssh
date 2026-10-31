@@ -730,7 +730,11 @@ mod tests {
             "检查源过少（{} 个），国内网络很容易全挂",
             CHECK_URLS.len()
         );
-        for edge in ["cdn.jsdelivr.net", "fastly.jsdelivr.net", "gcore.jsdelivr.net"] {
+        for edge in [
+            "cdn.jsdelivr.net",
+            "fastly.jsdelivr.net",
+            "gcore.jsdelivr.net",
+        ] {
             assert!(
                 CHECK_URLS.iter().any(|u| u.contains(edge)),
                 "缺少 jsDelivr 入口 {}：它和别的入口走不同边缘节点，缺一个国内就可能全线报错",
@@ -747,7 +751,11 @@ mod tests {
         // jsDelivr 用 `@main` 两种合法写法）。
         for url in CHECK_URLS {
             assert!(url.starts_with("https://"), "检查源必须 https: {}", url);
-            assert!(url.ends_with("/latest.json"), "检查源指向了别的文件: {}", url);
+            assert!(
+                url.ends_with("/latest.json"),
+                "检查源指向了别的文件: {}",
+                url
+            );
             assert!(
                 url.contains("q541810/Marcel_ssh"),
                 "检查源指向了别的仓库: {}",

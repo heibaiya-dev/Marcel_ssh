@@ -200,7 +200,11 @@ impl ExternalExecutor {
 
         let temp = self.temp_auth.read().get(connection_id).cloned();
         let Some(auth_method) = temp else {
-            return crate::commands::ssh::build_saved_connection_config(&saved, connection_id, false);
+            return crate::commands::ssh::build_saved_connection_config(
+                &saved,
+                connection_id,
+                false,
+            );
         };
 
         Ok(ConnectionConfig {
@@ -284,7 +288,9 @@ impl ExternalExecutor {
 
     /// 获取会话的当前工作目录（用于相对路径解析）
     pub async fn get_working_directory(&self, connection_id: &str) -> Result<String, AppError> {
-        let result = self.execute_command(connection_id, "pwd", Some(10_000)).await?;
+        let result = self
+            .execute_command(connection_id, "pwd", Some(10_000))
+            .await?;
 
         if result.exit_code != 0 {
             return Err(AppError::Agent(format!(
@@ -315,9 +321,8 @@ impl ExternalExecutor {
         // 首字母大写——在边界处转换，两边各自保持自己的约定。
         let (auth, stored_auth_method) = match auth_method {
             "password" => {
-                let password = password.ok_or_else(|| {
-                    AppError::Config("auth_method=password 需要 password".into())
-                })?;
+                let password = password
+                    .ok_or_else(|| AppError::Config("auth_method=password 需要 password".into()))?;
                 (
                     AuthMethod::Password {
                         password: password.to_string(),
@@ -572,7 +577,14 @@ mod tests {
         // 建一条临时连接后：查得到（这是 agent_task 前置校验的依据）
         let id = executor
             .create_connection(
-                "t", "example.com", 22, "u", "password", Some("pw"), None, None,
+                "t",
+                "example.com",
+                22,
+                "u",
+                "password",
+                Some("pw"),
+                None,
+                None,
             )
             .await
             .expect("建临时连接应成功");
@@ -600,7 +612,16 @@ mod tests {
 
         // 大小写在边界处归一：内部存 "Password"，外部只认小写 "password"
         let id = executor
-            .create_connection("t", "h.example.com", 22, "u", "password", Some("pw"), None, None)
+            .create_connection(
+                "t",
+                "h.example.com",
+                22,
+                "u",
+                "password",
+                Some("pw"),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let saved = executor.saved_connection(&id).await.unwrap();
@@ -610,7 +631,16 @@ mod tests {
         );
 
         let err = executor
-            .create_connection("t", "h.example.com", 22, "u", "PASSWORD", Some("pw"), None, None)
+            .create_connection(
+                "t",
+                "h.example.com",
+                22,
+                "u",
+                "PASSWORD",
+                Some("pw"),
+                None,
+                None,
+            )
             .await
             .expect_err("大写不该被接受——外部契约是小写");
         assert!(err.to_string().contains("password"));

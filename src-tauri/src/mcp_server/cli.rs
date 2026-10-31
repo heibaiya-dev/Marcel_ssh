@@ -200,10 +200,7 @@ async fn run_http(server: &McpServer) -> Result<(), Box<dyn std::error::Error>> 
 
     let cfg = HttpConfig { bind, port, token };
 
-    eprintln!(
-        "[Marcel SSH] HTTP 端点: http://{}/mcp",
-        cfg.socket_addr()
-    );
+    eprintln!("[Marcel SSH] HTTP 端点: http://{}/mcp", cfg.socket_addr());
     eprintln!(
         "[Marcel SSH] Tools: 10 (list_connections, ssh_execute, get_working_directory, \
          create_connection, test_connection, sftp_upload, sftp_download, sftp_list, \

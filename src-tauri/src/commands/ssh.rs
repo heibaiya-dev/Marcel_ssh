@@ -481,11 +481,8 @@ pub async fn ssh_reconnect(
             .clone()
     };
 
-    let config = build_saved_connection_config(
-        &saved,
-        &connection_id,
-        trust_new_host_key.unwrap_or(false),
-    )?;
+    let config =
+        build_saved_connection_config(&saved, &connection_id, trust_new_host_key.unwrap_or(false))?;
 
     state.ssh_manager.reconnect(session_id, config, app).await
 }
