@@ -62,36 +62,53 @@ export default memo(function MarkdownBody({
   const [fallback, setFallback] = useState(() => typeof Worker === 'undefined');
   /** 已经放到屏幕上的原文（只在 live 时落后于 content）。 */
   const [paced, setPaced] = useState(content);
+  /** 节拍器是否在跑：直播期间一直跑；直播结束后继续把欠的字慢慢排完（不整段跳出来）。 */
+  const [pacing, setPacing] = useState(live);
   const target = useRef(content);
   target.current = content;
   const pace = useRef<PaceState>({ shownLength: content.length, pendingSince: null });
+  /** 屏幕上的原文，供节拍器读取（setState 是异步的，不能靠它拿当前值）。 */
+  const pacedRef = useRef(content);
   /** 上一次交付的原文与渲染字符数：两者之差就是「这次新到的字」。 */
   const lastSource = useRef('');
   const lastLength = useRef(0);
   const liveRef = useRef(live);
   liveRef.current = live;
   const parity = useRef(0);
-  // 非直播（历史消息、流已结束）：不做节拍，永远和 content 对齐。
-  const shown = live ? paced : content;
+  // 非直播（历史消息、流已结束且已排完）：不做节拍，永远和 content 对齐。
+  const shown = pacing ? paced : content;
 
-  // 直播：开播时对齐一次，然后按固定节拍成段推进。没有新字 / 还没攒够时
-  // setState 返回同一个值，React 直接 bail，不产生任何渲染。
+  // 直播开始：对齐一次，然后交给节拍器。
   useEffect(() => {
     if (!live) return;
     pace.current = { shownLength: target.current.length, pendingSince: null };
+    pacedRef.current = target.current;
     setPaced(target.current);
+    setPacing(true);
+  }, [live]);
+
+  // 节拍器：每拍只放固定字数（见 lib/streamPacing.ts）。没有新字 / 还没攒够时
+  // 不调 setState，不产生任何渲染。
+  // 直播结束后不立刻对齐：把剩下的欠账按同一个节拍排完，避免最后一段「啪」地整块出现。
+  useEffect(() => {
+    if (!pacing) return;
     // 用节拍数当时间轴：不受系统时钟跳变影响，行为完全可预测。
     let ticks = 0;
     const timer = window.setInterval(() => {
       ticks += 1;
-      setPaced((current) => {
-        const result = paceShown(current, target.current, pace.current, ticks * STREAM_TICK_MS);
-        pace.current = result.state;
-        return result.changed ? target.current.slice(0, result.state.shownLength) : current;
-      });
+      const current = pacedRef.current;
+      const next = target.current;
+      const result = paceShown(current, next, pace.current, ticks * STREAM_TICK_MS, liveRef.current);
+      pace.current = result.state;
+      if (result.changed) {
+        const value = next.slice(0, result.state.shownLength);
+        pacedRef.current = value;
+        setPaced(value);
+      }
+      if (!liveRef.current && result.state.shownLength >= next.length) setPacing(false);
     }, STREAM_TICK_MS);
     return () => window.clearInterval(timer);
-  }, [live]);
+  }, [pacing]);
 
   useEffect(() => {
     if (fallback || sync || !visible) return;
