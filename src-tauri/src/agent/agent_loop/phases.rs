@@ -713,7 +713,14 @@ pub(super) async fn finish_text_reply(
     settled_jobs.extend(state.local_command_exec.take_settled_jobs_for_task(task_id));
     settled_jobs.sort_by_key(|job| job.started_at_millis);
     if !settled_jobs.is_empty() {
-        let notice = build_job_settlement_notice(&settled_jobs);
+        let still_running = super::count_running_jobs(
+            &state.command_exec,
+            &state.local_command_exec,
+            &persister.conversation_id,
+            Some(task_id),
+        )
+        .await;
+        let notice = build_job_settlement_notice(&settled_jobs, still_running);
         log::info!(
             "Agent {} job settled notice: {}",
             task_id,
