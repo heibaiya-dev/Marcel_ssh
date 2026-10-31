@@ -1207,6 +1207,12 @@ export interface SubTaskStartPayload {
    * 是否为空串）不会把正在跑的本机子任务误判成占位。
    */
   side?: 'local';
+  /**
+   * `true` = 对**已有**子对话的续派（`continue_id`）：`subConversationId` 是之前那个
+   * 子对话，`prompt` 是主 agent 的追问。前端不需要据此分支 —— 对话条目已登记时
+   * `conversationStore.registerSubConversation` 会把追问与新骨架追加进原对话。
+   */
+  resumed?: boolean;
 }
 
 /**

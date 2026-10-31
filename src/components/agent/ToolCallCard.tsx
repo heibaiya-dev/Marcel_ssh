@@ -3,7 +3,7 @@ import type { AgentMessage } from '@/lib/types';
 import FileChangeView from './FileChangeView';
 import LiveOutputPanel from './LiveOutputPanel';
 import TransientReveal from './TransientReveal';
-import { useConversationStore } from '@/stores/conversationStore';
+import { sessionConversationBindingManager } from '@/stores/sessionConversationBindingManager';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { readWebToolStatus, webToolChips, webToolDetails, webToolNotice } from '@/lib/webToolStatus';
 import {
@@ -31,7 +31,7 @@ interface Props {
 function openSubConversation(metadata: Record<string, unknown> | undefined) {
   const convId = metadata?.subConversationId;
   if (typeof convId === 'string' && convId) {
-    void useConversationStore.getState().switchConversation(convId);
+    void sessionConversationBindingManager.openConversation(convId);
   }
 }
 

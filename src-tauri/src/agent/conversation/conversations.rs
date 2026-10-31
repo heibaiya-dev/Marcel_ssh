@@ -16,6 +16,23 @@ use super::ConversationDb;
 const CONVERSATION_COLUMNS: &str = "id, connection_id, title, created_at, updated_at, \
      parent_conversation_id, model_id, pinned, usage_json, forked_from_id, archived_at";
 
+/// 子 agent 对话的派发参数：`continue_id` 续派时据此还原「在哪、什么权限」。
+///
+/// 为什么落在会话行上而不是从历史里推：任务表只在内存、重启即空；父会话里的工具结果
+/// 元数据可能已被压缩归档。会话行与子对话同生共死（级联删除、分叉深拷贝都带着走）。
+/// 不放进 `CONVERSATION_COLUMNS`：只有续派路径读它，列表/详情不需要。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SubDispatch {
+    /// `"remote"`（`subagent`）| `"local"`（`local_subagent`）。
+    pub side: String,
+    /// `"plan"`（只读）| `"agent"`（读写）。
+    pub mode: String,
+    /// 远端多机派发时的目标机器可读名（`host` 参数解析后的 label）；`None` = 派发时
+    /// 的当前会话机器。续派时重新按它解析成当前存活的会话 id（会话 id 重连即变）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
 fn conversation_from_row(row: &rusqlite::Row<'_>) -> RusqliteResult<Conversation> {
     Ok(Conversation {
         id: row.get(0)?,
@@ -564,6 +581,36 @@ impl ConversationDb {
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
+    }
+
+    /// 记下子 agent 对话的派发参数（建子对话后立刻调用）。
+    pub fn set_sub_dispatch(
+        &self,
+        conversation_id: &str,
+        dispatch: &SubDispatch,
+    ) -> RusqliteResult<()> {
+        let json = serde_json::to_string(dispatch)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations SET sub_dispatch_json = ?1 WHERE id = ?2",
+            (json, conversation_id),
+        )?;
+        Ok(())
+    }
+
+    /// 读回子 agent 对话的派发参数；不是子对话 / 旧数据 / 内容读不懂都返回 `None`。
+    pub fn get_sub_dispatch(&self, conversation_id: &str) -> RusqliteResult<Option<SubDispatch>> {
+        let conn = self.conn.lock().unwrap();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT sub_dispatch_json FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(raw.and_then(|j| serde_json::from_str(&j).ok()))
     }
 
     /// 设置会话级模型选择（`llmRegistry` 模型条目 id）。
@@ -1320,5 +1367,27 @@ mod tests {
         assert_eq!(rows[0].1.as_deref(), Some(r#"{"model-x":"max"}"#));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod sub_dispatch_tests {
+    use super::*;
+    use crate::agent::conversation::test_support::create_test_db;
+
+    #[test]
+    fn sub_dispatch_round_trips_and_defaults_to_none() {
+        let db = create_test_db();
+        let parent = db.create_conversation("c", "p").unwrap();
+        let sub = db.create_sub_conversation("c", "s", &parent.id).unwrap();
+        assert_eq!(db.get_sub_dispatch(&sub.id).unwrap(), None);
+        let d = SubDispatch {
+            side: "remote".into(),
+            mode: "agent".into(),
+            host: Some("web-1".into()),
+        };
+        db.set_sub_dispatch(&sub.id, &d).unwrap();
+        assert_eq!(db.get_sub_dispatch(&sub.id).unwrap(), Some(d));
+        assert_eq!(db.get_sub_dispatch("missing").unwrap(), None);
     }
 }

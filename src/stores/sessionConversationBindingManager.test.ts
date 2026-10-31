@@ -609,4 +609,57 @@ describe('SessionConversationBindingManager', () => {
       expect(cleanupTaskListenersMock).not.toHaveBeenCalledWith('sub-done');
     });
   });
+
+  describe('openConversation（任务中心 / 弹窗 / 返回主对话等入口）', () => {
+    const conv = (id: string, parent?: string): AgentConversation => ({
+      id, connectionId: 'conn-1', title: id, createdAt: '', updatedAt: '', parentConversationId: parent,
+    });
+    const seed = () => {
+      useSessionStore.setState({ activeSessionId: 'sess-a', sessions: { 'sess-a': makeSession('sess-a') } });
+      useConversationStore.setState({
+        activeConversationId: 'conv-a',
+        activeConversationBySession: { 'sess-a': 'conv-a' },
+        conversations: {
+          'conv-a': conv('conv-a'),
+          'conv-x': conv('conv-x'),
+          'sub-x': conv('sub-x', 'conv-x'),
+          'sub-a': conv('sub-a', 'conv-a'),
+        },
+        messages: { 'conv-a': [], 'conv-x': [], 'sub-x': [], 'sub-a': [] },
+      });
+    };
+
+    it('跳到另一条主对话：绑定跟着走，输入区归属不再算成 null', async () => {
+      seed();
+      await sessionConversationBindingManager.openConversation('conv-x');
+      const s = useConversationStore.getState();
+      expect(s.activeConversationId).toBe('conv-x');
+      expect(s.activeConversationBySession['sess-a']).toBe('conv-x');
+    });
+
+    it('跳到另一条主对话的子对话：绑定落到它的主对话，不绑子对话本身', async () => {
+      seed();
+      await sessionConversationBindingManager.openConversation('sub-x');
+      const s = useConversationStore.getState();
+      expect(s.activeConversationId).toBe('sub-x');
+      expect(s.activeConversationBySession['sess-a']).toBe('conv-x');
+    });
+
+    it('本对话的子对话来回切：绑定始终停在主对话', async () => {
+      seed();
+      await sessionConversationBindingManager.openConversation('sub-a');
+      expect(useConversationStore.getState().activeConversationBySession['sess-a']).toBe('conv-a');
+      await sessionConversationBindingManager.openConversation('conv-a');
+      const s = useConversationStore.getState();
+      expect(s.activeConversationId).toBe('conv-a');
+      expect(s.activeConversationBySession['sess-a']).toBe('conv-a');
+    });
+
+    it('对话元数据未知时照旧只切显示，不替它猜归属', async () => {
+      seed();
+      vi.mocked(tauri.agentGetConversation).mockResolvedValue(null as never);
+      await sessionConversationBindingManager.openConversation('unknown');
+      expect(useConversationStore.getState().activeConversationBySession['sess-a']).toBe('conv-a');
+    });
+  });
 });

@@ -126,7 +126,6 @@ export default function MobileAgentHost({
     draftConversationId,
     draftSendUnavailableReason,
     newConversation,
-    switchConversation,
     loadConversation,
     renameConversation,
     setConversationPinned,
@@ -278,9 +277,9 @@ export default function MobileAgentHost({
 
   const handleBackToParent = useCallback(() => {
     if (parentConversationId) {
-      void switchConversation(parentConversationId);
+      void sessionConversationBindingManager.openConversation(parentConversationId);
     }
-  }, [parentConversationId, switchConversation]);
+  }, [parentConversationId]);
 
   const handleNewConversation = useCallback(async () => {
     if (!canInteract || !ids) return;

@@ -249,6 +249,23 @@ impl ConversationDb {
         Ok(project_llm_history(&messages))
     }
 
+    /// 子 agent 续派用：把一个已有对话的**活跃段**（最新压缩卡起，同归档边界）整条投影成
+    /// 请求历史。子对话没有前端 live 消息，库里就是全部真相，所以不必先拼 `HistorySnapshot`。
+    /// 上一轮若中途崩溃/被取消留下未配对的工具调用，由 `project_llm_history` 的闭合步骤
+    /// 补齐，请求不会因协议残缺被 provider 拒掉。
+    pub(crate) fn load_llm_history_for_resume(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<LlmMessage>, HistoryError> {
+        let active = self.load_active_messages(conversation_id)?;
+        let messages: Vec<HistoryMessage> = active
+            .messages
+            .iter()
+            .map(HistoryMessage::from_stored)
+            .collect();
+        Ok(project_llm_history(&messages))
+    }
+
     fn read_history_snapshot_rows(
         &self,
         conversation_id: &str,
@@ -953,5 +970,88 @@ mod tests {
                 fixture.name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use crate::agent::conversation::test_support::create_test_db;
+
+    fn save(db: &ConversationDb, conv: &str, role: &str, content: &str, calls: Option<&str>) {
+        db.save_message(conv, role, content, "2026-01-01T00:00:00Z", calls, None)
+            .expect("save message");
+    }
+
+    /// 续派：整段活跃历史按原次序投影；中途崩溃留下的悬空工具调用被闭合，
+    /// 请求里不会出现没有结果的 tool_call。
+    #[test]
+    fn resume_history_closes_dangling_tool_call_from_a_crashed_turn() {
+        let db = create_test_db();
+        let parent = db.create_conversation("c", "p").unwrap();
+        let sub = db.create_sub_conversation("c", "s", &parent.id).unwrap();
+        save(&db, &sub.id, "user", "查磁盘", None);
+        save(
+            &db,
+            &sub.id,
+            "assistant",
+            "",
+            Some(r#"[{"id":"call-1","name":"bash","arguments":{"command":"df -h"}}]"#),
+        );
+        save(
+            &db,
+            &sub.id,
+            "tool",
+            "Filesystem ...",
+            Some(r#"{"id":"call-1","name":"bash","arguments":{"command":"df -h"}}"#),
+        );
+        // 第二次调用发出后进程崩溃：没有对应的 tool 行。
+        save(
+            &db,
+            &sub.id,
+            "assistant",
+            "",
+            Some(r#"[{"id":"call-2","name":"bash","arguments":{"command":"du -sh /"}}]"#),
+        );
+
+        let history = db.load_llm_history_for_resume(&sub.id).unwrap();
+        assert_eq!(history[0].content, "查磁盘");
+        // 每个保留下来的 tool_call 都必须有对应的 tool 回复。
+        for item in &history {
+            if let Some(calls) = &item.tool_calls {
+                for call in calls {
+                    assert!(
+                        history.iter().any(|m| m.role == LlmRole::Tool
+                            && m.tool_call_id.as_deref() == Some(call.id.as_str())),
+                        "tool_call {} 没有结果，续派的请求协议不完整",
+                        call.id
+                    );
+                }
+            }
+        }
+        // 已完成的那一组原样在。
+        assert!(history
+            .iter()
+            .any(|m| m.role == LlmRole::Tool && m.content == "Filesystem ..."));
+    }
+
+    /// 压缩过的子对话只回灌最新压缩卡起的活跃段（与归档边界同口径）。
+    #[test]
+    fn resume_history_starts_at_latest_compaction_card() {
+        let db = create_test_db();
+        let parent = db.create_conversation("c", "p").unwrap();
+        let sub = db.create_sub_conversation("c", "s", &parent.id).unwrap();
+        save(&db, &sub.id, "user", "很早以前的话", None);
+        save(
+            &db,
+            &sub.id,
+            "system",
+            &format!("{COMPACTION_CARD_PREFIX}\n摘要正文"),
+            None,
+        );
+        save(&db, &sub.id, "user", "压缩后的话", None);
+        let history = db.load_llm_history_for_resume(&sub.id).unwrap();
+        assert!(history.iter().all(|m| !m.content.contains("很早以前")));
+        assert!(history.iter().any(|m| m.content == "压缩后的话"));
     }
 }

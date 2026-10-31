@@ -5,6 +5,7 @@ import { useTaskStore } from '@/stores/taskStore';
 import { useInteractionStore } from '@/stores/interactionStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useConversationStore } from '@/stores/conversationStore';
+import { sessionConversationBindingManager } from '@/stores/sessionConversationBindingManager';
 import MobileApprovalSheet from '@/mobile/MobileApprovalSheet';
 import MobileQuestionSheet from '@/mobile/MobileQuestionSheet';
 import { InteractionFloatingCapsule } from '@/components/agent/InteractionFloatingCapsule';
@@ -56,7 +57,6 @@ export default function MobileGlobalInteractionOverlay() {
   const setActiveSession = useSessionStore((s) => s.setActiveSession);
 
   const activeConversationId = useConversationStore((s) => s.activeConversationId);
-  const switchConversation = useConversationStore((s) => s.switchConversation);
 
   // 用户是否主动最小化了当前交互
   const [minimized, setMinimized] = useState(false);
@@ -85,11 +85,11 @@ export default function MobileGlobalInteractionOverlay() {
       setActiveSession(jumpSessionId);
     }
     if (current.conversationId && activeConversationId !== current.conversationId) {
-      void switchConversation(current.conversationId);
+      void sessionConversationBindingManager.openConversation(current.conversationId);
     }
     // 点击跳转后自动最小化弹窗，避免遮挡聊天内容
     setMinimized(true);
-  }, [current, activeSessionId, activeConversationId, setActiveSession, switchConversation]);
+  }, [current, activeSessionId, activeConversationId, setActiveSession]);
 
   if (!current) return null;
 

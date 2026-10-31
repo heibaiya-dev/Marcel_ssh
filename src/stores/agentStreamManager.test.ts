@@ -154,6 +154,40 @@ describe('subagent wiring', () => {
     expect(msgs[1].isLoading).toBe(true);
   });
 
+  it('subTaskStart with resumed=true reuses the sub-conversation: follow-up + new skeleton, new task record', () => {
+    const handler = createDefaultStreamHandler();
+    seedParentTask();
+    const base = {
+      type: 'subTaskStart' as const,
+      toolCallId: 'call-1',
+      subConversationId: 'sub-conv-1',
+      description: 'explore nginx',
+      parentConversationId: 'main-conv',
+    };
+    handleSubTaskStart(handler, 'parent-1', { ...base, subTaskId: 'sub-1', prompt: 'look at /etc/nginx' });
+    // 第一轮失败收尾：骨架被清掉
+    useConversationStore.setState((s) => ({
+      messages: {
+        ...s.messages,
+        'sub-conv-1': s.messages['sub-conv-1'].filter((m) => !m.isLoading),
+      },
+    }));
+
+    handleSubTaskStart(handler, 'parent-1', {
+      ...base,
+      toolCallId: 'call-2',
+      subTaskId: 'sub-2',
+      prompt: '接着查 upstream',
+      resumed: true,
+    });
+
+    const taskStore = useTaskStore.getState();
+    expect(taskStore.tasks['sub-2']).toMatchObject({ conversationId: 'sub-conv-1', parentTaskId: 'parent-1' });
+    const msgs = useConversationStore.getState().messages['sub-conv-1'];
+    expect(msgs.map((m) => m.content)).toEqual(['look at /etc/nginx', '接着查 upstream', '']);
+    expect(msgs[2].isLoading).toBe(true);
+  });
+
   it('subTaskStart attaches sub-conversation link to the running task tool card', () => {
     const handler = createDefaultStreamHandler();
     seedParentTask();
