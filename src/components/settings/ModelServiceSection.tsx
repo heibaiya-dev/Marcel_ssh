@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react';
+import { ChevronUp, ChevronDown } from 'lucide-react';
 import { useSettingsStore } from '@/stores/settingsStore';
 import type { AgentModeSettings, ChannelConfig, LlmRegistry, ModelEntry, ModelSlots, NetPolicy, SubagentModelChoice } from '@/lib/types';
 import Select, { type SelectGroup } from '@/components/ui/Select';
@@ -17,6 +18,7 @@ import {
   mergeChannelModels,
   candidateRowModelLabel,
   emptyRegistry,
+  shiftChannel,
 } from '@/lib/llmRegistry';
 
 /** 从注册表生成槽位选择器的选项（按渠道分组）。 */
@@ -345,11 +347,36 @@ export function ModelServiceSection() {
           </div>
         ) : (
           <ul className="divide-y divide-edge-subtle overflow-hidden rounded-xl border border-edge-subtle">
-            {registry.channels.map((ch) => {
+            {registry.channels.map((ch, idx) => {
               const models = modelsOfChannel(registry, ch.id);
               const hasKey = channelKeyStatus[ch.id] ?? !!ch.apiKey;
+              const isFirst = idx === 0;
+              const isLast = idx === registry.channels.length - 1;
               return (
                 <li key={ch.id} className="flex items-center gap-3 px-4 py-3 bg-zinc-900/40">
+                  {/* 手动排序：数组顺序即展示顺序（设置页 + 模型选择器分组都读它） */}
+                  <div className="flex flex-col flex-shrink-0 -my-1">
+                    <button
+                      type="button"
+                      onClick={() => updateRegistry(shiftChannel(registry, ch.id, -1))}
+                      disabled={isFirst}
+                      title="上移渠道"
+                      aria-label={`上移 ${ch.name}`}
+                      className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-state-mid disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-zinc-400 transition-colors"
+                    >
+                      <ChevronUp className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updateRegistry(shiftChannel(registry, ch.id, 1))}
+                      disabled={isLast}
+                      title="下移渠道"
+                      aria-label={`下移 ${ch.name}`}
+                      className="p-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-state-mid disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-zinc-400 transition-colors"
+                    >
+                      <ChevronDown className="w-4 h-4" />
+                    </button>
+                  </div>
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       <span className="text-sm font-medium text-zinc-200 truncate">{ch.name}</span>

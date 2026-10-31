@@ -13,6 +13,7 @@ import {
   effortValidForModel,
   dedupeModelEntries,
   mergeChannelModels,
+  shiftChannel,
 } from './llmRegistry';
 import type { LlmRegistry, ModelEntry } from './types';
 
@@ -265,5 +266,60 @@ describe('subagentModels cross-channel retention', () => {
     const next = mergeChannelModels(r, chA, [{ ...createModel(chA.id, 'model-a2'), id: ma.id }]);
     expect(next.subagentModels).toHaveLength(1);
     expect(next.subagentModels?.[0].modelId).toBe(mb.id);
+  });
+});
+
+describe('shiftChannel — 渠道手动排序', () => {
+  function regWith3(): LlmRegistry {
+    const r = emptyRegistry();
+    r.channels.push(
+      createChannel('A', 'https://a'),
+      createChannel('B', 'https://b'),
+      createChannel('C', 'https://c'),
+    );
+    return r;
+  }
+
+  it('下移一位：中间项与下一项交换', () => {
+    const r = regWith3();
+    const [a, b, c] = r.channels;
+    const next = shiftChannel(r, a.id, 1);
+    expect(next.channels.map((x) => x.id)).toEqual([b.id, a.id, c.id]);
+    // 原 registry 不被修改（不可变）
+    expect(r.channels.map((x) => x.id)).toEqual([a.id, b.id, c.id]);
+  });
+
+  it('上移一位：中间项与上一项交换', () => {
+    const r = regWith3();
+    const [a, b, c] = r.channels;
+    const next = shiftChannel(r, c.id, -1);
+    expect(next.channels.map((x) => x.id)).toEqual([a.id, c.id, b.id]);
+  });
+
+  it('顶/底边界原样返回（同引用，不触发落盘）', () => {
+    const r = regWith3();
+    const [a, , c] = r.channels;
+    expect(shiftChannel(r, a.id, -1)).toBe(r);
+    expect(shiftChannel(r, c.id, 1)).toBe(r);
+  });
+
+  it('id 不存在时原样返回', () => {
+    const r = regWith3();
+    expect(shiftChannel(r, 'ghost', 1)).toBe(r);
+  });
+
+  it('排序不影响 slots / lastUsedModelId / models / subagentModels', () => {
+    const r = regWith3();
+    const [a, b] = r.channels;
+    const m = createModel(a.id, 'm1');
+    r.models.push(m);
+    r.lastUsedModelId = m.id;
+    r.slots.summarizerModelId = m.id;
+    r.subagentModels = [{ modelId: m.id, description: 'd' }];
+    const next = shiftChannel(r, b.id, -1);
+    expect(next.lastUsedModelId).toBe(m.id);
+    expect(next.slots.summarizerModelId).toBe(m.id);
+    expect(next.models).toEqual(r.models);
+    expect(next.subagentModels).toEqual(r.subagentModels);
   });
 });

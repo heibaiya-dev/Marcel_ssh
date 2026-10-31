@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, Loader2 } from 'lucide-react';
+import { ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
 import { useSettingsStore } from '@/stores/settingsStore';
 import type { AgentModeSettings, ChannelConfig, LlmRegistry, ModelEntry, ModelInfo, NetPolicy, SubagentModelChoice } from '@/lib/types';
 import { llmListModels } from '@/lib/tauri';
@@ -20,6 +20,7 @@ import {
   mergeChannelModels,
   modelOptionsByChannel,
   candidateRowModelLabel,
+  shiftChannel,
 } from '@/lib/llmRegistry';
 import MobileSheet from '../ui/MobileSheet';
 import { MobileSettingRow } from './MobileSettingRow';
@@ -1015,34 +1016,60 @@ export function MobileModelSection() {
           </p>
         ) : (
           <div className="mt-2 divide-y divide-edge-subtle">
-            {registry.channels.map((ch) => {
+            {registry.channels.map((ch, idx) => {
               const models = modelsOfChannel(registry, ch.id);
               const hasKey = channelKeyStatus[ch.id] ?? !!ch.apiKey;
+              const isFirst = idx === 0;
+              const isLast = idx === registry.channels.length - 1;
               return (
-                <button
-                  key={ch.id}
-                  type="button"
-                  onClick={() => setChannelEditor({ open: true, channel: ch })}
-                  className="flex w-full items-center gap-2 py-3 text-left active:bg-state-soft/50"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-sm text-zinc-200">{ch.name}</span>
-                      {!ch.enabled && (
-                        <span className="rounded bg-zinc-700 px-1.5 py-0.5 text-[10px] text-zinc-400">
-                          已禁用
-                        </span>
-                      )}
+                <div key={ch.id} className="flex items-center gap-1 py-2">
+                  {/* 编辑入口（占满中间） */}
+                  <button
+                    type="button"
+                    onClick={() => setChannelEditor({ open: true, channel: ch })}
+                    className="flex min-w-0 flex-1 items-center gap-2 py-1 text-left active:bg-state-soft/50"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="truncate text-sm text-zinc-200">{ch.name}</span>
+                        {!ch.enabled && (
+                          <span className="rounded bg-zinc-700 px-1.5 py-0.5 text-[10px] text-zinc-400">
+                            已禁用
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-0.5 truncate font-mono text-xs text-zinc-500">
+                        {ch.baseUrl || <span className="text-amber-500/80">未填写 Base URL</span>}
+                      </div>
+                      <div className="mt-0.5 text-[11px] text-zinc-600">
+                        {models.length} 个模型 · {hasKey ? '已配置密钥' : '未配置密钥'}
+                      </div>
                     </div>
-                    <div className="mt-0.5 truncate font-mono text-xs text-zinc-500">
-                      {ch.baseUrl || <span className="text-amber-500/80">未填写 Base URL</span>}
-                    </div>
-                    <div className="mt-0.5 text-[11px] text-zinc-600">
-                      {models.length} 个模型 · {hasKey ? '已配置密钥' : '未配置密钥'}
-                    </div>
+                    <ChevronDown className="h-4 w-4 flex-shrink-0 rotate-[-90deg] text-zinc-600" />
+                  </button>
+                  {/* 手动排序（与桌面同语义：数组顺序 = 展示顺序） */}
+                  {/* 每个按钮触控区 38×38，比图标本身大，便于手指点中 */}
+                  <div className="flex flex-col flex-shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => updateRegistry(shiftChannel(registry, ch.id, -1))}
+                      disabled={isFirst}
+                      aria-label={`上移 ${ch.name}`}
+                      className="flex h-[38px] w-[38px] items-center justify-center rounded text-zinc-400 active:bg-state-mid disabled:opacity-30"
+                    >
+                      <ChevronUp className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updateRegistry(shiftChannel(registry, ch.id, 1))}
+                      disabled={isLast}
+                      aria-label={`下移 ${ch.name}`}
+                      className="flex h-[38px] w-[38px] items-center justify-center rounded text-zinc-400 active:bg-state-mid disabled:opacity-30"
+                    >
+                      <ChevronDown className="h-4 w-4" />
+                    </button>
                   </div>
-                  <ChevronDown className="h-4 w-4 flex-shrink-0 rotate-[-90deg] text-zinc-600" />
-                </button>
+                </div>
               );
             })}
           </div>

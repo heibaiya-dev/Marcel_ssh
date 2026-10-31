@@ -301,6 +301,26 @@ export function mergeChannelModels(
   return { ...r, channels, models, slots, subagentModels, lastUsedModelId };
 }
 
+/**
+ * 把渠道在数组里上移/下移一位（影响设置页列表、模型选择器分组顺序）。
+ * 数组顺序就是展示顺序（与连接列表同口径），无需 position 字段。
+ * 到边界或 id 不存在时原样返回（不触发落盘）。
+ */
+export function shiftChannel(
+  r: LlmRegistry,
+  channelId: string,
+  delta: -1 | 1,
+): LlmRegistry {
+  const index = r.channels.findIndex((c) => c.id === channelId);
+  if (index < 0) return r;
+  const to = index + delta;
+  if (to < 0 || to >= r.channels.length) return r;
+  const channels = r.channels.slice();
+  const [moved] = channels.splice(index, 1);
+  channels.splice(to, 0, moved);
+  return { ...r, channels };
+}
+
 /** 删除渠道：级联删除其模型，并清理指向被删模型的槽位与最近使用。返回新 registry。 */
 export function removeChannel(r: LlmRegistry, channelId: string): LlmRegistry {
   const removedModelIds = new Set(
