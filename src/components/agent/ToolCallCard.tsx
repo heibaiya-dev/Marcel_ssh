@@ -3,7 +3,6 @@ import type { AgentMessage } from '@/lib/types';
 import FileChangeView from './FileChangeView';
 import LiveOutputPanel from './LiveOutputPanel';
 import TransientReveal from './TransientReveal';
-import { sessionConversationBindingManager } from '@/stores/sessionConversationBindingManager';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { readWebToolStatus, webToolChips, webToolDetails, webToolNotice } from '@/lib/webToolStatus';
 import {
@@ -31,7 +30,10 @@ interface Props {
 function openSubConversation(metadata: Record<string, unknown> | undefined) {
   const convId = metadata?.subConversationId;
   if (typeof convId === 'string' && convId) {
-    void sessionConversationBindingManager.openConversation(convId);
+    // 点击时才加载：管理器连着终端/会话这一大串依赖，消息卡片的渲染路径不该静态背上它。
+    void import('@/stores/sessionConversationBindingManager').then((m) =>
+      m.sessionConversationBindingManager.openConversation(convId),
+    );
   }
 }
 

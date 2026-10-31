@@ -12,7 +12,7 @@ const mocks = vi.hoisted(() => ({
   interaction: null as ActiveInteractionPayload | null,
   activeSessionId: null as string | null,
   setActiveSession: vi.fn(),
-  switchConversation: vi.fn(async () => {}),
+  switchConversation: vi.fn(async (_id: string) => {}),
   activeConversationId: null as string | null,
   approve: vi.fn(async () => {}),
   reject: vi.fn(async () => {}),
@@ -39,6 +39,10 @@ vi.mock('@/stores/interactionStore', () => ({
 vi.mock('@/stores/sessionStore', () => ({
   useSessionStore: (sel: (s: Record<string, unknown>) => unknown) =>
     sel({ activeSessionId: mocks.activeSessionId, setActiveSession: mocks.setActiveSession }),
+}));
+// 跳转入口统一经 openConversation（同时更新机器与对话的绑定）；本文件只关心「跳到哪条对话」。
+vi.mock('@/stores/sessionConversationBindingManager', () => ({
+  sessionConversationBindingManager: { openConversation: (id: string) => mocks.switchConversation(id) },
 }));
 vi.mock('@/stores/conversationStore', () => ({
   useConversationStore: (sel: (s: Record<string, unknown>) => unknown) =>
