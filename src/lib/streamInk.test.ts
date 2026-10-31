@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { inkTextLength, wrapInkRange, type InkNode } from './streamInk';
+import { appendStreamingTail, inkTextLength, wrapInkRange, type InkNode } from './streamInk';
 
 const text = (value: string): InkNode => ({ type: 'text', value });
 const el = (tagName: string, children: InkNode[], properties: Record<string, unknown> = {}): InkNode => ({
@@ -79,5 +79,23 @@ describe('wrapInkRange', () => {
     const result = wrapInkRange(tree, null);
     expect(result.tree).toBe(tree);
     expect(result.length).toBe(1);
+  });
+});
+
+describe('appendStreamingTail', () => {
+  it('把未解析的尾巴接进最后一个文本节点，只克隆尾路径', () => {
+    const kept = el('h2', [text('标题')]);
+    const tree = root([kept, el('p', [text('前缀')])]);
+    const result = appendStreamingTail(tree, '新字');
+    expect(result.children?.[0]).toBe(kept);
+    expect(result.children?.[1]).not.toBe(tree.children?.[1]);
+    expect(inkTextLength(result)).toBe(6);
+    expect(inkTextLength(tree)).toBe(4);
+  });
+
+  it('没有文本节点时补一个段落，空尾巴保持引用', () => {
+    const tree = root([]);
+    expect(appendStreamingTail(tree, '')).toBe(tree);
+    expect(inkTextLength(appendStreamingTail(tree, '新'))).toBe(1);
   });
 });

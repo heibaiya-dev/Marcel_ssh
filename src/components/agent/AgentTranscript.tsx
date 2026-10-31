@@ -87,6 +87,7 @@ export default memo(function AgentTranscript({
     // 中间帧；若再套一层 rAF，每次内容变高/变矮（折叠动画、流式、拖宽）都会先画出一帧
     // 偏离底部的画面，下一帧再拉回，表现为上下抖动。
     const observer = new ResizeObserver(() => {
+      if (userScrolling.current && !nearBottomRef.current) return;
       if (nearBottomRef.current) scrollToBottom();
       else if (containerRef.current) {
         const node = containerRef.current;
@@ -96,7 +97,7 @@ export default memo(function AgentTranscript({
     if (containerRef.current) observer.observe(containerRef.current);
     if (contentRef.current) observer.observe(contentRef.current);
     return () => observer.disconnect();
-  }, [visible, scrollToBottom]);
+  }, [visible, scrollToBottom, userScrolling]);
 
   return (
     <div className="relative flex-1 min-h-0 min-w-0">
@@ -146,7 +147,7 @@ export default memo(function AgentTranscript({
           onClick={() => scrollToBottom('smooth')}
           title="回到底部"
           aria-label="回到底部"
-          className="absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full border border-edge-strong bg-zinc-800/95 px-3 py-1.5 text-xs font-medium text-zinc-100 shadow-lg backdrop-blur-sm active:bg-state-mid"
+          className="absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full border border-edge-strong bg-zinc-800 px-3 py-1.5 text-xs font-medium text-zinc-100 shadow-lg active:bg-state-mid"
         >
           回到底部
         </button>
@@ -160,7 +161,7 @@ export default memo(function AgentTranscript({
               onClick={() => scrollToBottom('smooth')}
               title="回到底部"
               aria-label="回到底部"
-              className="pointer-events-auto flex h-8 w-8 items-center justify-center rounded-full border border-edge-strong bg-zinc-800/95 text-zinc-100 shadow-lg backdrop-blur-sm transition-colors hover:bg-state-mid"
+              className="pointer-events-auto flex h-8 w-8 items-center justify-center rounded-full border border-edge-strong bg-zinc-800 text-zinc-100 shadow-lg transition-colors hover:bg-state-mid"
             >
               <ArrowDown className="h-4 w-4" />
             </button>

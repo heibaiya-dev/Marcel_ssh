@@ -124,3 +124,39 @@ export function wrapInkRange<T extends InkNode>(
   const next = wrapNode(tree, usable ?? { start: 0, end: 0 }, even ? 'ink-a' : 'ink-b', cursor, false) as T;
   return { tree: usable ? next : tree, length: cursor.index };
 }
+
+/**
+ * 解析结果落后于显示节拍时，把尚未解析的尾巴接到最后一个文本节点。
+ * 只克隆尾路径：已排版的前缀保持原引用，绝不整块退回裸文本。
+ */
+export function appendStreamingTail<T extends InkNode>(tree: T, tail: string): T {
+  if (!tail) return tree;
+  let appended = false;
+  const visit = (node: InkNode): InkNode => {
+    if (appended) return node;
+    if (node.type === 'text') {
+      appended = true;
+      return { ...node, value: (node.value ?? '') + tail };
+    }
+    const children = node.children;
+    if (!children?.length) return node;
+    for (let index = children.length - 1; index >= 0; index--) {
+      const next = visit(children[index]);
+      if (next !== children[index]) {
+        const nextChildren = [...children];
+        nextChildren[index] = next;
+        return { ...node, children: nextChildren };
+      }
+    }
+    return node;
+  };
+  const next = visit(tree);
+  if (next !== tree) return next as T;
+  return {
+    ...tree,
+    children: [
+      ...(tree.children ?? []),
+      { type: 'element', tagName: 'p', children: [{ type: 'text', value: tail }] },
+    ],
+  };
+}

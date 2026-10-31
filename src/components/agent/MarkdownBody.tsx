@@ -6,7 +6,7 @@ import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 import { markdownRenderManager } from '@/lib/markdownRenderManager';
 import type { MarkdownTree } from '@/lib/markdownProcessor';
 import { openExternalLink } from '@/lib/externalLinks';
-import { inkTextLength, wrapInkRange, type InkRange } from '@/lib/streamInk';
+import { appendStreamingTail, inkTextLength, wrapInkRange, type InkRange } from '@/lib/streamInk';
 import { STREAM_TICK_MS, paceShown, type PaceState } from '@/lib/streamPacing';
 import { MarkdownVisibility } from './markdownVisibility';
 import CodeBlock from './CodeBlock';
@@ -117,16 +117,17 @@ export default memo(function MarkdownBody({
     });
   }, [shown, fallback, sync, visible]);
 
-  const tree = useMemo(
-    () => (rendered?.ink ? wrapInkRange(rendered.tree, rendered.ink, rendered.even).tree : null),
-    [rendered],
-  );
+  const tree = useMemo(() => {
+    if (!rendered || !shown.startsWith(rendered.source)) return null;
+    const base = rendered.ink
+      ? wrapInkRange(rendered.tree, rendered.ink, rendered.even).tree
+      : rendered.tree;
+    return appendStreamingTail(base, shown.slice(rendered.source.length));
+  }, [rendered, shown]);
 
   if (fallback || sync) {
     return <SynchronousMarkdown content={content} />;
   }
-  if (rendered && shown.startsWith(rendered.source)) {
-    return <CompiledMarkdown tree={tree ?? rendered.tree} />;
-  }
+  if (tree) return <CompiledMarkdown tree={tree} />;
   return <div className="whitespace-pre-wrap">{shown}</div>;
 });

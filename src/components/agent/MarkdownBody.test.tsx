@@ -70,7 +70,8 @@ it('shows text immediately, then keeps parsed content while the next prefix is p
   await deliver('first');
   expect(host.querySelector('p')?.textContent).toBe('first');
   await render('first next');
-  expect(host.querySelector('p')?.textContent).toBe('first');
+  expect(host.querySelector('p')?.textContent).toBe('first next');
+  expect(host.querySelector('strong')).toBeNull();
   await deliver('first next');
   expect(host.textContent).toBe('first next');
 });
